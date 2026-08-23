@@ -38,7 +38,6 @@ def make_decision(
     market: dict[str, Any],
     settings: dict[str, Any],
     bankroll: float,
-    drawdown_pct: float,
     data_quality: dict[str, Any],
     calibration: dict[str, Any],
     model_variant_spread: float,
@@ -54,15 +53,6 @@ def make_decision(
             "NO TRADE", "DATA_UNRELIABLE", "Low", f"Data unreliable: {detail}",
             model_probability, implied, None, None, None, None, 0.0, 0.0, 0, None,
         )
-
-    if settings.get("risk_controls_enabled", True):
-        max_drawdown = float(settings.get("max_session_drawdown_pct", 0.10))
-        if drawdown_pct >= max_drawdown:
-            return Decision(
-                "NO TRADE", "RISK_LIMIT", "Low",
-                "The session drawdown limit is active, so no new paper position is allowed.",
-                model_probability, implied, None, None, None, None, 0.0, 0.0, 0, None,
-            )
 
     slippage = float(settings.get("slippage_cents", 0.5)) / 100
     executable_yes = min(0.999, float(yes_ask) + slippage)

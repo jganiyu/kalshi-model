@@ -25,7 +25,7 @@ through the live feed. Kalshi prices also stream once the Key ID is configured.
 - **BTC vs threshold:** Where Bitcoin is relative to the settlement target.
 - **Model vs market:** Our estimated Up probability compared with Kalshi's price.
 - **Edge and EV:** Whether the difference survives spread, fees, and slippage.
-- **Signal:** `UP`, `DOWN`, or, most often, `HOLD`.
+- **Signal:** `BUY UP`, `BUY DOWN`, or, most often, `HOLD`.
 - **Position:** A conservative paper amount based on the configured bankroll.
 
 Confidence measures data quality, calibration, model agreement, liquidity, and

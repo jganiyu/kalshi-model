@@ -101,6 +101,11 @@ async def cancel_paper_order(order_id: int) -> dict[str, Any]:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
+@app.post("/api/paper/reset")
+async def reset_paper_round() -> dict[str, Any]:
+    return await engine.reset_paper_round()
+
+
 @app.get("/api/signals")
 async def signals(limit: int = Query(default=100, ge=1, le=500)) -> dict[str, Any]:
     rows = db.fetch_all(

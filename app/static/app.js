@@ -14,6 +14,7 @@ const state = {
   priceMovement: { direction: null, until: 0 },
   themePreference: localStorage.getItem("kalshi-theme") || "system",
   paperOrder: { side: "YES", action: "BUY", limit: false, submitting: false },
+  paperReset: { confirming: false, resetting: false, timer: null },
 };
 
 const $ = (selector) => document.querySelector(selector);
@@ -43,6 +44,12 @@ function money(value, digits = 2) {
   return new Intl.NumberFormat("en-US", {
     style: "currency", currency: "USD", minimumFractionDigits: digits, maximumFractionDigits: digits,
   }).format(Number(value));
+}
+
+function numberOrNull(value) {
+  if (value === null || value === undefined || value === "") return null;
+  const number = Number(value);
+  return Number.isFinite(number) ? number : null;
 }
 
 function percent(value, digits = 1, signed = false) {
@@ -197,7 +204,7 @@ function renderDashboard(data) {
   const position = signalPosition(decision);
   const pill = $("#signal-pill");
   pill.dataset.position = position;
-  pill.setAttribute("aria-label", `Current signal: ${position === "up" ? "Trade Up" : position === "down" ? "Trade Down" : "Hold"}`);
+  pill.setAttribute("aria-label", `Current signal: ${position === "up" ? "Buy Up" : position === "down" ? "Buy Down" : "Hold"}`);
   pill.querySelectorAll("[data-signal-option]").forEach((option) => {
     option.classList.toggle("active", option.dataset.signalOption === position);
   });
@@ -205,6 +212,16 @@ function renderDashboard(data) {
   const signalTitleElement = $("#signal-title");
   signalTitleElement.textContent = confidence;
   signalTitleElement.hidden = !confidence;
+  const paperPermission = $("#paper-permission");
+  const paper = data.paper || {};
+  const paperBlocked = paper.automatic_trade_allowed === false;
+  paperPermission.hidden = !paperBlocked;
+  paperPermission.classList.toggle("off", paperBlocked && !paper.automatic_trading_enabled);
+  paperPermission.textContent = paperBlocked
+    ? paper.automatic_trading_enabled
+      ? `Paper trading paused · ${paper.automatic_trade_block_reason || "Risk control active."}`
+      : paper.automatic_trade_block_reason || "Automatic paper trading is off."
+    : "";
   $("#signal-explanation").textContent = formatMarketLanguage(decision?.explanation || system.message || "Connecting to public feeds.");
   $("#model-probability").textContent = percent(decision?.model_probability, 1);
   $("#market-probability").textContent = percent(decision?.market_probability, 1);
@@ -213,14 +230,15 @@ function renderDashboard(data) {
   $("#edge").className = Number(decision?.edge) > 0 ? "positive" : Number(decision?.edge) < 0 ? "negative" : "";
   $("#ev").className = Number(decision?.expected_value) > 0 ? "positive" : Number(decision?.expected_value) < 0 ? "negative" : "";
 
-  const referencePrice = Number(btc.price);
-  const threshold = Number(current?.strike);
-  const distance = Number.isFinite(referencePrice) && Number.isFinite(threshold) ? referencePrice - threshold : null;
-  $("#chart-to-beat").textContent = money(current?.strike);
-  $("#btc-price").textContent = money(btc.price);
+  const referencePrice = numberOrNull(btc.price);
+  const threshold = numberOrNull(current?.strike);
+  const distance = referencePrice !== null && threshold !== null ? referencePrice - threshold : null;
+  $("#chart-to-beat").textContent = money(threshold);
+  $("#btc-price").textContent = money(referencePrice);
   syncPriceMovement();
-  $("#chart-now-distance").textContent = distance === null
-    ? "Waiting for reference price"
+  $("#chart-now-distance").textContent = threshold === null
+    ? "Waiting for threshold"
+    : distance === null ? "Waiting for reference price"
     : `${distance > 0 ? "+" : ""}${money(distance)} (${percent(distance / threshold, 3, true)})`;
   $("#btc-dispersion").textContent = btc.price
     ? `${btc.exchange_count} feeds · ${Number(btc.dispersion_pct || 0).toFixed(3)}% dispersion`
@@ -230,8 +248,10 @@ function renderDashboard(data) {
   $("#contract-ticker").textContent = current?.ticker || "No active contract";
   state.closeTime = current?.close_time ? new Date(current.close_time) : null;
   updateCountdown();
-  $("#threshold").textContent = money(current?.strike);
-  $("#distance-to-strike").textContent = distance === null ? "--" : `${distance >= 0 ? "+" : ""}${money(distance)} from threshold`;
+  $("#threshold").textContent = money(threshold);
+  $("#distance-to-strike").textContent = threshold === null
+    ? "Waiting for threshold"
+    : distance === null ? "--" : `${distance >= 0 ? "+" : ""}${money(distance)} from threshold`;
   $("#yes-market").textContent = `${percent(current?.yes_bid, 1)} / ${percent(current?.yes_ask, 1)}`;
   $("#no-market").textContent = `${percent(current?.no_bid, 1)} / ${percent(current?.no_ask, 1)}`;
   $("#spread").textContent = points(current?.spread);
@@ -438,11 +458,11 @@ async function cancelPaperOrder(orderId) {
 }
 
 function updateCountdown() {
-  if (!state.closeTime) {
-    $("#countdown").textContent = "--:--";
-    return;
-  }
-  $("#countdown").textContent = countdown((state.closeTime.getTime() - Date.now()) / 1000);
+  const value = state.closeTime
+    ? countdown((state.closeTime.getTime() - Date.now()) / 1000)
+    : "--:--";
+  $("#countdown").textContent = value;
+  $("#chart-countdown").textContent = value;
 }
 
 function resetChartAxis() {
@@ -519,11 +539,13 @@ function drawChart(frameTime = performance.now()) {
     .filter((point) => Number.isFinite(point.time) && Number.isFinite(point.price)
       && point.time >= viewStart && point.time <= viewEnd);
   const current = state.dashboard?.current;
-  const threshold = Number(current?.strike);
-  const currentPrice = Number(state.dashboard?.btc?.price ?? points.at(-1)?.price);
+  const threshold = numberOrNull(current?.strike);
+  const currentPrice = numberOrNull(state.dashboard?.btc?.price) ?? numberOrNull(points.at(-1)?.price);
   const thresholdColor = color("--chart-threshold");
   const thresholdSwatch = $("#threshold-legend-swatch");
   if (thresholdSwatch) thresholdSwatch.style.backgroundColor = thresholdColor;
+  const thresholdLegend = $("#threshold-legend");
+  if (thresholdLegend) thresholdLegend.hidden = !Number.isFinite(threshold);
   if (!points.length) {
     context.fillStyle = color("--chart-label");
     context.font = "12px -apple-system, sans-serif";
@@ -627,10 +649,12 @@ function drawChart(frameTime = performance.now()) {
   };
 
   const drawCurrentPriceLine = (value) => {
-    if (!Number.isFinite(value) || !Number.isFinite(threshold)) return;
+    if (!Number.isFinite(value)) return;
     const levelY = y(value);
-    const delta = value - threshold;
-    const lineColor = delta > 0 ? color("--green") : delta < 0 ? color("--red") : thresholdColor;
+    const delta = Number.isFinite(threshold) ? value - threshold : null;
+    const lineColor = delta === null
+      ? color("--green")
+      : delta > 0 ? color("--green") : delta < 0 ? color("--red") : thresholdColor;
     context.save();
     context.strokeStyle = lineColor;
     context.lineWidth = 1.25;
@@ -812,6 +836,48 @@ async function loadPaper() {
   `).join("") : '<tr><td colspan="9" class="empty-state">No paper trades yet.</td></tr>';
 }
 
+function setPaperResetState({ confirming = false, resetting = false } = {}) {
+  state.paperReset.confirming = confirming;
+  state.paperReset.resetting = resetting;
+  const button = $("#reset-paper-round");
+  button.classList.toggle("confirming", confirming);
+  button.disabled = resetting;
+  button.querySelector("[data-reset-label]").textContent = resetting
+    ? "Resetting"
+    : confirming ? "Confirm reset" : "Reset round";
+}
+
+async function resetPaperRound() {
+  if (state.paperReset.resetting) return;
+  if (!state.paperReset.confirming) {
+    clearTimeout(state.paperReset.timer);
+    setPaperResetState({ confirming: true });
+    showToast(
+      "Reset paper round?",
+      "Click Confirm reset within 6 seconds to clear simulated orders, positions, and trade history.",
+    );
+    state.paperReset.timer = setTimeout(() => setPaperResetState(), 6000);
+    return;
+  }
+
+  clearTimeout(state.paperReset.timer);
+  setPaperResetState({ confirming: true, resetting: true });
+  try {
+    const result = await api("/api/paper/reset", { method: "POST" });
+    if (state.dashboard) state.dashboard.paper = result.portfolio;
+    await refreshDashboard();
+    await loadPaper();
+    showToast(
+      "New paper round started",
+      `${result.reset.cleared_trades} trades and ${result.reset.cleared_orders} orders cleared.`,
+    );
+  } catch (error) {
+    showToast("Paper round not reset", error.message);
+  } finally {
+    setPaperResetState();
+  }
+}
+
 const percentSettingIds = ["min_edge", "fractional_kelly", "max_position_pct", "max_risk_per_trade_pct", "max_session_drawdown_pct"];
 
 async function loadSettings() {
@@ -917,6 +983,7 @@ function bindEvents() {
   }));
   $("#save-settings").addEventListener("click", saveSettings);
   $("#run-backtest").addEventListener("click", runBacktest);
+  $("#reset-paper-round").addEventListener("click", resetPaperRound);
   $("#run-bootstrap").addEventListener("click", runBootstrap);
   $("#backup-database").addEventListener("click", backupDatabase);
   $$('[data-paper-action]').forEach((button) => button.addEventListener("click", () => {

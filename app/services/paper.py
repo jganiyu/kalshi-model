@@ -79,6 +79,17 @@ class PaperTradingService:
         )
         session_peak = max(starting + realized - session_pnl, starting + realized)
         session_drawdown = max(0.0, -session_pnl / session_peak) if session_peak else 0.0
+        automatic_enabled = bool(settings.get("paper_trading_enabled", True))
+        automatic_block_reason = None
+        if not automatic_enabled:
+            automatic_block_reason = "Automatic paper trading is off."
+        elif (
+            settings.get("risk_controls_enabled", True)
+            and session_drawdown >= float(settings.get("max_session_drawdown_pct", 0.10))
+        ):
+            automatic_block_reason = "Session drawdown limit reached."
+        elif available_cash <= 0:
+            automatic_block_reason = "No paper bankroll is available."
         average_edge = (
             sum(float(trade["edge"]) for trade in trades) / len(trades) if trades else 0.0
         )
@@ -100,6 +111,9 @@ class PaperTradingService:
             "expected_value": expected_total,
             "max_drawdown_pct": max_drawdown,
             "session_drawdown_pct": session_drawdown,
+            "automatic_trading_enabled": automatic_enabled,
+            "automatic_trade_allowed": automatic_block_reason is None,
+            "automatic_trade_block_reason": automatic_block_reason,
             "risk_controls_enabled": bool(settings.get("risk_controls_enabled", True)),
             "max_position_pct": float(settings.get("max_position_pct", 0.05)),
             "max_risk_per_trade_pct": float(
@@ -427,6 +441,17 @@ class PaperTradingService:
         )
         return True
 
+    def reset_round(self) -> dict[str, int]:
+        trades = self.db.fetch_one("SELECT COUNT(*) AS count FROM paper_trades")
+        orders = self.db.fetch_one("SELECT COUNT(*) AS count FROM paper_orders")
+        with self.db.transaction() as connection:
+            connection.execute("DELETE FROM paper_orders")
+            connection.execute("DELETE FROM paper_trades")
+        return {
+            "cleared_trades": int(trades["count"] if trades else 0),
+            "cleared_orders": int(orders["count"] if orders else 0),
+        }
+
     def open_from_decision(
         self, ticker: str, decision: Decision, model_version: str = "baseline-1.0"
     ) -> bool:
@@ -441,6 +466,10 @@ class PaperTradingService:
         if existing:
             return False
         contracts = decision.suggested_contracts
+        try:
+            self._validate_buy(ticker, decision.side, decision.executable_price, contracts)
+        except ValueError:
+            return False
         entry_cost = decision.executable_price * contracts
         fees = kalshi_fee(decision.executable_price, contracts)
         self.db.execute(

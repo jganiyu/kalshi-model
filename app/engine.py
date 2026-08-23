@@ -699,7 +699,6 @@ class AnalysisEngine:
             market=market_state,
             settings=settings,
             bankroll=portfolio["available_cash"],
-            drawdown_pct=portfolio["session_drawdown_pct"],
             data_quality=quality,
             calibration=calibration,
             model_variant_spread=variant_spread,
@@ -901,6 +900,18 @@ class AnalysisEngine:
             self.dashboard["paper"] = self._portfolio_summary()
             self._schedule_publish()
             return {"canceled": order_id, "portfolio": self.paper.portfolio()}
+
+    async def reset_paper_round(self) -> dict[str, Any]:
+        async with self._update_lock:
+            reset = self.paper.reset_round()
+            portfolio = self.paper.portfolio()
+            self.dashboard["paper"] = {
+                key: value
+                for key, value in portfolio.items()
+                if key not in {"trades", "orders"}
+            }
+            self._schedule_publish()
+            return {"reset": reset, "portfolio": portfolio}
 
     def calibration_summary(self) -> dict[str, Any]:
         observations = self.models.observations()

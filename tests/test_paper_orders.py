@@ -6,6 +6,7 @@ import pytest
 
 from app.db import MIGRATIONS, Database
 from app.domain import iso_now
+from app.services.decision import Decision
 from app.services.paper import PaperTradingService
 
 
@@ -214,3 +215,58 @@ def test_limit_validation_and_bankroll_controls(tmp_path: Path) -> None:
             market=market(),
             dollars=50,
         )
+
+
+def test_drawdown_blocks_execution_without_replacing_model_signal(tmp_path: Path) -> None:
+    db = make_db(tmp_path)
+    add_market(db)
+    db.update_settings({
+        "risk_controls_enabled": True,
+        "max_session_drawdown_pct": 0.0,
+    })
+    service = PaperTradingService(db)
+    decision = Decision(
+        "TRADE YES", "POSITIVE_EV", "Moderate", "model still favors Up",
+        0.72, 0.60, 0.12, 0.10, 0.40, 0.01, 0.01, 10.0, 10, "YES",
+    )
+
+    portfolio = service.portfolio()
+    assert decision.signal == "TRADE YES"
+    assert portfolio["automatic_trade_allowed"] is False
+    assert portfolio["automatic_trade_block_reason"] == "Session drawdown limit reached."
+    assert service.open_from_decision("TEST-MARKET", decision) is False
+    assert db.fetch_one("SELECT id FROM paper_trades") is None
+
+
+def test_reset_round_restores_starting_paper_state(tmp_path: Path) -> None:
+    db = make_db(tmp_path)
+    add_market(db)
+    service = PaperTradingService(db)
+    service.place_order(
+        ticker="TEST-MARKET",
+        side="YES",
+        action="BUY",
+        order_type="MARKET",
+        market=market(),
+        dollars=10,
+    )
+    service.place_order(
+        ticker="TEST-MARKET",
+        side="NO",
+        action="BUY",
+        order_type="LIMIT",
+        market=market(),
+        contracts=5,
+        limit_price=0.40,
+    )
+
+    reset = service.reset_round()
+    portfolio = service.portfolio()
+
+    assert reset == {"cleared_trades": 1, "cleared_orders": 2}
+    assert portfolio["current_bankroll"] == portfolio["starting_bankroll"]
+    assert portfolio["available_cash"] == portfolio["starting_bankroll"]
+    assert portfolio["realized_pnl"] == 0
+    assert portfolio["session_drawdown_pct"] == 0
+    assert portfolio["trades"] == []
+    assert portfolio["orders"] == []

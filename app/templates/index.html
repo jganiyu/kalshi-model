@@ -48,12 +48,13 @@
             <p class="decision-label">CURRENT SIGNAL</p>
             <div class="signal-row">
               <div class="signal-pill" id="signal-pill" data-position="hold" aria-label="Current signal: Hold">
-                <span data-signal-option="up">Up</span>
+                <span data-signal-option="up">Buy Up</span>
                 <span class="active" data-signal-option="hold">Hold</span>
-                <span data-signal-option="down">Down</span>
+                <span data-signal-option="down">Buy Down</span>
               </div>
               <h2 id="signal-title" hidden></h2>
             </div>
+            <span class="paper-permission" id="paper-permission" hidden></span>
             <p id="signal-explanation">Connecting to Kalshi and public BTC feeds.</p>
           </div>
           <div class="decision-numbers">
@@ -67,16 +68,22 @@
         <div class="dashboard-grid">
           <section class="chart-panel">
             <div class="chart-header">
-              <div class="chart-price-pair">
-                <div class="chart-price-stat">
-                  <span>TO BEAT</span>
-                  <strong id="chart-to-beat">--</strong>
-                  <small>Current threshold</small>
+              <div class="chart-primary-metrics">
+                <div class="chart-price-pair">
+                  <div class="chart-price-stat">
+                    <span>TO BEAT</span>
+                    <strong id="chart-to-beat">--</strong>
+                    <small>Current threshold</small>
+                  </div>
+                  <div class="chart-price-stat">
+                    <span>NOW</span>
+                    <strong id="btc-price">--</strong>
+                    <small id="chart-now-distance">Waiting for reference price</small>
+                  </div>
                 </div>
-                <div class="chart-price-stat">
-                  <span>NOW</span>
-                  <strong id="btc-price">--</strong>
-                  <small id="chart-now-distance">Waiting for reference price</small>
+                <div class="chart-market-timer" aria-label="Time remaining in current market">
+                  <strong id="chart-countdown" role="timer">--:--</strong>
+                  <span aria-hidden="true">&#9203;&#65038;</span>
                 </div>
               </div>
               <div class="chart-tools">
@@ -93,7 +100,7 @@
             <div class="chart-wrap"><canvas id="price-chart" aria-label="Live Bitcoin price chart"></canvas></div>
             <div class="chart-legend">
               <span><i class="legend-price"></i>BTC composite</span>
-              <span><i class="legend-strike" id="threshold-legend-swatch"></i>Current threshold</span>
+              <span id="threshold-legend"><i class="legend-strike" id="threshold-legend-swatch"></i>Current threshold</span>
             </div>
           </section>
         </div>
@@ -196,7 +203,13 @@
       </section>
 
       <section class="page" id="page-paper">
-        <header class="page-header"><div><p class="eyebrow">FORWARD TEST</p><h1>Paper Trading</h1></div><span class="read-only-badge">SIMULATED ONLY</span></header>
+        <header class="page-header">
+          <div><p class="eyebrow">FORWARD TEST</p><h1>Paper Trading</h1></div>
+          <div class="paper-page-actions">
+            <span class="read-only-badge">SIMULATED ONLY</span>
+            <button class="secondary-button reset-round-button" id="reset-paper-round" type="button" title="Start a new paper-trading round" aria-label="Reset paper-trading round"><span aria-hidden="true">&#8635;</span><span data-reset-label>Reset round</span></button>
+          </div>
+        </header>
         <div class="paper-stats" id="paper-stats"></div>
         <section class="table-section">
           <div class="section-heading"><div><h3>Trade ledger</h3><p>Executable asks, fees, and settlement results</p></div><button class="secondary-button" id="run-backtest">Run backtest</button></div>

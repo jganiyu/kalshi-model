@@ -30,7 +30,6 @@ def decide(**overrides):
         "market": MARKET,
         "settings": SETTINGS,
         "bankroll": 1_000,
-        "drawdown_pct": 0.0,
         "data_quality": {"reliable": True},
         "calibration": {"sample_size": 60, "calibration_error": 0.05},
         "model_variant_spread": 0.02,
@@ -43,12 +42,6 @@ def test_data_quality_blocks_trade() -> None:
     result = decide(data_quality={"reliable": False, "reason": "stale feed"})
     assert result.signal == "NO TRADE"
     assert result.reason_code == "DATA_UNRELIABLE"
-
-
-def test_drawdown_risk_control_blocks_trade() -> None:
-    result = decide(drawdown_pct=0.11)
-    assert result.signal == "NO TRADE"
-    assert result.reason_code == "RISK_LIMIT"
 
 
 def test_positive_ev_produces_yes_signal_and_conservative_size() -> None:
