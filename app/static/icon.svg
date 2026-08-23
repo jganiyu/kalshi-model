@@ -1,15 +1,16 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" role="img" aria-labelledby="title">
   <title id="title">Kalshi Model</title>
-  <rect width="1024" height="1024" rx="224" fill="#74756f"/>
+  <rect width="1024" height="1024" rx="224" fill="#efefec"/>
   <text
     x="512"
-    y="478"
-    fill="#ffffff"
+    y="512"
+    fill="#1d1d1b"
     font-family="Helvetica Neue, Helvetica, Arial, sans-serif"
     font-size="126"
     font-weight="600"
+    dominant-baseline="middle"
     text-anchor="middle"
   >Kalshi Model</text>
-  <circle cx="486" cy="584" r="18" fill="#0b8f68"/>
-  <circle cx="538" cy="584" r="18" fill="#e1334b"/>
+  <circle cx="478" cy="660" r="18" fill="#0b8f68"/>
+  <circle cx="546" cy="660" r="18" fill="#e1334b"/>
 </svg>
