@@ -24,6 +24,13 @@ FEATURE_NAMES = [
     "market_probability",
 ]
 
+MIN_CANDIDATE_OBSERVATIONS = 12
+MIN_PROMOTION_OBSERVATIONS = 120
+MIN_PROMOTION_DAYS = 7
+MAX_TRAINING_OBSERVATIONS = 1_000
+MIN_BRIER_IMPROVEMENT = 0.005
+MAX_CALIBRATION_ERROR_REGRESSION = 0.01
+
 
 def feature_vector(features: dict[str, Any]) -> list[float]:
     values = []
@@ -119,39 +126,60 @@ class ModelManager:
             (row["model_probability"], row["result"]) for row in observations
         )
         n = len(observations)
+        training_observations = observations[-MAX_TRAINING_OBSERVATIONS:]
+        training_n = len(training_observations)
+        observed_days = len(
+            {str(row["observed_at"])[:10] for row in training_observations}
+        )
         candidate_version = None
         candidate_metrics: dict[str, Any] | None = None
         promoted = False
+        promotion_data_eligible = False
         parameters: dict[str, Any] | None = None
         validation_predictions: list[tuple[float, int]] = []
 
-        if n >= 12:
-            x = np.asarray([feature_vector(row["features"]) for row in observations], dtype=float)
-            y = np.asarray([row["result"] for row in observations], dtype=float)
-            minimum_train = max(8, n // 3)
-            for index in range(minimum_train, n):
+        if training_n >= MIN_CANDIDATE_OBSERVATIONS:
+            x = np.asarray(
+                [feature_vector(row["features"]) for row in training_observations],
+                dtype=float,
+            )
+            y = np.asarray([row["result"] for row in training_observations], dtype=float)
+            minimum_train = max(8, training_n // 3)
+            for index in range(minimum_train, training_n):
                 fold_parameters = fit_logistic(x[:index], y[:index], iterations=600)
-                prediction = predict_logistic(fold_parameters, observations[index]["features"])
+                prediction = predict_logistic(
+                    fold_parameters, training_observations[index]["features"]
+                )
                 validation_predictions.append((prediction, int(y[index])))
             candidate_metrics = calibration_metrics(validation_predictions)
             parameters = fit_logistic(x, y)
-            candidate_version = f"logistic-{datetime.now(UTC).strftime('%Y%m%d-%H%M%S')}"
+            candidate_version = (
+                f"logistic-{datetime.now(UTC).strftime('%Y%m%d-%H%M%S-%f')}"
+            )
             incumbent_tail = calibration_metrics(
-                (observations[index]["model_probability"], observations[index]["result"])
-                for index in range(minimum_train, n)
+                (
+                    training_observations[index]["model_probability"],
+                    training_observations[index]["result"],
+                )
+                for index in range(minimum_train, training_n)
             )
             candidate_brier = candidate_metrics.get("brier_score")
             incumbent_brier = incumbent_tail.get("brier_score")
             candidate_error = candidate_metrics.get("calibration_error")
             incumbent_error = incumbent_tail.get("calibration_error")
+            promotion_data_eligible = bool(
+                training_n >= MIN_PROMOTION_OBSERVATIONS
+                and observed_days >= MIN_PROMOTION_DAYS
+            )
             promoted = bool(
-                n >= 40
+                promotion_data_eligible
                 and candidate_brier is not None
                 and incumbent_brier is not None
-                and candidate_brier <= incumbent_brier - 0.005
+                and candidate_brier <= incumbent_brier - MIN_BRIER_IMPROVEMENT
                 and candidate_error is not None
                 and incumbent_error is not None
-                and candidate_error <= incumbent_error + 0.01
+                and candidate_error
+                <= incumbent_error + MAX_CALIBRATION_ERROR_REGRESSION
             )
             self.db.execute(
                 """
@@ -165,12 +193,25 @@ class ModelManager:
                     iso_now(),
                     "regularized-logistic",
                     "active" if promoted else "candidate",
-                    n,
+                    training_n,
                     json.dumps(
                         {
                             "candidate": candidate_metrics,
                             "incumbent_same_window": incumbent_tail,
                             "method": "expanding-window one-step-forward validation",
+                            "training_window": {
+                                "observations": training_n,
+                                "distinct_utc_days": observed_days,
+                                "maximum_observations": MAX_TRAINING_OBSERVATIONS,
+                            },
+                            "promotion_requirements": {
+                                "minimum_observations": MIN_PROMOTION_OBSERVATIONS,
+                                "minimum_distinct_utc_days": MIN_PROMOTION_DAYS,
+                                "minimum_brier_improvement": MIN_BRIER_IMPROVEMENT,
+                                "maximum_calibration_error_regression": (
+                                    MAX_CALIBRATION_ERROR_REGRESSION
+                                ),
+                            },
                         }
                     ),
                     json.dumps(parameters),
@@ -192,6 +233,12 @@ class ModelManager:
                 f"Calibration updated with {n} settled contracts. More independent outcomes are "
                 "needed before a candidate model can be validated."
             )
+        elif not promotion_data_eligible:
+            tldr = (
+                f"Candidate validation updated with {training_n} recent contracts across "
+                f"{observed_days} UTC days. Promotion requires at least "
+                f"{MIN_PROMOTION_OBSERVATIONS} contracts across {MIN_PROMOTION_DAYS} days."
+            )
         elif promoted:
             tldr = (
                 f"Calibration improved and {candidate_version} earned promotion on forward validation."
@@ -204,20 +251,35 @@ class ModelManager:
         report = {
             "trigger": trigger,
             "sample_size": n,
+            "training_sample_size": training_n,
+            "training_distinct_utc_days": observed_days,
+            "training_window_limit": MAX_TRAINING_OBSERVATIONS,
             "current": current_metrics,
             "candidate": candidate_metrics,
             "promoted": promoted,
+            "promotion_data_eligible": promotion_data_eligible,
             "active_model": active["version"],
             "candidate_model": candidate_version,
             "feature_names": FEATURE_NAMES,
             "candidate_coefficients": parameters.get("coefficients") if parameters else None,
-            "validation": "Expanding-window, one-step-forward; no future rows enter a training fold.",
+            "validation": (
+                "Rolling-window expanding, one-step-forward; no future rows enter a "
+                "training fold."
+            ),
+            "promotion_requirements": {
+                "minimum_observations": MIN_PROMOTION_OBSERVATIONS,
+                "minimum_distinct_utc_days": MIN_PROMOTION_DAYS,
+                "minimum_brier_improvement": MIN_BRIER_IMPROVEMENT,
+                "maximum_calibration_error_regression": (
+                    MAX_CALIBRATION_ERROR_REGRESSION
+                ),
+            },
             "limitations": [
                 "Historical bootstrap uses Coinbase spot as a documented proxy for CF Benchmarks BRTI.",
                 "Kalshi historical order-book depth is not available from market candlesticks.",
                 "Probability buckets with small samples should be treated as descriptive only.",
             ],
-            "signal_snapshot_ids": [row["id"] for row in observations],
+            "signal_snapshot_ids": [row["id"] for row in training_observations],
         }
         self.db.execute(
             """

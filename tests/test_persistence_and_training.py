@@ -67,7 +67,8 @@ def test_paper_trade_settlement_uses_actual_binary_outcome(tmp_path: Path) -> No
 def test_model_promotion_requires_forward_validation_and_minimum_sample(tmp_path: Path) -> None:
     db = make_db(tmp_path)
     manager = ModelManager(db)
-    for index in range(40):
+
+    def add_observation(index: int) -> None:
         ticker = f"TEST-{index:02d}"
         add_market(db, ticker)
         outcome = index % 2
@@ -98,14 +99,28 @@ def test_model_promotion_requires_forward_validation_and_minimum_sample(tmp_path
             ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
-                f"2026-01-{index // 2 + 1:02d}T00:{index % 2:02d}:00+00:00", ticker,
+                f"2026-01-{index // 17 + 1:02d}T00:{index % 17:02d}:00+00:00", ticker,
                 "NO TRADE", "TEST", "Low", "fixture", wrong_probability, 0.5,
                 wrong_probability - 0.5, None, 0, 0, 0, "baseline-1.0",
                 json.dumps({"features": features}), "{}", "{}", "fixture",
             ),
         )
+
+    for index in range(119):
+        add_observation(index)
+
+    early_report = manager.evaluate_and_retrain("test-before-minimum")
+    assert early_report["training_distinct_utc_days"] == 7
+    assert early_report["promotion_data_eligible"] is False
+    assert "requires at least 120 contracts" in early_report["tldr"]
+    assert early_report["promoted"] is False
+
+    add_observation(119)
     report = manager.evaluate_and_retrain("test")
-    assert report["validation"].startswith("Expanding-window")
-    assert report["candidate"]["sample_size"] < 40
+    assert report["validation"].startswith("Rolling-window expanding")
+    assert report["training_sample_size"] == 120
+    assert report["training_distinct_utc_days"] == 8
+    assert report["promotion_data_eligible"] is True
+    assert report["candidate"]["sample_size"] < 120
     assert report["promoted"] is True
     assert manager.active()["model_type"] == "regularized-logistic"

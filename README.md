@@ -51,9 +51,10 @@ and restrict it with `chmod 600`. Coinbase and Kraken streams require no credent
   per-trade, position, and session-drawdown limits.
 - Stores BTC ticks, Kalshi snapshots, material signals, model versions, settlements,
   calibration reports, backtests, settings, and paper trades in local SQLite.
-- Retrains a regularized logistic candidate with expanding-window one-step-forward
-  validation. Promotion requires at least 40 settled observations, a Brier-score
-  gain of at least `0.005`, and no material calibration-error regression.
+- Retrains a regularized logistic candidate on the latest 1,000 observations with
+  expanding-window one-step-forward validation. Promotion requires at least 120
+  settled observations across 7 UTC days, a Brier-score gain of at least `0.005`,
+  and no material calibration-error regression.
 
 ## Data and settlement caveat
 
