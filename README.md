@@ -1,6 +1,6 @@
 # Kalshi Model
 
-Chief, Kalshi Model is a local Mac command center for Kalshi's 15-minute Bitcoin Up or Down markets. I watch Bitcoin, compare the model's odds with live Kalshi prices, and call Buy Up, Hold, or Buy Down when the math changes. No real orders leave this machine; even I know better than to fire without authorization.
+Kalshi Model is a local macOS research application for analyzing Kalshi's 15-minute Bitcoin Up or Down markets. It combines live Kalshi order-book data with a multi-exchange Bitcoin price proxy to estimate outcome probabilities, identify pricing differences, and generate Buy Up, Hold, or Buy Down signals. The application supports manual and automatic paper trading, calibration tracking, and local data storage; it does not place real-money orders.
 
 > Research and paper trading only, not financial advice.
 
