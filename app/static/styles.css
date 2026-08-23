@@ -360,12 +360,13 @@ nav { display: grid; gap: 2px; }
 .negative { color: var(--red) !important; }
 
 .calibration-plot-panel, .table-section { margin-bottom: 16px; padding: 20px; }
-.calibration-bars { display: grid; min-height: 230px; grid-template-columns: repeat(6, 1fr); align-items: end; gap: 16px; padding: 28px 12px 4px; }
-.bucket { position: relative; display: grid; height: 180px; grid-template-columns: 1fr 1fr; align-items: end; gap: 4px; border-bottom: 1px solid var(--line); }
-.bucket i { min-height: 2px; border-radius: 3px 3px 0 0; background: var(--faint); }
-.bucket i.actual { background: var(--green); }
-.bucket label { position: absolute; top: calc(100% + 8px); left: 50%; transform: translateX(-50%); color: var(--muted); font-size: 10px; white-space: nowrap; }
-.bucket small { position: absolute; bottom: -32px; left: 50%; transform: translateX(-50%); color: var(--faint); font-size: 9px; }
+.calibration-bars { display: grid; min-height: 250px; grid-template-columns: repeat(6, minmax(0, 1fr)); align-items: end; gap: 16px; padding: 28px 12px 8px; }
+.bucket { display: grid; min-width: 0; grid-template-rows: 180px 20px 14px; text-align: center; }
+.bucket-bars { display: grid; min-width: 0; grid-template-columns: 1fr 1fr; align-items: end; gap: 4px; border-bottom: 1px solid var(--line); }
+.bucket-bars i { min-height: 2px; border-radius: 3px 3px 0 0; background: var(--faint); }
+.bucket-bars i.actual { background: var(--green); }
+.bucket label { align-self: end; color: var(--muted); font-size: 10px; line-height: 16px; white-space: nowrap; }
+.bucket small { color: var(--faint); font-size: 9px; line-height: 14px; }
 .report-list-section { padding: 10px 0; }
 .report-list-section > .section-heading { padding: 12px 2px 16px; }
 .report-list { display: grid; gap: 8px; }
@@ -512,7 +513,7 @@ td { padding: 12px 16px; border-top: 1px solid var(--line); white-space: nowrap;
   .theme-picker { width: 100%; }
   .theme-picker button { min-width: 0; flex: 1; }
   .report-item summary { grid-template-columns: 1fr; gap: 6px; }
-  .calibration-bars { gap: 6px; overflow-x: auto; }
+  .calibration-bars { grid-template-columns: repeat(6, minmax(76px, 1fr)); gap: 6px; overflow-x: auto; }
   .section-heading { align-items: flex-start; }
   .button-row { flex-direction: column; }
 }

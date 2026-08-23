@@ -796,9 +796,12 @@ async function loadCalibration() {
   const buckets = summary.buckets || [];
   $("#calibration-bars").innerHTML = buckets.length ? buckets.map((bucket) => `
     <div class="bucket">
-      <i style="height:${Math.max(2, bucket.predicted * 100)}%" title="Predicted ${percent(bucket.predicted)}"></i>
-      <i class="actual" style="height:${Math.max(2, bucket.actual * 100)}%" title="Actual ${percent(bucket.actual)}"></i>
-      <label>${bucket.label}</label><small>n=${bucket.count}</small>
+      <div class="bucket-bars">
+        <i style="height:${Math.max(2, bucket.predicted * 100)}%" title="Predicted ${percent(bucket.predicted)}"></i>
+        <i class="actual" style="height:${Math.max(2, bucket.actual * 100)}%" title="Actual ${percent(bucket.actual)}"></i>
+      </div>
+      <label>${bucket.label}</label>
+      <small>n=${bucket.count}</small>
     </div>`).join("") : '<p class="empty-state">Settled observations will populate this chart.</p>';
   const reports = data.reports || [];
   $("#report-list").innerHTML = reports.length ? reports.map((row) => {
