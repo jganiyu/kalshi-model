@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import time
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -14,7 +15,10 @@ import httpx
 from app.config import AppConfig
 from app.db import Database
 from app.domain import (
+    DEFAULT_BENCHMARK_UNCERTAINTY_PCT,
+    SETTLEMENT_WINDOW_SECONDS,
     calibration_metrics,
+    clamp,
     iso_now,
     momentum_return,
     parse_time,
@@ -52,6 +56,14 @@ class AnalysisEngine:
         self.kalshi: KalshiPublicClient | None = None
         self.paper = PaperTradingService(db)
         self.models = ModelManager(db)
+        self._benchmark_calibration: dict[str, Any] = {
+            "sample_size": 0,
+            "calibrated": False,
+            "bias_pct": 0.0,
+            "residual_sigma_pct": None,
+            "uncertainty_pct": DEFAULT_BENCHMARK_UNCERTAINTY_PCT,
+        }
+        self._recent_btc_samples: list[tuple[float, float]] = []
         self.dashboard: dict[str, Any] = {
             "system": {"status": "starting", "message": "Connecting to public data feeds."},
             "current": None,
@@ -91,6 +103,7 @@ class AnalysisEngine:
         }
 
     async def start(self) -> None:
+        self._benchmark_calibration = self.models.benchmark_calibration()
         self.http = httpx.AsyncClient(
             timeout=httpx.Timeout(8.0, connect=5.0),
             headers={"User-Agent": "kalshi-model/0.1 local-analysis-only"},
@@ -196,6 +209,7 @@ class AnalysisEngine:
             result = await HistoricalBootstrapService(
                 self.db, self.kalshi, self.bitcoin
             ).run()
+            self._benchmark_calibration = self.models.benchmark_calibration()
             report = self.models.evaluate_and_retrain("automatic historical bootstrap")
             self.dashboard["bootstrap"] = {"status": "complete", **result, "report": report["tldr"]}
         except asyncio.CancelledError:
@@ -211,6 +225,7 @@ class AnalysisEngine:
     async def run_bootstrap(self) -> dict[str, Any]:
         assert self.kalshi and self.bitcoin
         result = await HistoricalBootstrapService(self.db, self.kalshi, self.bitcoin).run()
+        self._benchmark_calibration = self.models.benchmark_calibration()
         report = self.models.evaluate_and_retrain("manual historical bootstrap")
         self.dashboard["bootstrap"] = {"status": "complete", **result, "report": report["tldr"]}
         return self.dashboard["bootstrap"]
@@ -538,6 +553,12 @@ class AnalysisEngine:
             if parse_time(row["observed_at"])
         ]
         samples.append((datetime.now(UTC).timestamp(), composite.price))
+        latest_timestamp = samples[-1][0]
+        self._recent_btc_samples = [
+            (timestamp, price)
+            for timestamp, price in samples
+            if latest_timestamp - timestamp <= SETTLEMENT_WINDOW_SECONDS + 5
+        ]
         vol_5m = realized_volatility(samples, 300)
         vol_15m = realized_volatility(samples, 900)
         vol_60m = realized_volatility(samples, 3600)
@@ -599,6 +620,49 @@ class AnalysisEngine:
             "momentum_5m": momentum_5m,
             "high_low_5m_pct": high_low_5m_pct,
             "volume_acceleration": volume_acceleration,
+        }
+
+    def _settlement_window_state(
+        self,
+        close: datetime | None,
+        observed_at: str,
+    ) -> dict[str, float | int | None]:
+        observed = parse_time(observed_at) or datetime.now(UTC)
+        if close is None:
+            return {
+                "average": None,
+                "elapsed_seconds": 0.0,
+                "sample_seconds": 0,
+                "coverage": 1.0,
+            }
+        seconds_remaining = max(0.0, (close - observed).total_seconds())
+        elapsed = clamp(
+            SETTLEMENT_WINDOW_SECONDS - seconds_remaining,
+            0.0,
+            SETTLEMENT_WINDOW_SECONDS,
+        )
+        if elapsed <= 0:
+            return {
+                "average": None,
+                "elapsed_seconds": 0.0,
+                "sample_seconds": 0,
+                "coverage": 1.0,
+            }
+        window_start = close.timestamp() - SETTLEMENT_WINDOW_SECONDS
+        observed_end = min(observed.timestamp(), close.timestamp())
+        per_second: dict[int, float] = {}
+        for timestamp, price in self._recent_btc_samples:
+            if window_start <= timestamp <= observed_end:
+                per_second[int(timestamp)] = price
+        sample_seconds = len(per_second)
+        expected_seconds = max(1, math.ceil(elapsed))
+        return {
+            "average": (
+                sum(per_second.values()) / sample_seconds if sample_seconds else None
+            ),
+            "elapsed_seconds": elapsed,
+            "sample_seconds": sample_seconds,
+            "coverage": min(1.0, sample_seconds / expected_seconds),
         }
 
     def _save_market(self, market: dict[str, Any], observed_at: str) -> None:
@@ -694,12 +758,23 @@ class AnalysisEngine:
         observed_at: str,
     ) -> tuple[dict[str, Any], dict[str, Any] | None]:
         close = parse_time(market.get("close_time"))
-        seconds_remaining = max(0.0, (close - datetime.now(UTC)).total_seconds()) if close else 0.0
+        observed = parse_time(observed_at) or datetime.now(UTC)
+        seconds_remaining = max(0.0, (close - observed).total_seconds()) if close else 0.0
         strike = market_strike(market)
+        settlement_window = self._settlement_window_state(close, observed_at)
+        benchmark_bias = float(self._benchmark_calibration.get("bias_pct") or 0.0)
+        benchmark_uncertainty = float(
+            self._benchmark_calibration.get("uncertainty_pct")
+            or DEFAULT_BENCHMARK_UNCERTAINTY_PCT
+        )
         baseline = settlement_probability(
             float(btc["price"]), float(strike), seconds_remaining,
             btc.get("volatility_15m") or btc.get("volatility_5m"),
             btc.get("momentum_5m") or 0.0,
+            basis_uncertainty_pct=benchmark_uncertainty,
+            observed_window_average=settlement_window["average"],
+            observed_window_seconds=float(settlement_window["elapsed_seconds"] or 0.0),
+            benchmark_bias_pct=benchmark_bias,
         )
         market_mid = (
             (market_state["yes_bid"] + market_state["yes_ask"]) / 2
@@ -718,6 +793,11 @@ class AnalysisEngine:
             "dispersion_pct": btc.get("dispersion_pct") or 0.0,
             "orderbook_imbalance": market_state.get("imbalance") or 0.0,
             "market_probability": market_mid,
+            "settlement_window_fraction": (
+                float(settlement_window["elapsed_seconds"] or 0.0)
+                / SETTLEMENT_WINDOW_SECONDS
+            ),
+            "benchmark_uncertainty_pct": benchmark_uncertainty,
         }
         probability, model_version = self.models.predict(features, baseline.probability)
         variants = []
@@ -727,12 +807,27 @@ class AnalysisEngine:
                     settlement_probability(
                         float(btc["price"]), float(strike), seconds_remaining, vol,
                         btc.get("momentum_5m") or 0.0,
+                        basis_uncertainty_pct=benchmark_uncertainty,
+                        observed_window_average=settlement_window["average"],
+                        observed_window_seconds=float(
+                            settlement_window["elapsed_seconds"] or 0.0
+                        ),
+                        benchmark_bias_pct=benchmark_bias,
                     ).probability
                 )
         variant_spread = max(variants) - min(variants) if len(variants) > 1 else 0.0
         calibration = self.calibration_summary()
         portfolio = self.paper.portfolio()
-        quality = self._data_quality(btc, market_state, seconds_remaining, settings)
+        quality = self._data_quality(
+            btc,
+            market_state,
+            seconds_remaining,
+            settings,
+            reference_price=baseline.reference_price,
+            strike=float(strike),
+            benchmark_uncertainty_pct=benchmark_uncertainty,
+            settlement_window=settlement_window,
+        )
         decision = make_decision(
             model_probability=probability,
             market=market_state,
@@ -770,6 +865,12 @@ class AnalysisEngine:
                 "model_version": model_version,
                 "z_distance": baseline.z_distance,
                 "annualized_volatility": baseline.annualized_volatility,
+                "settlement_proxy_price": baseline.reference_price,
+                "settlement_window": settlement_window,
+                "benchmark_calibration": self._benchmark_calibration,
+                "benchmark_uncertainty_dollars": (
+                    baseline.reference_price * benchmark_uncertainty
+                ),
                 "model_variant_spread": variant_spread,
                 "data_quality": quality,
                 "decision": decision.as_dict(),
@@ -777,12 +878,17 @@ class AnalysisEngine:
         )
         return summary, notification
 
+    @staticmethod
     def _data_quality(
-        self,
         btc: dict[str, Any],
         market: dict[str, Any],
         seconds_remaining: float,
         settings: dict[str, Any],
+        *,
+        reference_price: float,
+        strike: float,
+        benchmark_uncertainty_pct: float,
+        settlement_window: dict[str, float | int | None],
     ) -> dict[str, Any]:
         if int(btc.get("exchange_count") or 0) < 2:
             return {"reliable": False, "reason": "fewer than two exchange feeds responded"}
@@ -792,7 +898,34 @@ class AnalysisEngine:
             return {"reliable": False, "reason": "the contract is closing or transitioning"}
         if market.get("yes_ask") is None or market.get("no_ask") is None:
             return {"reliable": False, "reason": "an executable Kalshi ask is missing"}
-        return {"reliable": True, "reason": "critical feeds are current and mutually consistent"}
+        elapsed = float(settlement_window.get("elapsed_seconds") or 0.0)
+        coverage = float(settlement_window.get("coverage") or 0.0)
+        if elapsed >= 5.0 and coverage < 0.5:
+            return {
+                "reliable": True,
+                "trade_allowed": False,
+                "reason_code": "SETTLEMENT_WINDOW_INCOMPLETE",
+                "reason": (
+                    "Hold: final-minute proxy coverage is too sparse to estimate "
+                    "Kalshi's 60-second settlement average."
+                ),
+            }
+        uncertainty_dollars = reference_price * benchmark_uncertainty_pct
+        if abs(math.log(reference_price / strike)) <= benchmark_uncertainty_pct:
+            return {
+                "reliable": True,
+                "trade_allowed": False,
+                "reason_code": "BENCHMARK_UNCERTAINTY",
+                "reason": (
+                    "Hold: the projected settlement proxy is inside the learned "
+                    f"BRTI uncertainty band (+/-${uncertainty_dollars:,.2f})."
+                ),
+            }
+        return {
+            "reliable": True,
+            "trade_allowed": True,
+            "reason": "critical feeds are current and mutually consistent",
+        }
 
     def _save_signal(
         self,
@@ -854,6 +987,7 @@ class AnalysisEngine:
             self.paper.settle(ticker, result, settled_at)
             self._pending_settlements.discard(ticker)
             if inserted:
+                self._benchmark_calibration = self.models.benchmark_calibration()
                 count = self.db.fetch_one("SELECT COUNT(*) AS count FROM settlements")["count"]
                 latest = self.db.fetch_one(
                     "SELECT created_at FROM calibration_reports ORDER BY created_at DESC LIMIT 1"

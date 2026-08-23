@@ -110,7 +110,7 @@ class HistoricalBootstrapService:
                 annualized_volatility = 0.55
             strike = float(market_strike(market))
             estimate = settlement_probability(
-                spot, strike, 300, annualized_volatility, model_version="baseline-1.0"
+                spot, strike, 300, annualized_volatility, model_version="baseline-1.1"
             )
             market_probability = (yes_bid + yes_ask) / 2
             observed_at = datetime.fromtimestamp(observation_ts, UTC).isoformat()
@@ -153,6 +153,8 @@ class HistoricalBootstrapService:
                 "dispersion_pct": 0.0,
                 "orderbook_imbalance": 0.0,
                 "market_probability": market_probability,
+                "settlement_window_fraction": 0.0,
+                "benchmark_uncertainty_pct": estimate.basis_uncertainty_pct,
             }
             edge = estimate.probability - market_probability
             self.db.execute(
@@ -168,7 +170,7 @@ class HistoricalBootstrapService:
                     observed_at, ticker, "HISTORICAL OBSERVATION", "BOOTSTRAP", "Low",
                     "Point-in-time bootstrap observation; never used as a paper trade.",
                     estimate.probability, market_probability, edge, None, 0, 0, 0,
-                    "baseline-1.0", json.dumps({"features": features, "source": "coinbase+kalshi-candles"}),
+                    "baseline-1.1", json.dumps({"features": features, "source": "coinbase+kalshi-candles"}),
                     json.dumps({"price": spot, "source": "Coinbase 1-minute candle"}),
                     json.dumps({"yes_bid": yes_bid, "yes_ask": yes_ask}), "historical bootstrap",
                 ),

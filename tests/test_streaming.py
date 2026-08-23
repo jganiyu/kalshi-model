@@ -145,3 +145,35 @@ def test_live_composite_is_not_pinned_by_rest_only_quote() -> None:
     assert composite.price == 102.0
     assert composite.dispersion_pct == pytest.approx((4.0 / 101.0) * 100)
     assert len(composite.quotes) == 3
+
+
+def test_benchmark_band_and_sparse_settlement_window_block_automatic_trade() -> None:
+    btc = {"exchange_count": 3, "dispersion_pct": 0.01}
+    market = {"yes_ask": 0.55, "no_ask": 0.46}
+    settings = {"max_exchange_dispersion_pct": 0.4}
+
+    inside_band = AnalysisEngine._data_quality(
+        btc,
+        market,
+        30.0,
+        settings,
+        reference_price=100.01,
+        strike=100.0,
+        benchmark_uncertainty_pct=0.00015,
+        settlement_window={"elapsed_seconds": 30.0, "coverage": 1.0},
+    )
+    sparse_window = AnalysisEngine._data_quality(
+        btc,
+        market,
+        30.0,
+        settings,
+        reference_price=101.0,
+        strike=100.0,
+        benchmark_uncertainty_pct=0.00015,
+        settlement_window={"elapsed_seconds": 30.0, "coverage": 0.25},
+    )
+
+    assert inside_band["reliable"] is True
+    assert inside_band["trade_allowed"] is False
+    assert inside_band["reason_code"] == "BENCHMARK_UNCERTAINTY"
+    assert sparse_window["reason_code"] == "SETTLEMENT_WINDOW_INCOMPLETE"

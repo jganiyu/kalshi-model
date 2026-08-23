@@ -18,7 +18,7 @@ Chief, Kalshi Model is a local Mac command center for Kalshi's 15-minute Bitcoin
 ## What it does
 
 - **Dashboard:** Shows the live model, BTC chart, current contract, paper controls, and Kalshi order books.
-- **BTC composite:** Uses the median price from Coinbase, Kraken, and Bitstamp to reduce single-feed noise.
+- **BTC proxy:** Uses the median price from Coinbase, Kraken, and Bitstamp without presenting it as official BRTI.
 - **Chart:** Tracks BTC, the Kalshi threshold, price delta, market timer, and moving time and price axes.
 - **Current contract:** Shows the threshold, bids, asks, spread, liquidity, timer, and paper position.
 - **Paper Trading:** Simulates market and limit orders without sending anything to Kalshi.
@@ -44,14 +44,15 @@ Chief, Kalshi Model is a local Mac command center for Kalshi's 15-minute Bitcoin
 
 ## Model logic
 
-- **Distance:** Measures how far BTC is above or below the current Kalshi threshold.
-- **Time:** Increases the threshold's importance as the 15-minute market approaches settlement.
+- **Distance:** Measures how far the projected settlement proxy is above or below the Kalshi threshold.
+- **Settlement window:** Blends the elapsed final-minute proxy average with the expected remainder of Kalshi's 60-second window.
+- **Benchmark learning:** Measures proxy error against settled BRTI values and maintains a conservative uncertainty band.
 - **Movement:** Uses volatility, momentum, recent range, volume acceleration, and exchange dispersion.
 - **Market context:** Adds order-book imbalance and Kalshi's implied probability when enough training data exists.
 - **Probability:** Starts with a volatility-adjusted baseline and can graduate to regularized logistic regression.
 - **Decision:** Compares Up and Down after executable asks, slippage, fees, and the minimum edge setting.
 - **Sizing:** Uses capped fractional Kelly sizing with bankroll, position, liquidity, and drawdown limits.
-- **Safety:** Holds during stale feeds, high dispersion, contract transitions, or missing executable prices.
+- **Safety:** Holds during stale feeds, high dispersion, sparse final-minute coverage, benchmark uncertainty, contract transitions, or missing executable prices.
 
 ## Calibration
 
@@ -94,7 +95,7 @@ KALSHI_PRIVATE_KEY_PATH=/absolute/path/to/your-private-key.pem
 ## Local data
 
 - **Database:** Each installation creates its own `data/kalshi_model.db` and starts with a fresh paper account.
-- **Settlement source:** Kalshi settles with CF Benchmarks BRTI while the app uses a multi-exchange spot composite as a live proxy.
+- **Settlement source:** Kalshi settles with CF Benchmarks BRTI; the app learns the gap from its multi-exchange proxy over time.
 - **Privacy:** Credentials, databases, backups, and generated app bundles are ignored by Git.
 
 ## Tests

@@ -257,6 +257,22 @@ MIGRATIONS: list[tuple[int, str]] = [
             ON paper_orders(status, ticker);
         """,
     ),
+    (
+        4,
+        """
+        UPDATE model_versions SET status='retired' WHERE status='active';
+        INSERT OR IGNORE INTO model_versions(
+            version, created_at, model_type, status, training_samples,
+            validation_json, parameters_json, promoted_at, parent_version
+        ) VALUES (
+            'baseline-1.1', strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+            'settlement-average', 'active', 0,
+            '{"note":"Settlement-aware analytical baseline"}',
+            '{"volatility_floor":0.15,"volatility_cap":2.5,"settlement_window_seconds":60}',
+            strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), 'baseline-1.0'
+        );
+        """,
+    ),
 ]
 
 
@@ -318,15 +334,21 @@ class Database:
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
-                    "baseline-1.0",
+                    "baseline-1.1",
                     iso_now(),
-                    "distance-volatility",
+                    "settlement-average",
                     "active",
                     0,
-                    json.dumps({"note": "Analytical cold-start model"}),
-                    json.dumps({"volatility_floor": 0.15, "volatility_cap": 2.5}),
+                    json.dumps({"note": "Settlement-aware analytical baseline"}),
+                    json.dumps(
+                        {
+                            "volatility_floor": 0.15,
+                            "volatility_cap": 2.5,
+                            "settlement_window_seconds": 60,
+                        }
+                    ),
                     iso_now(),
-                    None,
+                    "baseline-1.0",
                 ),
             )
 

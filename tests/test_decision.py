@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from app.services.decision import make_decision, material_change
 
 
@@ -42,6 +44,21 @@ def test_data_quality_blocks_trade() -> None:
     result = decide(data_quality={"reliable": False, "reason": "stale feed"})
     assert result.signal == "NO TRADE"
     assert result.reason_code == "DATA_UNRELIABLE"
+
+
+def test_benchmark_uncertainty_forces_hold_without_degrading_live_data() -> None:
+    result = decide(
+        data_quality={
+            "reliable": True,
+            "trade_allowed": False,
+            "reason_code": "BENCHMARK_UNCERTAINTY",
+            "reason": "Hold: proxy is inside the benchmark band.",
+        }
+    )
+
+    assert result.signal == "NO TRADE"
+    assert result.reason_code == "BENCHMARK_UNCERTAINTY"
+    assert result.edge == pytest.approx(0.125)
 
 
 def test_positive_ev_produces_yes_signal_and_conservative_size() -> None:

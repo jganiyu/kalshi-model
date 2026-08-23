@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import json
+import math
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
+
+import pytest
 
 from app.db import Database
 from app.domain import iso_now
@@ -36,7 +40,8 @@ def test_database_migrations_and_settings_persist(tmp_path: Path) -> None:
     reopened.initialize()
     assert reopened.settings()["starting_bankroll"] == 2_500.0
     assert "unknown" not in reopened.settings()
-    assert reopened.fetch_one("SELECT MAX(version) version FROM schema_migrations")["version"] == 3
+    assert reopened.fetch_one("SELECT MAX(version) version FROM schema_migrations")["version"] == 4
+    assert ModelManager(reopened).active()["version"] == "baseline-1.1"
 
 
 def test_new_database_starts_with_clean_manual_paper_account(tmp_path: Path) -> None:
@@ -139,3 +144,59 @@ def test_model_promotion_requires_forward_validation_and_minimum_sample(tmp_path
     assert report["candidate"]["sample_size"] < 120
     assert report["promoted"] is True
     assert manager.active()["model_type"] == "regularized-logistic"
+
+
+def test_benchmark_calibration_learns_from_final_minute_proxy_ticks(tmp_path: Path) -> None:
+    db = make_db(tmp_path)
+    close = datetime(2026, 8, 23, 16, 0, tzinfo=UTC)
+    official = 100.01
+    for index in range(20):
+        ticker = f"BASIS-{index:02d}"
+        raw = json.dumps({"expiration_value": f"{official:.2f}"})
+        db.execute(
+            """
+            INSERT INTO markets(
+                ticker,event_ticker,status,title,strike,open_time,close_time,
+                expected_expiration_time,result,rules_primary,rules_secondary,raw_json,
+                first_seen_at,updated_at
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                ticker, ticker, "finalized", "test", 100.0,
+                (close - timedelta(minutes=15)).isoformat(), close.isoformat(),
+                close.isoformat(), "yes", "", "", raw, iso_now(), iso_now(),
+            ),
+        )
+        db.execute(
+            """
+            INSERT INTO settlements(
+                ticker,settled_at,result,settlement_value,raw_json,processed_at
+            ) VALUES (?,?,?,?,?,?)
+            """,
+            (ticker, close.isoformat(), 1, 1.0, raw, iso_now()),
+        )
+    db.executemany(
+        """
+        INSERT INTO btc_ticks(
+            observed_at,composite_price,dispersion_pct,exchange_count,source_json
+        ) VALUES (?,?,?,?,?)
+        """,
+        [
+            (
+                (close - timedelta(seconds=second)).isoformat(),
+                100.0,
+                0.01,
+                3,
+                "{}",
+            )
+            for second in range(1, 31)
+        ],
+    )
+
+    summary = ModelManager(db).benchmark_calibration()
+
+    assert summary["sample_size"] == 20
+    assert summary["calibrated"] is True
+    assert summary["bias_pct"] == pytest.approx(math.log(official / 100.0))
+    assert summary["uncertainty_pct"] == pytest.approx(0.00015)
+    assert summary["average_window_coverage"] == pytest.approx(0.5)

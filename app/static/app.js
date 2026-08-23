@@ -238,7 +238,7 @@ function renderDashboard(data) {
   syncPriceMovement();
   $("#chart-now-distance").textContent = threshold === null
     ? "Waiting for threshold"
-    : distance === null ? "Waiting for reference price"
+    : distance === null ? "Waiting for proxy price"
     : `${distance > 0 ? "+" : ""}${money(distance)} (${percent(distance / threshold, 3, true)})`;
   $("#btc-dispersion").textContent = btc.price
     ? `${btc.exchange_count} feeds · ${Number(btc.dispersion_pct || 0).toFixed(3)}% dispersion`

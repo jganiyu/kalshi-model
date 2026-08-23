@@ -53,6 +53,24 @@ def make_decision(
             "NO TRADE", "DATA_UNRELIABLE", "Low", f"Data unreliable: {detail}",
             model_probability, implied, None, None, None, None, 0.0, 0.0, 0, None,
         )
+    if not data_quality.get("trade_allowed", True):
+        edge = float(model_probability) - float(implied)
+        return Decision(
+            "NO TRADE",
+            str(data_quality.get("reason_code") or "MODEL_UNCERTAINTY"),
+            "Low",
+            str(data_quality.get("reason") or "Hold: model uncertainty is too high."),
+            model_probability,
+            implied,
+            edge,
+            None,
+            None,
+            None,
+            0.0,
+            0.0,
+            0,
+            None,
+        )
 
     slippage = float(settings.get("slippage_cents", 0.5)) / 100
     executable_yes = min(0.999, float(yes_ask) + slippage)

@@ -1,13 +1,19 @@
 from __future__ import annotations
 
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import numpy as np
 
 from app.db import Database
-from app.domain import calibration_metrics, clamp, iso_now
+from app.domain import (
+    benchmark_error_summary,
+    calibration_metrics,
+    clamp,
+    iso_now,
+    parse_time,
+)
 
 
 FEATURE_NAMES = [
@@ -22,6 +28,8 @@ FEATURE_NAMES = [
     "dispersion_pct",
     "orderbook_imbalance",
     "market_probability",
+    "settlement_window_fraction",
+    "benchmark_uncertainty_pct",
 ]
 
 MIN_CANDIDATE_OBSERVATIONS = 12
@@ -88,16 +96,69 @@ class ModelManager:
             "SELECT * FROM model_versions WHERE status='active' ORDER BY promoted_at DESC LIMIT 1"
         )
         if not row:
-            return {"version": "baseline-1.0", "model_type": "distance-volatility"}
+            return {"version": "baseline-1.1", "model_type": "settlement-average"}
         row["parameters"] = json.loads(row["parameters_json"])
         row["validation"] = json.loads(row["validation_json"])
         return row
 
     def predict(self, features: dict[str, Any], baseline_probability: float) -> tuple[float, str]:
         model = self.active()
-        if model.get("model_type") == "regularized-logistic":
+        if (
+            model.get("model_type") == "regularized-logistic"
+            and model.get("parameters", {}).get("feature_names") == FEATURE_NAMES
+        ):
             return predict_logistic(model["parameters"], features), str(model["version"])
-        return baseline_probability, str(model.get("version", "baseline-1.0"))
+        return baseline_probability, str(model.get("version", "baseline-1.1"))
+
+    def benchmark_calibration(self, limit: int = 120) -> dict[str, Any]:
+        rows = self.db.fetch_all(
+            """
+            SELECT z.raw_json, m.close_time
+            FROM settlements z
+            JOIN markets m ON m.ticker = z.ticker
+            WHERE m.close_time IS NOT NULL
+            ORDER BY m.close_time DESC
+            LIMIT ?
+            """,
+            (limit,),
+        )
+        observations: list[tuple[float, float]] = []
+        coverage: list[float] = []
+        for row in rows:
+            try:
+                payload = json.loads(row["raw_json"])
+                official = float(payload.get("expiration_value"))
+                close = parse_time(row["close_time"])
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            if official <= 0 or close is None:
+                continue
+            start = close - timedelta(seconds=60)
+            proxy = self.db.fetch_one(
+                """
+                SELECT AVG(second_price) AS proxy_average,
+                       COUNT(*) AS sample_seconds
+                FROM (
+                    SELECT substr(observed_at, 1, 19) AS observed_second,
+                           AVG(composite_price) AS second_price
+                    FROM btc_ticks
+                    WHERE observed_at >= ? AND observed_at <= ?
+                    GROUP BY observed_second
+                )
+                """,
+                (start.isoformat(), close.isoformat()),
+            )
+            sample_seconds = int((proxy or {}).get("sample_seconds") or 0)
+            proxy_average = (proxy or {}).get("proxy_average")
+            if sample_seconds < 20 or proxy_average is None:
+                continue
+            observations.append((float(proxy_average), official))
+            coverage.append(min(1.0, sample_seconds / 60.0))
+        summary = benchmark_error_summary(observations)
+        summary["average_window_coverage"] = (
+            sum(coverage) / len(coverage) if coverage else None
+        )
+        return summary
 
     def observations(self) -> list[dict[str, Any]]:
         rows = self.db.fetch_all(

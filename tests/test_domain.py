@@ -5,6 +5,7 @@ import math
 import pytest
 
 from app.domain import (
+    benchmark_error_summary,
     calibration_metrics,
     expected_value,
     fractional_kelly_fraction,
@@ -37,6 +38,33 @@ def test_probability_stays_finite_at_expiry() -> None:
     estimate = settlement_probability(100_000, 100_000, 0, None)
     assert math.isfinite(estimate.probability)
     assert 0.01 <= estimate.probability <= 0.99
+
+
+def test_probability_blends_the_observed_final_minute_average() -> None:
+    estimate = settlement_probability(
+        110.0,
+        100.0,
+        30.0,
+        0.55,
+        basis_uncertainty_pct=0.0,
+        observed_window_average=90.0,
+        observed_window_seconds=30.0,
+    )
+
+    assert estimate.reference_price == pytest.approx(100.0)
+    assert estimate.effective_horizon_seconds == pytest.approx(2.5)
+    assert estimate.probability == pytest.approx(0.5)
+
+
+def test_benchmark_error_requires_evidence_and_keeps_a_conservative_floor() -> None:
+    insufficient = benchmark_error_summary([(100.0, 100.01)] * 19)
+    calibrated = benchmark_error_summary([(100.0, 100.01)] * 20)
+
+    assert insufficient["calibrated"] is False
+    assert insufficient["bias_pct"] == 0.0
+    assert calibrated["calibrated"] is True
+    assert calibrated["bias_pct"] == pytest.approx(math.log(100.01 / 100.0))
+    assert calibrated["uncertainty_pct"] == pytest.approx(0.00015)
 
 
 def test_robust_composite_uses_median_and_reports_dispersion() -> None:

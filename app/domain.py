@@ -9,6 +9,9 @@ from typing import Iterable, Sequence
 
 
 SECONDS_PER_YEAR = 365.25 * 24 * 60 * 60
+SETTLEMENT_WINDOW_SECONDS = 60.0
+DEFAULT_BENCHMARK_UNCERTAINTY_PCT = 0.00015
+MIN_BENCHMARK_CALIBRATION_SAMPLES = 20
 
 
 def utc_now() -> datetime:
@@ -91,6 +94,9 @@ class ProbabilityEstimate:
     raw_probability: float
     z_distance: float
     annualized_volatility: float
+    reference_price: float
+    effective_horizon_seconds: float
+    basis_uncertainty_pct: float
     model_version: str
     explanation: str
 
@@ -101,18 +107,50 @@ def settlement_probability(
     seconds_remaining: float,
     annualized_volatility: float | None,
     momentum_5m: float = 0.0,
-    basis_uncertainty_pct: float = 0.00015,
-    model_version: str = "baseline-1.0",
+    basis_uncertainty_pct: float = DEFAULT_BENCHMARK_UNCERTAINTY_PCT,
+    model_version: str = "baseline-1.1",
+    observed_window_average: float | None = None,
+    observed_window_seconds: float = 0.0,
+    benchmark_bias_pct: float = 0.0,
 ) -> ProbabilityEstimate:
     """Interpretable distance/volatility model for P(final BRTI average >= strike)."""
     if spot <= 0 or strike <= 0:
         raise ValueError("spot and strike must be positive")
-    horizon = max(1.0, seconds_remaining)
+    horizon = max(0.0, seconds_remaining)
+    bias = clamp(benchmark_bias_pct, -0.0005, 0.0005)
+    bias_multiplier = math.exp(bias)
+    corrected_spot = spot * bias_multiplier
+    elapsed = clamp(observed_window_seconds, 0.0, SETTLEMENT_WINDOW_SECONDS)
+    has_observed_window = bool(
+        horizon < SETTLEMENT_WINDOW_SECONDS
+        and observed_window_average is not None
+        and observed_window_average > 0
+        and elapsed > 0
+    )
+    if has_observed_window:
+        remaining_window = SETTLEMENT_WINDOW_SECONDS - elapsed
+        corrected_average = float(observed_window_average) * bias_multiplier
+        reference_price = (
+            corrected_average * elapsed + corrected_spot * remaining_window
+        ) / SETTLEMENT_WINDOW_SECONDS
+        effective_horizon = max(
+            1.0,
+            remaining_window**3
+            / (3.0 * SETTLEMENT_WINDOW_SECONDS**2),
+        )
+    else:
+        reference_price = corrected_spot
+        effective_horizon = max(
+            1.0,
+            horizon - (2.0 * SETTLEMENT_WINDOW_SECONDS / 3.0)
+            if horizon >= SETTLEMENT_WINDOW_SECONDS
+            else horizon**3 / (3.0 * SETTLEMENT_WINDOW_SECONDS**2),
+        )
     vol = clamp(annualized_volatility or 0.55, 0.15, 2.50)
-    horizon_sigma = vol * math.sqrt(horizon / SECONDS_PER_YEAR)
+    horizon_sigma = vol * math.sqrt(effective_horizon / SECONDS_PER_YEAR)
     basis_sigma = max(basis_uncertainty_pct, 0.0)
     total_sigma = math.sqrt(horizon_sigma**2 + basis_sigma**2)
-    distance = math.log(spot / strike)
+    distance = math.log(reference_price / strike)
     # Only a small, decaying fraction of recent momentum is carried forward.
     momentum_weight = clamp(horizon / 900.0, 0.0, 1.0) * 0.12
     adjusted_distance = distance + momentum_weight * momentum_5m
@@ -120,18 +158,68 @@ def settlement_probability(
     raw = normal_cdf(z_distance)
     probability = clamp(raw, 0.01, 0.99)
     direction = "above" if distance >= 0 else "below"
-    explanation = (
-        f"BTC is {direction} the threshold with {int(horizon)} seconds left; "
-        "the estimate scales that distance by recent volatility."
-    )
+    if has_observed_window:
+        explanation = (
+            f"The projected 60-second settlement proxy is {direction} the threshold; "
+            f"{int(elapsed)} seconds of the closing window are already averaged."
+        )
+    else:
+        explanation = (
+            f"The settlement proxy is {direction} the threshold with {int(horizon)} seconds left; "
+            "the estimate includes closing-average volatility and benchmark uncertainty."
+        )
     return ProbabilityEstimate(
         probability=probability,
         raw_probability=raw,
         z_distance=z_distance,
         annualized_volatility=vol,
+        reference_price=reference_price,
+        effective_horizon_seconds=effective_horizon,
+        basis_uncertainty_pct=basis_sigma,
         model_version=model_version,
         explanation=explanation,
     )
+
+
+def benchmark_error_summary(
+    observations: Iterable[tuple[float, float]],
+    *,
+    uncertainty_floor_pct: float = DEFAULT_BENCHMARK_UNCERTAINTY_PCT,
+    minimum_samples: int = MIN_BENCHMARK_CALIBRATION_SAMPLES,
+) -> dict[str, float | int | bool | None]:
+    residuals = [
+        math.log(float(official) / float(proxy))
+        for proxy, official in observations
+        if proxy > 0 and official > 0 and abs(math.log(float(official) / float(proxy))) <= 0.005
+    ]
+    sample_size = len(residuals)
+    mean_absolute_error = (
+        sum(abs(value) for value in residuals) / sample_size if sample_size else None
+    )
+    if sample_size < minimum_samples:
+        return {
+            "sample_size": sample_size,
+            "minimum_samples": minimum_samples,
+            "calibrated": False,
+            "bias_pct": 0.0,
+            "residual_sigma_pct": None,
+            "mean_absolute_error_pct": mean_absolute_error,
+            "uncertainty_pct": uncertainty_floor_pct,
+        }
+    bias = clamp(float(median(residuals)), -0.0005, 0.0005)
+    deviations = [value - bias for value in residuals]
+    robust_sigma = 1.4826 * float(median(abs(value) for value in deviations))
+    standard_sigma = math.sqrt(sum(value**2 for value in deviations) / sample_size)
+    residual_sigma = max(robust_sigma, standard_sigma)
+    return {
+        "sample_size": sample_size,
+        "minimum_samples": minimum_samples,
+        "calibrated": True,
+        "bias_pct": bias,
+        "residual_sigma_pct": residual_sigma,
+        "mean_absolute_error_pct": mean_absolute_error,
+        "uncertainty_pct": max(uncertainty_floor_pct, residual_sigma * 2.0),
+    }
 
 
 def market_probability(yes_bid: float | None, yes_ask: float | None) -> float | None:
