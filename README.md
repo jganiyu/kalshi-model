@@ -1,87 +1,94 @@
 # Kalshi Model
 
-Kalshi Model is a local Mac application for analyzing Kalshi's 15-minute Bitcoin
-Up or Down markets (`KXBTC15M`). It combines live Bitcoin and Kalshi data, estimates
-the probability of an Up settlement, compares that estimate with executable market
-prices, and tests the decision logic through paper trading.
+Chief, Kalshi Model is a local Mac command center for Kalshi's 15-minute Bitcoin Up or Down markets. I watch Bitcoin, compare the model's odds with live Kalshi prices, and call Buy Up, Hold, or Buy Down when the math changes. No real orders leave this machine; even I know better than to fire without authorization.
 
-The app cannot place real Kalshi orders. It is a research and simulation tool, not
-financial advice.
+> Research and paper trading only, not financial advice.
 
-## Features
+<table>
+  <tr>
+    <td width="50%"><img src="docs/screenshots/dashboard-light.jpg" alt="Kalshi Model dashboard in light mode"></td>
+    <td width="50%"><img src="docs/screenshots/dashboard-dark.jpg" alt="Kalshi Model dashboard in dark mode"></td>
+  </tr>
+  <tr>
+    <td align="center"><strong>Light mode</strong></td>
+    <td align="center"><strong>Dark mode</strong></td>
+  </tr>
+</table>
 
-- Live Bitcoin composite built from Coinbase, Kraken, and Bitstamp.
-- Fluid chart with the current Kalshi threshold, BTC price, delta, and market timer.
-- Live Up and Down order books.
-- Model probability, Kalshi probability, edge, expected value, and confidence.
-- `Buy Up`, `Hold`, and `Buy Down` model signals.
-- Manual market and limit paper orders using live executable prices.
-- Optional automatic signal-based paper trading.
-- Paper bankroll, positions, open orders, trade history, drawdown controls, and round reset.
-- Calibration history with reliability buckets and model-version tracking.
-- Light and dark themes.
-- Local SQLite storage and local database backups.
+## What it does
 
-## How the model works
+- **Dashboard:** Shows the live model, BTC chart, current contract, paper controls, and Kalshi order books.
+- **BTC composite:** Uses the median price from Coinbase, Kraken, and Bitstamp to reduce single-feed noise.
+- **Chart:** Tracks BTC, the Kalshi threshold, price delta, market timer, and moving time and price axes.
+- **Current contract:** Shows the threshold, bids, asks, spread, liquidity, timer, and paper position.
+- **Paper Trading:** Simulates market and limit orders without sending anything to Kalshi.
+- **Order books:** Displays live Up and Down bids, asks, contract depth, and total value.
+- **Calibration:** Measures forecast accuracy and decides when a trained model is ready to replace the baseline.
+- **Local storage:** Keeps settings, model evidence, paper trades, and backups in SQLite on your Mac.
+- **Themes:** Supports system, light, and dark appearance modes.
 
-1. The app takes the median of the available BTC exchange prices to reduce the
-   effect of a single unusual feed.
-2. It measures BTC's distance from the Kalshi threshold, time remaining, recent
-   volatility, short-term momentum, and uncertainty between the spot composite and
-   Kalshi's BRTI settlement source.
-3. The cold-start model converts that volatility-adjusted distance into an Up
-   probability. Its estimate becomes more sensitive to the threshold as settlement
-   approaches.
-4. Once enough settled observations exist, the app can use a regularized logistic
-   model. Its features include distance, time, volatility, momentum, recent range,
-   volume acceleration, exchange dispersion, order-book imbalance, and Kalshi's
-   market probability.
-5. The app evaluates both Up and Down using the current ask, configured slippage,
-   and Kalshi's taker fee. It only produces a buy signal when expected value is
-   positive and the executable probability edge clears the configured minimum.
-6. Suggested paper size uses capped fractional Kelly sizing plus bankroll,
-   per-trade, position, liquidity, and session-drawdown limits.
+## Current signal
 
-Missing or stale feeds, excessive exchange dispersion, a transitioning contract,
-or an unavailable executable price cause the app to hold instead of forcing a
-decision. Model direction remains visible when paper-trading risk controls pause
-execution.
+![Current signal panel](docs/screenshots/current-signal.jpg)
 
-## How calibration improves over time
+- **Buy Up:** The Up contract has positive expected value and clears the configured executable-edge requirement.
+- **Hold:** Neither contract safely clears the decision rules, or the required market data is not reliable.
+- **Buy Down:** The Down contract has positive expected value and clears the configured executable-edge requirement.
+- **Confidence:** Rates the signal using edge, spread, model agreement, sample size, and calibration quality.
+- **Explanation:** States the immediate reason for the current signal in plain language.
+- **Model:** The model's estimated probability that Bitcoin settles above the threshold.
+- **Kalshi:** The Up probability implied by the midpoint of Kalshi's current Up bid and ask.
+- **Edge:** The model's probability advantage over Kalshi's midpoint for the preferred contract.
+- **EV / contract:** Estimated profit for one preferred-side contract after price, slippage, and Kalshi's taker fee.
+- **Paper status:** Shows whether automatic paper trading may act on a qualifying signal.
 
-After a market settles, the app pairs its result with the latest stored model
-prediction for that contract. It then measures:
+## Model logic
 
-- **Brier score:** the average squared error of the probability forecasts. Lower is
-  better.
-- **Calibration error:** the difference between predicted probability and actual
-  outcomes within probability buckets. Lower is better.
+- **Distance:** Measures how far BTC is above or below the current Kalshi threshold.
+- **Time:** Increases the threshold's importance as the 15-minute market approaches settlement.
+- **Movement:** Uses volatility, momentum, recent range, volume acceleration, and exchange dispersion.
+- **Market context:** Adds order-book imbalance and Kalshi's implied probability when enough training data exists.
+- **Probability:** Starts with a volatility-adjusted baseline and can graduate to regularized logistic regression.
+- **Decision:** Compares Up and Down after executable asks, slippage, fees, and the minimum edge setting.
+- **Sizing:** Uses capped fractional Kelly sizing with bankroll, position, liquidity, and drawdown limits.
+- **Safety:** Holds during stale feeds, high dispersion, contract transitions, or missing executable prices.
 
-Candidate training begins after 12 settled observations. The candidate is a
-regularized logistic model trained on up to the latest 1,000 contracts and tested
-with expanding-window, one-step-forward validation, so future outcomes never enter
-an earlier training fold.
+## Calibration
 
-A candidate can replace the active model only when all of these are true:
+- **Settlement matching:** Pairs each settled contract with its last stored prediction.
+- **Brier score:** Measures squared probability error; lower is better.
+- **Calibration error:** Measures the gap between predicted probabilities and observed outcomes; lower is better.
+- **Candidate training:** Begins after 12 settlements and uses up to the latest 1,000 contracts.
+- **Validation:** Uses expanding-window forward tests so future results never leak into earlier training.
+- **Promotion:** Requires 120 settlements, 7 UTC days, a `0.005` Brier improvement, and no major calibration loss.
+- **Schedule:** Rechecks after each of the first 20 settlements, then once per UTC day when new evidence arrives.
+- **Independence:** Resetting paper trading never erases model evidence or calibration history.
 
-- At least 120 settled contracts are available.
-- Those contracts cover at least 7 UTC days.
-- Candidate Brier score improves by at least `0.005` on the comparison window.
-- Candidate calibration error is no more than `0.01` worse than the incumbent.
+## Kalshi credentials
 
-If a candidate fails those checks, the current model stays active. Calibration runs
-after each of the first 20 stored settlements and then when a new settlement arrives
-on a UTC day without a report. Automatic or manual historical bootstrap also updates
-the report. Resetting a paper-trading round does not erase model evidence or
-calibration history.
+![Kalshi credentials setup form](docs/screenshots/credentials-setup.jpg)
+
+- **Without credentials:** Public REST data works, but Kalshi prices update less fluidly.
+- **With credentials:** Your API Key ID and RSA private key enable the live Kalshi WebSocket.
+- **Create a key:** Open Kalshi's **Account & security**, choose **API Keys**, and use read-only access when available.
+- **Connect:** Open Kalshi Model's **Settings**, enter the Key ID, choose the downloaded key file, and press **Save and connect**.
+- **Storage:** The app saves a protected local copy under `~/Library/Application Support/Kalshi Model/`.
+- **Security:** Never commit `.env`, your Key ID, or your private key.
+
+Environment setup is also supported:
+
+```bash
+cp .env.example .env
+```
+
+```bash
+KALSHI_API_KEY_ID=your-key-id
+KALSHI_PRIVATE_KEY_PATH=/absolute/path/to/your-private-key.pem
+```
 
 ## Run on a Mac
 
-Requirements:
-
-- macOS
-- Python 3.11 or newer
-- Internet connection
+Requires macOS, Python 3.11 or newer, and an internet connection.
 
 ```bash
 git clone https://github.com/jganiyu/kalshi-model.git
@@ -89,69 +96,23 @@ cd kalshi-model
 ./start.sh
 ```
 
-The first launch creates a virtual environment, installs dependencies, creates the
-local database, and opens [http://127.0.0.1:8765](http://127.0.0.1:8765). Later
-launches reuse the same environment. Stop the app with `Control-C` in Terminal.
+The first launch installs dependencies, creates the local database, and opens [http://127.0.0.1:8765](http://127.0.0.1:8765).
 
-## Kalshi streaming credentials
-
-Public REST data works without credentials. Fluid Kalshi WebSocket updates require
-your own Kalshi API Key ID and RSA private key.
-
-1. In Kalshi, open **Account & security**, then **API Keys**.
-2. Create a key, choose read-only access when scopes are offered, and save the
-   downloaded private key file.
-3. In Kalshi Model, open **Settings** and use the **Kalshi credentials** form.
-
-The form validates the RSA key and saves a protected local copy under
-`~/Library/Application Support/Kalshi Model/`. It reconnects the market-data stream
-without exposing the private key to the UI or database.
-
-For environment-based setup instead, create `.env`:
-
-```bash
-cp .env.example .env
-```
-
-Then set these values in `.env`:
-
-```bash
-KALSHI_API_KEY_ID=your-key-id
-KALSHI_PRIVATE_KEY_PATH=/absolute/path/to/your-private-key.pem
-```
-
-Keep the private key outside this repository and restrict it with `chmod 600`.
-Never commit `.env` or the private key.
-
-## Build the macOS app
+## Build the Mac app
 
 ```bash
 ./scripts/build_macos_app.sh
 ```
 
-This creates:
+This creates `dist/Kalshi Model.app` and `dist/Kalshi-Model-macOS-<architecture>.zip`.
 
-- `dist/Kalshi Model.app`
-- `dist/Kalshi-Model-macOS-<architecture>.zip`
-
-The application bundle contains Python and its dependencies, opens the local UI on
-launch, uses the custom Kalshi Model icon, and stores packaged-app data under
-`~/Library/Application Support/Kalshi Model/`.
-
-The local build is ad-hoc signed. A public download may require the user to
-right-click the app and choose **Open** the first time. Frictionless public
-distribution requires an Apple Developer ID certificate and Apple notarization.
+The local build is ad-hoc signed; public distribution without a first-launch warning requires Apple Developer ID signing and notarization.
 
 ## Local data
 
-Each installation creates its own `data/kalshi_model.db`. Market history, model
-evidence, settings, paper trades, and backups remain on that Mac and are ignored by
-Git. A fresh clone therefore starts with a fresh paper account and builds its own
-calibration history.
-
-Kalshi settles these markets from CF Benchmarks BRTI, while this app uses a
-multi-exchange spot composite as a live proxy. The model includes basis uncertainty,
-but the two sources can still differ.
+- **Database:** Each installation creates its own `data/kalshi_model.db` and starts with a fresh paper account.
+- **Settlement source:** Kalshi settles with CF Benchmarks BRTI while the app uses a multi-exchange spot composite as a live proxy.
+- **Privacy:** Credentials, databases, backups, and generated app bundles are ignored by Git.
 
 ## Tests
 
@@ -159,6 +120,4 @@ but the two sources can still differ.
 .venv/bin/python -m pytest
 ```
 
-The test suite covers probability and fee math, decision gates, risk controls,
-paper-order execution and persistence, settlement, calibration, model promotion,
-and streaming order-book behavior.
+Tests cover model math, fees, signal gates, risk controls, paper orders, settlement, calibration, promotion, and streaming order books.
