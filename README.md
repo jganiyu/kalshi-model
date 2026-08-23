@@ -119,7 +119,7 @@ Choose one route; most people should use the download.
 3. On first launch, right-click the app and choose **Open**.
 4. Add your Kalshi credentials in the app's **Settings** page.
 
-This route needs no Python or Terminal; private-repository collaborators must be signed in to GitHub.
+The app opens in its own native macOS window and needs no Python, Terminal, or browser tab.
 
 ### 2. Run from source
 
