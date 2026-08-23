@@ -15,7 +15,7 @@
       document.documentElement.dataset.themePreference = preference;
     })();
   </script>
-  <link rel="stylesheet" href="/static/styles.css?v=0.1.5">
+  <link rel="stylesheet" href="/static/styles.css?v=0.1.5-2">
 </head>
 <body>
   <div class="app-shell">
@@ -56,7 +56,6 @@
               </div>
               <h2 id="signal-title" hidden></h2>
             </div>
-            <span class="paper-permission" id="paper-permission" hidden></span>
             <p id="signal-explanation">Connecting to Kalshi and public BTC feeds.</p>
           </div>
           <div class="decision-numbers">
@@ -126,6 +125,7 @@
               <div><p class="eyebrow">PAPER TRADING</p><h3 id="paper-controller-title">Manual order</h3></div>
               <span class="simulated-label">SIMULATED</span>
             </div>
+            <span class="paper-permission" id="paper-permission" hidden></span>
             <div class="paper-order-toolbar">
               <div class="segmented order-action-picker" role="group" aria-label="Order action">
                 <button type="button" class="active" data-paper-action="BUY">Buy</button>

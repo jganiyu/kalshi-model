@@ -214,14 +214,19 @@ function renderDashboard(data) {
   signalTitleElement.hidden = !confidence;
   const paperPermission = $("#paper-permission");
   const paper = data.paper || {};
-  const paperBlocked = paper.automatic_trade_allowed === false;
-  paperPermission.hidden = !paperBlocked;
-  paperPermission.classList.toggle("off", paperBlocked && !paper.automatic_trading_enabled);
-  paperPermission.textContent = paperBlocked
-    ? paper.automatic_trading_enabled
-      ? `Paper trading paused · ${paper.automatic_trade_block_reason || "Risk control active."}`
-      : paper.automatic_trade_block_reason || "Automatic paper trading is off."
-    : "";
+  const automaticTradingEnabled = Boolean(paper.automatic_trading_enabled);
+  const paperBlocked = automaticTradingEnabled && paper.automatic_trade_allowed === false;
+  const automaticTradingStatus = paperBlocked
+    ? `Automatic trading paused · ${paper.automatic_trade_block_reason || "Risk control active."}`
+    : automaticTradingEnabled
+      ? "Automatic trading on"
+      : "Automatic trading off";
+  paperPermission.hidden = false;
+  paperPermission.classList.toggle("on", automaticTradingEnabled && !paperBlocked);
+  paperPermission.classList.toggle("off", !automaticTradingEnabled);
+  paperPermission.classList.toggle("paused", paperBlocked);
+  paperPermission.textContent = automaticTradingStatus;
+  paperPermission.title = automaticTradingStatus;
   $("#signal-explanation").textContent = formatMarketLanguage(decision?.explanation || system.message || "Connecting to public feeds.");
   $("#model-probability").textContent = percent(decision?.model_probability, 1);
   $("#market-probability").textContent = percent(decision?.market_probability, 1);
