@@ -1,0 +1,111 @@
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+from app.db import Database
+from app.domain import iso_now
+from app.services.decision import Decision
+from app.services.paper import PaperTradingService
+from app.services.training import ModelManager
+
+
+def make_db(tmp_path: Path) -> Database:
+    db = Database(tmp_path / "test.db")
+    db.initialize()
+    return db
+
+
+def add_market(db: Database, ticker: str) -> None:
+    db.execute(
+        """
+        INSERT INTO markets(
+            ticker,event_ticker,status,title,strike,open_time,close_time,
+            expected_expiration_time,result,rules_primary,rules_secondary,raw_json,
+            first_seen_at,updated_at
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """,
+        (ticker, ticker, "finalized", "test", 100.0, iso_now(), iso_now(), iso_now(), "", "", "", "{}", iso_now(), iso_now()),
+    )
+
+
+def test_database_migrations_and_settings_persist(tmp_path: Path) -> None:
+    db = make_db(tmp_path)
+    db.update_settings({"starting_bankroll": 2_500.0, "unknown": "ignored"})
+    reopened = Database(tmp_path / "test.db")
+    reopened.initialize()
+    assert reopened.settings()["starting_bankroll"] == 2_500.0
+    assert "unknown" not in reopened.settings()
+    assert reopened.fetch_one("SELECT MAX(version) version FROM schema_migrations")["version"] == 2
+
+
+def test_paper_trade_settlement_uses_actual_binary_outcome(tmp_path: Path) -> None:
+    db = make_db(tmp_path)
+    add_market(db, "TEST-YES")
+    service = PaperTradingService(db)
+    decision = Decision(
+        "TRADE YES", "POSITIVE_EV", "Moderate", "test", 0.75, 0.60, 0.15,
+        0.12, 0.61, 0.01, 0.02, 10.0, 16, "YES",
+    )
+    assert service.open_from_decision("TEST-YES", decision)
+    assert not service.open_from_decision("TEST-YES", decision)
+    opposite = Decision(
+        "TRADE NO", "POSITIVE_EV", "Moderate", "test", 0.25, 0.40, 0.15,
+        0.12, 0.41, 0.01, 0.02, 10.0, 16, "NO",
+    )
+    assert not service.open_from_decision("TEST-YES", opposite)
+    open_portfolio = service.portfolio()
+    assert open_portfolio["available_cash"] < open_portfolio["current_bankroll"]
+    assert open_portfolio["current_bankroll"] < open_portfolio["starting_bankroll"]
+    assert service.settle("TEST-YES", 1, iso_now()) == 1
+    trade = db.fetch_one("SELECT * FROM paper_trades WHERE ticker='TEST-YES'")
+    assert trade["status"] == "settled"
+    assert trade["payout"] == 16
+    assert trade["realized_pnl"] > 0
+
+
+def test_model_promotion_requires_forward_validation_and_minimum_sample(tmp_path: Path) -> None:
+    db = make_db(tmp_path)
+    manager = ModelManager(db)
+    for index in range(40):
+        ticker = f"TEST-{index:02d}"
+        add_market(db, ticker)
+        outcome = index % 2
+        z_distance = 3.0 if outcome else -3.0
+        wrong_probability = 0.15 if outcome else 0.85
+        features = {
+            "z_distance": z_distance,
+            "time_fraction": 0.33,
+            "volatility_5m": 0.5,
+            "volatility_15m": 0.5,
+            "momentum_1m": z_distance / 100,
+            "momentum_5m": z_distance / 50,
+            "dispersion_pct": 0.02,
+            "orderbook_imbalance": z_distance / 4,
+            "market_probability": 0.5,
+        }
+        db.execute(
+            "INSERT INTO settlements(ticker,settled_at,result,settlement_value,raw_json,processed_at) VALUES (?,?,?,?,?,?)",
+            (ticker, iso_now(), outcome, None, "{}", iso_now()),
+        )
+        db.execute(
+            """
+            INSERT INTO signal_snapshots(
+                observed_at,ticker,signal,reason_code,confidence,explanation,
+                model_probability,market_probability,edge,expected_value,
+                suggested_fraction,suggested_dollars,suggested_contracts,model_version,
+                input_json,btc_state_json,kalshi_state_json,material_reason
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                f"2026-01-{index // 2 + 1:02d}T00:{index % 2:02d}:00+00:00", ticker,
+                "NO TRADE", "TEST", "Low", "fixture", wrong_probability, 0.5,
+                wrong_probability - 0.5, None, 0, 0, 0, "baseline-1.0",
+                json.dumps({"features": features}), "{}", "{}", "fixture",
+            ),
+        )
+    report = manager.evaluate_and_retrain("test")
+    assert report["validation"].startswith("Expanding-window")
+    assert report["candidate"]["sample_size"] < 40
+    assert report["promoted"] is True
+    assert manager.active()["model_type"] == "regularized-logistic"

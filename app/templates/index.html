@@ -1,0 +1,159 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>Kalshi Model</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar">
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true">K</span>
+        <div><strong>Kalshi Model</strong><small>BTC 15 minute</small></div>
+      </div>
+      <nav aria-label="Primary navigation">
+        <button class="nav-item active" data-page="dashboard">Dashboard</button>
+        <button class="nav-item" data-page="calibration">Calibration History</button>
+        <button class="nav-item" data-page="paper">Paper Trading</button>
+        <button class="nav-item" data-page="settings">Settings</button>
+      </nav>
+      <div class="sidebar-foot">
+        <span class="status-dot" id="sidebar-status-dot"></span>
+        <div><strong id="sidebar-status">Connecting</strong><small>Analysis only</small></div>
+      </div>
+    </aside>
+
+    <main class="main-content">
+      <section class="page active" id="page-dashboard">
+        <header class="page-header">
+          <div><p class="eyebrow">LIVE MARKET</p><h1>BTC 15 minute</h1></div>
+          <div class="header-status"><span class="live-dot"></span><span id="last-update">Connecting</span></div>
+        </header>
+
+        <section class="decision-band" id="decision-band">
+          <div>
+            <p class="decision-label">CURRENT SIGNAL</p>
+            <h2 id="signal-title">Waiting for live data</h2>
+            <p id="signal-explanation">Connecting to Kalshi and public BTC feeds.</p>
+          </div>
+          <div class="decision-numbers">
+            <div><span>Model</span><strong id="model-probability">--</strong></div>
+            <div><span>Market</span><strong id="market-probability">--</strong></div>
+            <div><span>Edge</span><strong id="edge">--</strong></div>
+            <div><span>EV / contract</span><strong id="ev">--</strong></div>
+          </div>
+        </section>
+
+        <div class="dashboard-grid">
+          <section class="chart-panel">
+            <div class="section-heading">
+              <div><h3>Bitcoin reference price</h3><p id="composite-source">Multi-exchange median</p></div>
+              <div class="segmented" aria-label="Chart window">
+                <button data-window="30">30m</button>
+                <button data-window="60">60m</button>
+                <button class="active" data-window="90">90m</button>
+                <button data-window="180">3h</button>
+              </div>
+            </div>
+            <div class="price-row"><strong id="btc-price">--</strong><span id="btc-dispersion">--</span></div>
+            <div class="chart-wrap"><canvas id="price-chart" aria-label="Live Bitcoin price chart"></canvas></div>
+            <div class="chart-legend">
+              <span><i class="legend-price"></i>BTC composite</span>
+              <span><i class="legend-strike"></i>Current threshold</span>
+              <span><i class="legend-next"></i>Next threshold</span>
+            </div>
+          </section>
+
+          <section class="contract-panel">
+            <div class="section-heading"><div><h3>Current contract</h3><p id="contract-ticker">--</p></div><strong class="countdown" id="countdown">--:--</strong></div>
+            <div class="threshold-block"><span>Threshold</span><strong id="threshold">--</strong><small id="distance-to-strike">--</small></div>
+            <dl class="metric-list">
+              <div><dt>YES bid / ask</dt><dd id="yes-market">--</dd></div>
+              <div><dt>NO bid / ask</dt><dd id="no-market">--</dd></div>
+              <div><dt>Spread</dt><dd id="spread">--</dd></div>
+              <div><dt>Open interest</dt><dd id="open-interest">--</dd></div>
+              <div><dt>Volume</dt><dd id="volume">--</dd></div>
+              <div><dt>Position</dt><dd id="position-size">--</dd></div>
+            </dl>
+            <div class="quality-row"><span id="quality-dot" class="quality-dot"></span><span id="quality-text">Checking feeds</span></div>
+          </section>
+        </div>
+
+        <div class="lower-grid">
+          <section class="next-contract">
+            <div class="section-heading"><div><p class="eyebrow">UP NEXT</p><h3 id="next-title">Waiting for next contract</h3></div><span id="next-time">--</span></div>
+            <div class="next-values"><div><span>Threshold</span><strong id="next-threshold">--</strong></div><div><span>YES ask</span><strong id="next-yes">--</strong></div><div><span>NO ask</span><strong id="next-no">--</strong></div></div>
+          </section>
+          <section class="calibration-glance">
+            <div class="section-heading"><div><p class="eyebrow">CALIBRATION</p><h3>Model health</h3></div><span id="model-version">baseline-1.0</span></div>
+            <div class="next-values"><div><span>Brier score</span><strong id="brier-score">--</strong></div><div><span>Calibration error</span><strong id="calibration-error">--</strong></div><div><span>Settled sample</span><strong id="calibration-sample">0</strong></div></div>
+          </section>
+        </div>
+      </section>
+
+      <section class="page" id="page-calibration">
+        <header class="page-header"><div><p class="eyebrow">MODEL JOURNAL</p><h1>Calibration History</h1></div></header>
+        <div class="stats-strip" id="calibration-stats"></div>
+        <section class="calibration-plot-panel">
+          <div class="section-heading"><div><h3>Predicted vs actual</h3><p>Settlement frequency by probability range</p></div></div>
+          <div id="calibration-bars" class="calibration-bars"></div>
+        </section>
+        <section class="report-list-section">
+          <div class="section-heading"><div><h3>Permanent reports</h3><p>Every bootstrap, recalibration, and promotion decision</p></div></div>
+          <div id="report-list" class="report-list"><p class="empty-state">No reports yet.</p></div>
+        </section>
+      </section>
+
+      <section class="page" id="page-paper">
+        <header class="page-header"><div><p class="eyebrow">FORWARD TEST</p><h1>Paper Trading</h1></div><span class="read-only-badge">SIMULATED ONLY</span></header>
+        <div class="paper-stats" id="paper-stats"></div>
+        <section class="table-section">
+          <div class="section-heading"><div><h3>Trade ledger</h3><p>Executable asks, fees, and settlement results</p></div><button class="secondary-button" id="run-backtest">Run backtest</button></div>
+          <div id="backtest-result" class="inline-result" hidden></div>
+          <div class="table-wrap"><table><thead><tr><th>Opened</th><th>Contract</th><th>Side</th><th>Price</th><th>Contracts</th><th>Edge</th><th>Status</th><th>P&amp;L</th></tr></thead><tbody id="trade-table"><tr><td colspan="8" class="empty-state">No paper trades yet.</td></tr></tbody></table></div>
+        </section>
+      </section>
+
+      <section class="page" id="page-settings">
+        <header class="page-header"><div><p class="eyebrow">LOCAL CONFIGURATION</p><h1>Settings</h1></div><button class="primary-button" id="save-settings">Save changes</button></header>
+        <div class="settings-layout">
+          <section class="settings-section">
+            <h3>Paper bankroll</h3>
+            <div class="field"><label for="starting_bankroll">Starting bankroll</label><div class="input-prefix"><span>$</span><input id="starting_bankroll" type="number" min="1" step="100"></div></div>
+            <label class="toggle-row"><span><strong>Automatic paper trading</strong><small>Record one simulated position when a trade signal first appears.</small></span><input id="paper_trading_enabled" type="checkbox"><i></i></label>
+          </section>
+          <section class="settings-section">
+            <h3>Decision threshold</h3>
+            <div class="field"><label for="min_edge">Minimum executable edge</label><div class="input-suffix"><input id="min_edge" type="number" min="0" max="50" step="0.5"><span>%</span></div></div>
+            <div class="field"><label for="slippage_cents">Slippage allowance</label><div class="input-suffix"><input id="slippage_cents" type="number" min="0" max="10" step="0.1"><span>cents</span></div></div>
+            <div class="field"><label for="fractional_kelly">Fractional Kelly multiplier</label><div class="input-suffix"><input id="fractional_kelly" type="number" min="0" max="100" step="5"><span>%</span></div></div>
+          </section>
+          <section class="settings-section">
+            <h3>Risk controls</h3>
+            <label class="toggle-row"><span><strong>Risk controls</strong><small>Enforce every position and drawdown cap below.</small></span><input id="risk_controls_enabled" type="checkbox"><i></i></label>
+            <div class="field"><label for="max_position_pct">Maximum position</label><div class="input-suffix"><input id="max_position_pct" type="number" min="0" max="100" step="1"><span>% bankroll</span></div></div>
+            <div class="field"><label for="max_risk_per_trade_pct">Maximum risk per trade</label><div class="input-suffix"><input id="max_risk_per_trade_pct" type="number" min="0" max="100" step="1"><span>% bankroll</span></div></div>
+            <div class="field"><label for="max_session_drawdown_pct">Maximum session drawdown</label><div class="input-suffix"><input id="max_session_drawdown_pct" type="number" min="0" max="100" step="1"><span>%</span></div></div>
+          </section>
+          <section class="settings-section">
+            <h3>Data quality</h3>
+            <div class="field"><label for="max_exchange_dispersion_pct">Maximum exchange dispersion</label><div class="input-suffix"><input id="max_exchange_dispersion_pct" type="number" min="0.01" max="5" step="0.05"><span>%</span></div></div>
+            <div class="connection-row"><span>Kalshi public API</span><strong>No key required</strong></div>
+            <div class="connection-row"><span>BTC feeds</span><strong>Coinbase, Kraken, Bitstamp</strong></div>
+          </section>
+          <section class="settings-section wide">
+            <div class="section-heading"><div><h3>Local database</h3><p id="database-path">Loading</p></div><div class="button-row"><button class="secondary-button" id="run-bootstrap">Refresh history</button><button class="secondary-button" id="backup-database">Create backup</button></div></div>
+            <div class="database-counts" id="database-counts"></div>
+            <div id="settings-result" class="inline-result" hidden></div>
+          </section>
+        </div>
+      </section>
+    </main>
+  </div>
+  <div class="toast" id="toast" role="status" aria-live="polite" hidden><strong id="toast-title"></strong><span id="toast-detail"></span></div>
+  <script src="/static/app.js" defer></script>
+</body>
+</html>

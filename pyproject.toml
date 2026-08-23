@@ -1,0 +1,9 @@
+[project]
+name = "kalshi-model"
+version = "0.1.0"
+description = "Local analysis and paper-trading app for Kalshi BTC 15-minute markets"
+requires-python = ">=3.11"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
