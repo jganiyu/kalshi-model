@@ -862,7 +862,7 @@ class AnalysisEngine:
         )
 
     def chart(self, minutes: int) -> list[dict[str, Any]]:
-        minutes = max(15, min(360, int(minutes)))
+        minutes = max(5, min(360, int(minutes)))
         since = (datetime.now(UTC) - timedelta(minutes=minutes)).isoformat()
         return self.db.fetch_all(
             """

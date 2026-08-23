@@ -3,26 +3,33 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="color-scheme" content="light">
+  <meta name="color-scheme" content="light dark">
   <title>Kalshi Model</title>
+  <script>
+    (() => {
+      const preference = localStorage.getItem("kalshi-theme") || "system";
+      const dark = preference === "dark" || (preference === "system" && matchMedia("(prefers-color-scheme: dark)").matches);
+      document.documentElement.dataset.theme = dark ? "dark" : "light";
+      document.documentElement.dataset.themePreference = preference;
+    })();
+  </script>
   <link rel="stylesheet" href="/static/styles.css">
 </head>
 <body>
   <div class="app-shell">
     <aside class="sidebar">
       <div class="brand">
-        <span class="brand-mark" aria-hidden="true">K</span>
-        <div><strong>Kalshi Model</strong><small>BTC 15 minute</small></div>
+        <div><strong>Kalshi Model</strong></div>
       </div>
       <nav aria-label="Primary navigation">
         <button class="nav-item active" data-page="dashboard">Dashboard</button>
-        <button class="nav-item" data-page="calibration">Calibration History</button>
         <button class="nav-item" data-page="paper">Paper Trading</button>
-        <button class="nav-item" data-page="settings">Settings</button>
+        <button class="nav-item" data-page="calibration">Calibration</button>
       </nav>
       <div class="sidebar-foot">
         <span class="status-dot" id="sidebar-status-dot"></span>
         <div><strong id="sidebar-status">Connecting</strong><small>Analysis only</small></div>
+        <button class="settings-icon" data-page="settings" aria-label="Settings" title="Settings">&#9881;</button>
       </div>
     </aside>
 
@@ -34,9 +41,16 @@
         </header>
 
         <section class="decision-band" id="decision-band">
-          <div>
+          <div class="decision-summary">
             <p class="decision-label">CURRENT SIGNAL</p>
-            <h2 id="signal-title">Waiting for live data</h2>
+            <div class="signal-row">
+              <div class="signal-pill" id="signal-pill" data-position="hold" aria-label="Current signal: Hold">
+                <span data-signal-option="no">No</span>
+                <span class="active" data-signal-option="hold">Hold</span>
+                <span data-signal-option="yes">Yes</span>
+              </div>
+              <h2 id="signal-title" hidden></h2>
+            </div>
             <p id="signal-explanation">Connecting to Kalshi and public BTC feeds.</p>
           </div>
           <div class="decision-numbers">
@@ -52,9 +66,9 @@
             <div class="section-heading">
               <div><h3>Bitcoin reference price</h3><p id="composite-source">Multi-exchange median</p></div>
               <div class="segmented" aria-label="Chart window">
+                <button class="active" data-window="5">5m</button>
                 <button data-window="30">30m</button>
                 <button data-window="60">60m</button>
-                <button class="active" data-window="90">90m</button>
                 <button data-window="180">3h</button>
               </div>
             </div>
@@ -62,8 +76,7 @@
             <div class="chart-wrap"><canvas id="price-chart" aria-label="Live Bitcoin price chart"></canvas></div>
             <div class="chart-legend">
               <span><i class="legend-price"></i>BTC composite</span>
-              <span><i class="legend-strike"></i>Current threshold</span>
-              <span><i class="legend-next"></i>Next threshold</span>
+              <span><i class="legend-strike" id="threshold-legend-swatch"></i>Current threshold</span>
             </div>
           </section>
 
@@ -143,6 +156,17 @@
             <div class="field"><label for="max_exchange_dispersion_pct">Maximum exchange dispersion</label><div class="input-suffix"><input id="max_exchange_dispersion_pct" type="number" min="0.01" max="5" step="0.05"><span>%</span></div></div>
             <div class="connection-row"><span>Kalshi market feed</span><strong id="kalshi-connection">Checking</strong></div>
             <div class="connection-row"><span>BTC feeds</span><strong id="btc-connection">Checking</strong></div>
+          </section>
+          <section class="settings-section appearance-section">
+            <h3>Appearance</h3>
+            <div class="appearance-row">
+              <span>Color theme</span>
+              <div class="segmented theme-picker" role="group" aria-label="Color theme">
+                <button type="button" data-theme-choice="system">System</button>
+                <button type="button" data-theme-choice="light">Light</button>
+                <button type="button" data-theme-choice="dark">Dark</button>
+              </div>
+            </div>
           </section>
           <section class="settings-section wide">
             <div class="section-heading"><div><h3>Local database</h3><p id="database-path">Loading</p></div><div class="button-row"><button class="secondary-button" id="run-bootstrap">Refresh history</button><button class="secondary-button" id="backup-database">Create backup</button></div></div>

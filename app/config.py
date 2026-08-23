@@ -47,6 +47,6 @@ DEFAULT_SETTINGS: dict[str, object] = {
     "slippage_cents": 0.5,
     "max_data_age_seconds": 20,
     "max_exchange_dispersion_pct": 0.40,
-    "chart_window_minutes": 90,
+    "chart_window_minutes": 5,
     "kalshi_series": "KXBTC15M",
 }

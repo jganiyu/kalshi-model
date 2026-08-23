@@ -1,17 +1,37 @@
 const state = {
   dashboard: null,
   chartPoints: [],
-  chartWindow: 90,
+  chartWindow: 5,
   closeTime: null,
   lastNotification: null,
   activePage: "dashboard",
   liveSocket: null,
   liveConnected: false,
   liveRetryMs: 1000,
+  themePreference: localStorage.getItem("kalshi-theme") || "system",
 };
 
 const $ = (selector) => document.querySelector(selector);
 const $$ = (selector) => [...document.querySelectorAll(selector)];
+const themeMedia = window.matchMedia("(prefers-color-scheme: dark)");
+
+function syncThemeButtons() {
+  $$('[data-theme-choice]').forEach((button) => {
+    const selected = button.dataset.themeChoice === state.themePreference;
+    button.classList.toggle("active", selected);
+    button.setAttribute("aria-pressed", String(selected));
+  });
+}
+
+function applyTheme(preference = state.themePreference) {
+  state.themePreference = preference;
+  localStorage.setItem("kalshi-theme", preference);
+  const dark = preference === "dark" || (preference === "system" && themeMedia.matches);
+  document.documentElement.dataset.theme = dark ? "dark" : "light";
+  document.documentElement.dataset.themePreference = preference;
+  syncThemeButtons();
+  window.requestAnimationFrame(drawChart);
+}
 
 function money(value, digits = 2) {
   if (value === null || value === undefined || Number.isNaN(Number(value))) return "--";
@@ -66,11 +86,15 @@ async function api(path, options = {}) {
   return response.json();
 }
 
+function signalPosition(decision) {
+  if (decision?.signal === "TRADE NO") return "no";
+  if (decision?.signal === "TRADE YES") return "yes";
+  return "hold";
+}
+
 function signalTitle(decision) {
-  if (!decision) return "Waiting for live data";
-  if (decision.reason_code === "DATA_UNRELIABLE") return "NO TRADE — Data Unreliable";
-  if (decision.reason_code === "RISK_LIMIT") return "NO TRADE — Risk Limit";
-  return `${decision.signal} — ${decision.confidence} Confidence`;
+  if (!decision || signalPosition(decision) === "hold") return "";
+  return `${decision.confidence} Confidence`;
 }
 
 function renderDashboard(data) {
@@ -87,11 +111,17 @@ function renderDashboard(data) {
     : system.status === "live" ? "REST fallback" : "Data guarded";
   $("#last-update").textContent = system.updated_at ? `Updated ${new Date(system.updated_at).toLocaleTimeString([], { hour: "numeric", minute: "2-digit", second: "2-digit" })}` : "Connecting";
 
-  const band = $("#decision-band");
-  band.classList.remove("trade-yes", "trade-no");
-  if (decision?.signal === "TRADE YES") band.classList.add("trade-yes");
-  if (decision?.signal === "TRADE NO") band.classList.add("trade-no");
-  $("#signal-title").textContent = signalTitle(decision);
+  const position = signalPosition(decision);
+  const pill = $("#signal-pill");
+  pill.dataset.position = position;
+  pill.setAttribute("aria-label", `Current signal: ${position === "no" ? "Trade No" : position === "yes" ? "Trade Yes" : "Hold"}`);
+  pill.querySelectorAll("[data-signal-option]").forEach((option) => {
+    option.classList.toggle("active", option.dataset.signalOption === position);
+  });
+  const confidence = signalTitle(decision);
+  const signalTitleElement = $("#signal-title");
+  signalTitleElement.textContent = confidence;
+  signalTitleElement.hidden = !confidence;
   $("#signal-explanation").textContent = decision?.explanation || system.message || "Connecting to public feeds.";
   $("#model-probability").textContent = percent(decision?.model_probability, 1);
   $("#market-probability").textContent = percent(decision?.market_probability, 1);
@@ -178,74 +208,88 @@ function drawChart() {
   canvas.width = Math.floor(width * ratio);
   canvas.height = Math.floor(height * ratio);
   const context = canvas.getContext("2d");
+  const styles = getComputedStyle(document.documentElement);
+  const color = (name) => styles.getPropertyValue(name).trim();
+  const numberFont = color("--number-font");
   context.scale(ratio, ratio);
   context.clearRect(0, 0, width, height);
   const points = state.chartPoints.filter((point) => Number.isFinite(Number(point.price)));
   const current = state.dashboard?.current;
-  const next = state.dashboard?.next;
+  const threshold = Number(current?.strike);
+  const referencePrice = Number(state.dashboard?.btc?.price ?? points.at(-1)?.price);
+  const thresholdColor = Number.isFinite(referencePrice) && Number.isFinite(threshold) && referencePrice >= threshold
+    ? color("--green")
+    : color("--red");
+  const thresholdSwatch = $("#threshold-legend-swatch");
+  if (thresholdSwatch) thresholdSwatch.style.backgroundColor = thresholdColor;
   if (!points.length) {
-    context.fillStyle = "#8a9299";
+    context.fillStyle = color("--chart-label");
     context.font = "12px -apple-system, sans-serif";
     context.textAlign = "center";
     context.fillText("Collecting live price history", width / 2, height / 2);
     return;
   }
   const values = points.map((point) => Number(point.price));
-  if (current?.strike) values.push(Number(current.strike));
-  if (next?.strike) values.push(Number(next.strike));
+  if (Number.isFinite(threshold)) values.push(threshold);
   let low = Math.min(...values);
   let high = Math.max(...values);
   const padding = Math.max((high - low) * 0.18, high * 0.00035, 20);
   low -= padding;
   high += padding;
   const left = 8;
-  const right = 62;
+  const right = width < 430 ? 68 : 76;
   const top = 14;
   const bottom = 25;
   const chartWidth = width - left - right;
   const chartHeight = height - top - bottom;
+  const plotRight = width - right;
   const x = (index) => left + (points.length === 1 ? chartWidth / 2 : (index / (points.length - 1)) * chartWidth);
   const y = (value) => top + (1 - (value - low) / (high - low)) * chartHeight;
 
-  context.strokeStyle = "#e7eaec";
-  context.fillStyle = "#7b838a";
-  context.font = "10px -apple-system, sans-serif";
+  context.strokeStyle = color("--chart-grid");
+  context.fillStyle = color("--chart-label");
+  context.font = `10px ${numberFont}`;
   context.textAlign = "left";
   for (let index = 0; index < 4; index += 1) {
     const value = low + ((high - low) * index) / 3;
     const rowY = y(value);
-    context.beginPath(); context.moveTo(left, rowY); context.lineTo(width - right + 4, rowY); context.stroke();
-    context.fillText(money(value, 0), width - right + 9, rowY + 3);
+    context.beginPath(); context.moveTo(left, rowY); context.lineTo(plotRight, rowY); context.stroke();
+    context.fillText(money(value, 0), plotRight + 8, rowY + 3);
   }
 
-  const drawLevel = (value, color, dashed) => {
-    if (!value) return;
+  const drawThreshold = (value) => {
+    if (!Number.isFinite(value)) return;
+    const levelY = y(value);
+    const label = money(value, 0);
+    const tagX = plotRight + 5;
+    const tagWidth = right - 7;
+    const tagHeight = 20;
+    const tagY = Math.min(height - bottom - tagHeight, Math.max(top, levelY - tagHeight / 2));
     context.save();
-    context.strokeStyle = color;
+    context.strokeStyle = thresholdColor;
     context.lineWidth = 1.25;
-    context.setLineDash(dashed ? [5, 4] : []);
-    context.beginPath(); context.moveTo(left, y(Number(value))); context.lineTo(width - right + 4, y(Number(value))); context.stroke();
+    context.lineCap = "round";
+    context.setLineDash([2, 4]);
+    context.beginPath(); context.moveTo(left, levelY); context.lineTo(tagX, levelY); context.stroke();
+    context.setLineDash([]);
+    context.fillStyle = thresholdColor;
+    context.fillRect(tagX, tagY, tagWidth, tagHeight);
+    context.fillStyle = "#ffffff";
+    context.font = `600 9px ${numberFont}`;
+    context.textAlign = "center";
+    context.textBaseline = "middle";
+    context.fillText(label, tagX + tagWidth / 2, tagY + tagHeight / 2);
     context.restore();
   };
-  drawLevel(current?.strike, "#c9473e", false);
-  if (next?.strike && next.strike !== current?.strike) drawLevel(next.strike, "#2767c5", true);
+  drawThreshold(threshold);
 
   if (points.length > 1) {
-    const gradient = context.createLinearGradient(0, top, 0, height - bottom);
-    gradient.addColorStop(0, "rgba(21, 23, 25, .14)");
-    gradient.addColorStop(1, "rgba(21, 23, 25, 0)");
     context.beginPath();
     points.forEach((point, index) => index === 0 ? context.moveTo(x(index), y(Number(point.price))) : context.lineTo(x(index), y(Number(point.price))));
-    context.lineTo(x(points.length - 1), height - bottom);
-    context.lineTo(x(0), height - bottom);
-    context.closePath();
-    context.fillStyle = gradient; context.fill();
-    context.beginPath();
-    points.forEach((point, index) => index === 0 ? context.moveTo(x(index), y(Number(point.price))) : context.lineTo(x(index), y(Number(point.price))));
-    context.strokeStyle = "#191c1f"; context.lineWidth = 2; context.lineJoin = "round"; context.stroke();
+    context.strokeStyle = color("--chart-line"); context.lineWidth = 2.25; context.lineJoin = "round"; context.stroke();
   }
   const lastIndex = points.length - 1;
-  context.beginPath(); context.arc(x(lastIndex), y(Number(points[lastIndex].price)), 3.5, 0, Math.PI * 2); context.fillStyle = "#117a51"; context.fill();
+  context.beginPath(); context.arc(x(lastIndex), y(Number(points[lastIndex].price)), 3.25, 0, Math.PI * 2); context.fillStyle = color("--chart-line"); context.fill();
 }
 
 function appendLiveChartPoint(data) {
@@ -371,6 +415,7 @@ async function loadSettings() {
   }
   $("#database-path").textContent = database.path;
   $("#database-counts").innerHTML = Object.entries(database.counts).map(([key, value]) => `<span>${key.replaceAll("_", " ")}: ${value}</span>`).join("");
+  syncThemeButtons();
 }
 
 async function saveSettings() {
@@ -443,7 +488,7 @@ function showToast(title, detail) {
 
 async function switchPage(page) {
   state.activePage = page;
-  $$(".nav-item").forEach((button) => button.classList.toggle("active", button.dataset.page === page));
+  $$("[data-page]").forEach((button) => button.classList.toggle("active", button.dataset.page === page));
   $$(".page").forEach((section) => section.classList.toggle("active", section.id === `page-${page}`));
   try {
     if (page === "calibration") await loadCalibration();
@@ -453,7 +498,7 @@ async function switchPage(page) {
 }
 
 function bindEvents() {
-  $$(".nav-item").forEach((button) => button.addEventListener("click", () => switchPage(button.dataset.page)));
+  $$("[data-page]").forEach((button) => button.addEventListener("click", () => switchPage(button.dataset.page)));
   $$("[data-window]").forEach((button) => button.addEventListener("click", async () => {
     state.chartWindow = Number(button.dataset.window);
     $$("[data-window]").forEach((item) => item.classList.toggle("active", item === button));
@@ -464,10 +509,17 @@ function bindEvents() {
   $("#run-backtest").addEventListener("click", runBacktest);
   $("#run-bootstrap").addEventListener("click", runBootstrap);
   $("#backup-database").addEventListener("click", backupDatabase);
+  $$('[data-theme-choice]').forEach((button) => button.addEventListener("click", () => {
+    applyTheme(button.dataset.themeChoice);
+  }));
+  themeMedia.addEventListener("change", () => {
+    if (state.themePreference === "system") applyTheme("system");
+  });
   window.addEventListener("resize", drawChart);
 }
 
 document.addEventListener("DOMContentLoaded", async () => {
+  applyTheme(state.themePreference);
   bindEvents();
   await refreshDashboard();
   connectLive();

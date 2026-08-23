@@ -76,7 +76,7 @@ async def live(websocket: WebSocket) -> None:
 
 
 @app.get("/api/chart")
-async def chart(minutes: int = Query(default=90, ge=15, le=360)) -> dict[str, Any]:
+async def chart(minutes: int = Query(default=5, ge=5, le=360)) -> dict[str, Any]:
     return {"minutes": minutes, "points": engine.chart(minutes)}
 
 
@@ -137,7 +137,7 @@ async def update_settings(payload: dict[str, Any] = Body(...)) -> dict[str, Any]
         "slippage_cents": (0.0, 10.0),
         "max_data_age_seconds": (5.0, 300.0),
         "max_exchange_dispersion_pct": (0.01, 5.0),
-        "chart_window_minutes": (15, 360),
+        "chart_window_minutes": (5, 360),
     }
     cleaned: dict[str, Any] = {}
     for key, value in payload.items():
