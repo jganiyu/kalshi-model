@@ -15,47 +15,6 @@ Chief, Kalshi Model is a local Mac command center for Kalshi's 15-minute Bitcoin
   </tr>
 </table>
 
-## Get the app
-
-Choose one route; most people should use the download.
-
-### 1. Download the Mac app (recommended)
-
-[**Download the latest Apple Silicon Mac ZIP**](https://github.com/jganiyu/kalshi-model/releases/latest/download/Kalshi-Model-macOS-arm64.zip)
-
-1. Download and open the ZIP.
-2. Move `Kalshi Model.app` to your Applications folder.
-3. On first launch, right-click the app and choose **Open**.
-4. Add your Kalshi credentials in the app's **Settings** page.
-
-This route needs no Python or Terminal; private-repository collaborators must be signed in to GitHub.
-
-### 2. Run from source
-
-Use this route for development or code changes.
-
-```bash
-git clone https://github.com/jganiyu/kalshi-model.git
-cd kalshi-model
-./start.sh
-```
-
-This requires macOS, Python 3.11 or newer, and opens the app at [http://127.0.0.1:8765](http://127.0.0.1:8765).
-
-### 3. Build the Mac app yourself
-
-Use this route to create a fresh `.app` and ZIP from the source code.
-
-```bash
-git clone https://github.com/jganiyu/kalshi-model.git
-cd kalshi-model
-./scripts/build_macos_app.sh
-```
-
-You do not run `./start.sh` first; the build script creates its own environment and writes both files to `dist/`.
-
-`git clone` downloads the project from GitHub; the build script then works entirely on your Mac.
-
 ## What it does
 
 - **Dashboard:** Shows the live model, BTC chart, current contract, paper controls, and Kalshi order books.
@@ -145,3 +104,44 @@ KALSHI_PRIVATE_KEY_PATH=/absolute/path/to/your-private-key.pem
 ```
 
 Tests cover model math, fees, signal gates, risk controls, paper orders, settlement, calibration, promotion, and streaming order books.
+
+## Get the app
+
+Choose one route; most people should use the download.
+
+### 1. Download the Mac app (recommended)
+
+[**Download the latest Apple Silicon Mac ZIP**](https://github.com/jganiyu/kalshi-model/releases/latest/download/Kalshi-Model-macOS-arm64.zip)
+
+1. Download and open the ZIP.
+2. Move `Kalshi Model.app` to your Applications folder.
+3. On first launch, right-click the app and choose **Open**.
+4. Add your Kalshi credentials in the app's **Settings** page.
+
+This route needs no Python or Terminal; private-repository collaborators must be signed in to GitHub.
+
+### 2. Run from source
+
+Use this route for development or code changes.
+
+```bash
+git clone https://github.com/jganiyu/kalshi-model.git
+cd kalshi-model
+./start.sh
+```
+
+This requires macOS, Python 3.11 or newer, and opens the app at [http://127.0.0.1:8765](http://127.0.0.1:8765).
+
+### 3. Build the Mac app yourself
+
+Use this route to create a fresh `.app` and ZIP from the source code.
+
+```bash
+git clone https://github.com/jganiyu/kalshi-model.git
+cd kalshi-model
+./scripts/build_macos_app.sh
+```
+
+You do not run `./start.sh` first; the build script creates its own environment and writes both files to `dist/`.
+
+`git clone` downloads the project from GitHub; the build script then works entirely on your Mac.
