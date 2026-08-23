@@ -3,10 +3,11 @@ from __future__ import annotations
 import json
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 from fastapi import Body, FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse, Response
+from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
@@ -14,12 +15,18 @@ from app.config import AppConfig, ROOT
 from app.db import Database
 from app.engine import AnalysisEngine
 from app.services.backtest import BacktestService
+from app.services.credentials import (
+    CredentialStore,
+    environment_credentials,
+    masked_key_id,
+)
 from app.services.training import report_rows
 
 
 config = AppConfig()
 db = Database(config.database_path)
 engine = AnalysisEngine(config, db)
+credential_store = CredentialStore()
 templates = Jinja2Templates(directory=ROOT / "app" / "templates")
 
 
@@ -46,8 +53,8 @@ async def index(request: Request) -> HTMLResponse:
 
 
 @app.get("/favicon.ico", include_in_schema=False)
-async def favicon() -> Response:
-    return Response(status_code=204)
+async def favicon() -> FileResponse:
+    return FileResponse(ROOT / "app" / "static" / "icon-32.png", media_type="image/png")
 
 
 @app.get("/api/health")
@@ -144,6 +151,52 @@ async def models() -> dict[str, Any]:
 @app.get("/api/settings")
 async def get_settings() -> dict[str, Any]:
     return db.settings()
+
+
+def credential_status() -> dict[str, Any]:
+    active = engine.config
+    key_path = active.kalshi_private_key_path
+    display_directory = str(credential_store.directory)
+    home = str(Path.home())
+    if display_directory.startswith(home):
+        display_directory = display_directory.replace(home, "~", 1)
+    return {
+        "configured": bool(active.kalshi_api_key_id and key_path),
+        "source": active.kalshi_credentials_source,
+        "key_id_hint": masked_key_id(active.kalshi_api_key_id),
+        "private_key_ready": bool(key_path and key_path.exists()),
+        "storage_directory": display_directory,
+        "local_credentials_saved": credential_store.load() is not None,
+    }
+
+
+@app.get("/api/credentials")
+async def get_credentials() -> dict[str, Any]:
+    return credential_status()
+
+
+@app.post("/api/credentials")
+async def save_credentials(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    try:
+        saved = credential_store.save(
+            str(payload.get("key_id") or ""),
+            str(payload.get("private_key") or ""),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    await engine.set_kalshi_credentials(
+        saved.key_id, saved.private_key_path, "local form"
+    )
+    return credential_status()
+
+
+@app.delete("/api/credentials")
+async def remove_credentials() -> dict[str, Any]:
+    credential_store.remove()
+    key_id, key_path = environment_credentials()
+    source = "environment" if key_id or key_path else "none"
+    await engine.set_kalshi_credentials(key_id, key_path, source)
+    return credential_status()
 
 
 @app.put("/api/settings")

@@ -5,6 +5,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light dark">
   <title>Kalshi Model</title>
+  <link rel="icon" type="image/svg+xml" href="/static/icon.svg">
+  <link rel="apple-touch-icon" href="/static/icon-180.png">
   <script>
     (() => {
       const preference = localStorage.getItem("kalshi-theme") || "system";
@@ -221,6 +223,39 @@
       <section class="page" id="page-settings">
         <header class="page-header"><div><p class="eyebrow">LOCAL CONFIGURATION</p><h1>Settings</h1></div><button class="primary-button" id="save-settings">Save changes</button></header>
         <div class="settings-layout">
+          <section class="settings-section wide credentials-section">
+            <div class="section-heading credentials-heading">
+              <div><h3>Kalshi credentials</h3><p>Required for fluid Kalshi WebSocket prices. REST fallback works without them.</p></div>
+              <strong class="credential-state" id="credential-state">Checking</strong>
+            </div>
+            <div class="credential-layout">
+              <div class="credential-guide">
+                <ol>
+                  <li>Open Kalshi and go to <strong>Account &amp; security</strong>, then <strong>API Keys</strong>.</li>
+                  <li>Create a key, choose read-only access when scopes are offered, and save the downloaded private key file.</li>
+                  <li>Paste the Key ID and choose that private key file in this form.</li>
+                </ol>
+                <a href="https://kalshi.com/account/profile" target="_blank" rel="noopener noreferrer">Open Kalshi API key settings</a>
+              </div>
+              <form class="credential-form" id="credential-form" novalidate>
+                <label class="credential-field" for="kalshi-key-id">
+                  <span>API Key ID</span>
+                  <input id="kalshi-key-id" type="text" autocomplete="off" spellcheck="false" placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx">
+                </label>
+                <label class="credential-field credential-file-field" for="kalshi-private-key">
+                  <span>RSA private key file</span>
+                  <input id="kalshi-private-key" type="file" accept=".key,.pem,.txt,text/plain">
+                  <small id="credential-file-name">Choose the file downloaded when the key was created.</small>
+                </label>
+                <p class="credential-storage">Saved only on this Mac in <strong id="credential-storage-path">~/Library/Application Support/Kalshi Model</strong> with owner-only permissions.</p>
+                <div class="button-row credential-actions">
+                  <button class="primary-button" id="save-credentials" type="submit">Save and connect</button>
+                  <button class="secondary-button" id="remove-credentials" type="button">Remove saved credentials</button>
+                </div>
+                <div id="credential-result" class="inline-result" role="status" aria-live="polite" hidden></div>
+              </form>
+            </div>
+          </section>
           <section class="settings-section">
             <h3>Paper bankroll</h3>
             <div class="field"><label for="starting_bankroll">Starting bankroll</label><div class="input-prefix"><span>$</span><input id="starting_bankroll" type="number" min="1" step="100"></div></div>

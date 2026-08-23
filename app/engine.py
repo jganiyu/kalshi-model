@@ -4,7 +4,9 @@ import asyncio
 import json
 import logging
 import time
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -60,6 +62,7 @@ class AnalysisEngine:
         self._runner: asyncio.Task[None] | None = None
         self._bootstrap_task: asyncio.Task[None] | None = None
         self._stream_tasks: list[asyncio.Task[None]] = []
+        self._kalshi_stream_task: asyncio.Task[None] | None = None
         self._subscribers: set[asyncio.Queue[None]] = set()
         self._publish_task: asyncio.Task[None] | None = None
         self._live_refresh_task: asyncio.Task[None] | None = None
@@ -107,16 +110,7 @@ class AnalysisEngine:
                 asyncio.create_task(bitcoin_streams.run_kraken()),
             ]
         )
-        if self.config.kalshi_api_key_id and self.config.kalshi_private_key_path:
-            kalshi_stream = KalshiWebSocketFeed(
-                self.config.kalshi_ws_url,
-                self.config.kalshi_api_key_id,
-                self.config.kalshi_private_key_path,
-                lambda: str(self._current_market["ticker"]) if self._current_market else None,
-                self._handle_kalshi_message,
-                self._handle_stream_status,
-            )
-            self._stream_tasks.append(asyncio.create_task(kalshi_stream.run()))
+        self._start_kalshi_stream()
         existing = self.db.fetch_one(
             "SELECT COUNT(*) AS count FROM signal_snapshots WHERE material_reason='historical bootstrap'"
         )
@@ -125,20 +119,65 @@ class AnalysisEngine:
 
     async def stop(self) -> None:
         self._stopping.set()
-        for task in (
+        tasks = [task for task in (
             self._runner,
             self._bootstrap_task,
             self._publish_task,
             self._live_refresh_task,
+            self._kalshi_stream_task,
             *self._stream_tasks,
-        ):
-            if task:
-                task.cancel()
-        await asyncio.gather(
-            *(task for task in self._stream_tasks if task), return_exceptions=True
-        )
+        ) if task]
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
         if self.http:
             await self.http.aclose()
+
+    def _start_kalshi_stream(self) -> None:
+        key_id = self.config.kalshi_api_key_id
+        key_path = self.config.kalshi_private_key_path
+        configured = bool(key_id and key_path)
+        self._stream_status["Kalshi"] = {
+            "connected": False,
+            "configured": configured,
+        }
+        if not configured:
+            self._kalshi_stream_task = None
+            return
+        kalshi_stream = KalshiWebSocketFeed(
+            self.config.kalshi_ws_url,
+            str(key_id),
+            Path(key_path),
+            lambda: str(self._current_market["ticker"]) if self._current_market else None,
+            self._handle_kalshi_message,
+            self._handle_stream_status,
+        )
+        self._kalshi_stream_task = asyncio.create_task(kalshi_stream.run())
+
+    async def set_kalshi_credentials(
+        self,
+        key_id: str | None,
+        private_key_path: Path | None,
+        source: str,
+    ) -> None:
+        if self._kalshi_stream_task:
+            self._kalshi_stream_task.cancel()
+            await asyncio.gather(self._kalshi_stream_task, return_exceptions=True)
+            self._kalshi_stream_task = None
+        self.config = replace(
+            self.config,
+            kalshi_api_key_id=key_id,
+            kalshi_private_key_path=private_key_path,
+            kalshi_credentials_source=source,
+        )
+        self._start_kalshi_stream()
+        current = self.dashboard.get("current") or {}
+        reliable = bool(
+            current
+            and current.get("decision", {}).get("reason_code") != "DATA_UNRELIABLE"
+        )
+        self.dashboard["system"] = self._system_state(reliable, iso_now())
+        self._schedule_publish()
 
     async def _run_loop(self) -> None:
         while not self._stopping.is_set():

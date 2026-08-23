@@ -398,6 +398,29 @@ td { padding: 12px 16px; border-top: 1px solid var(--line); white-space: nowrap;
 .settings-section { padding: 20px; }
 .settings-section.wide, .appearance-section { grid-column: 1 / -1; }
 .settings-section > h3 { margin-bottom: 18px; }
+.credentials-heading { align-items: center; margin-bottom: 18px; }
+.credential-state { flex: 0 0 auto; padding: 5px 7px; border-radius: 4px; color: var(--muted); background: var(--surface-soft); font-size: 9px; font-weight: 750; }
+.credential-state.configured { color: var(--green); background: var(--green-soft); }
+.credential-layout { display: grid; grid-template-columns: minmax(240px, 0.8fr) minmax(360px, 1.2fr); gap: 32px; padding-top: 18px; border-top: 1px solid var(--line); }
+.credential-guide { color: var(--muted); font-size: 11px; line-height: 1.55; }
+.credential-guide ol { margin: 0 0 13px; padding-left: 18px; }
+.credential-guide li + li { margin-top: 8px; }
+.credential-guide strong { color: var(--ink); font-weight: 650; }
+.credential-guide a { color: var(--green); font-weight: 650; text-decoration: none; }
+.credential-guide a:hover { text-decoration: underline; }
+.credential-form { min-width: 0; }
+.credential-field { display: block; }
+.credential-field + .credential-field { margin-top: 13px; }
+.credential-field > span { display: block; margin-bottom: 6px; color: var(--muted); font-size: 10px; font-weight: 650; }
+.credential-field input[type="text"], .credential-field input[type="file"] { width: 100%; min-width: 0; height: 36px; border: 1px solid var(--line-strong); border-radius: 5px; color: var(--ink); background: var(--surface); font-size: 11px; }
+.credential-field input[type="text"] { padding: 0 10px; font-family: ui-monospace, "SFMono-Regular", Menlo, monospace; }
+.credential-field input[type="file"] { padding: 5px 7px; color: var(--muted); }
+.credential-field input[type="file"]::file-selector-button { height: 24px; margin-right: 9px; padding: 0 9px; border: 1px solid var(--line-strong); border-radius: 4px; color: var(--ink); background: var(--surface-soft); font-size: 9px; font-weight: 700; cursor: pointer; }
+.credential-field small { display: block; margin-top: 6px; color: var(--faint); font-size: 9px; }
+.credential-storage { margin: 13px 0; color: var(--muted); font-size: 9px; line-height: 1.5; }
+.credential-storage strong { color: var(--ink); font-family: ui-monospace, "SFMono-Regular", Menlo, monospace; font-weight: 500; overflow-wrap: anywhere; }
+.credential-actions { flex-wrap: wrap; }
+.credential-actions + .inline-result { margin-top: 10px; }
 .field { display: grid; min-height: 50px; grid-template-columns: 1fr minmax(150px, 210px); align-items: center; gap: 20px; border-top: 1px solid var(--line); }
 .field label { color: var(--muted); font-size: 11px; }
 .input-prefix, .input-suffix { display: flex; height: 33px; align-items: center; overflow: hidden; border: 1px solid var(--line-strong); border-radius: 5px; background: var(--surface); }
@@ -476,6 +499,7 @@ td { padding: 12px 16px; border-top: 1px solid var(--line); white-space: nowrap;
   .chart-wrap { height: 238px; }
   .chart-legend { flex-wrap: wrap; gap: 8px 14px; }
   .lower-grid, .orderbook-grid, .settings-layout { grid-template-columns: 1fr; gap: 10px; }
+  .credential-layout { grid-template-columns: 1fr; gap: 20px; }
   .orderbook-grid { margin-top: 10px; }
   .paper-controller { min-height: 0; }
   .paper-permission { white-space: normal; }

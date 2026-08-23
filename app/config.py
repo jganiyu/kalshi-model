@@ -1,18 +1,42 @@
 from __future__ import annotations
 
 import os
+import sys
 from dataclasses import dataclass
+from dataclasses import field
 from pathlib import Path
 
+from app.services.credentials import credential_directory, resolve_credentials
 
-ROOT = Path(__file__).resolve().parent.parent
+
+FROZEN = bool(getattr(sys, "frozen", False))
+ROOT = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent.parent))
+
+
+def default_database_path() -> Path:
+    configured = os.getenv("KALSHI_MODEL_DB")
+    if configured:
+        return Path(configured).expanduser()
+    if FROZEN:
+        return credential_directory() / "data" / "kalshi_model.db"
+    return ROOT / "data" / "kalshi_model.db"
+
+
+def credential_key_id() -> str | None:
+    return resolve_credentials()[0]
+
+
+def credential_key_path() -> Path | None:
+    return resolve_credentials()[1]
+
+
+def credential_source() -> str:
+    return resolve_credentials()[2]
 
 
 @dataclass(frozen=True)
 class AppConfig:
-    database_path: Path = Path(
-        os.getenv("KALSHI_MODEL_DB", str(ROOT / "data" / "kalshi_model.db"))
-    )
+    database_path: Path = field(default_factory=default_database_path)
     kalshi_api_base: str = os.getenv(
         "KALSHI_API_BASE", "https://external-api.kalshi.com/trade-api/v2"
     )
@@ -20,19 +44,18 @@ class AppConfig:
     kalshi_ws_url: str = os.getenv(
         "KALSHI_WS_URL", "wss://external-api-ws.kalshi.com/trade-api/ws/v2"
     )
-    kalshi_api_key_id: str | None = os.getenv("KALSHI_API_KEY_ID") or None
-    kalshi_private_key_path: Path | None = (
-        Path(value).expanduser()
-        if (value := os.getenv("KALSHI_PRIVATE_KEY_PATH"))
-        else None
-    )
+    kalshi_api_key_id: str | None = field(default_factory=credential_key_id)
+    kalshi_private_key_path: Path | None = field(default_factory=credential_key_path)
+    kalshi_credentials_source: str = field(default_factory=credential_source)
     host: str = os.getenv("KALSHI_MODEL_HOST", "127.0.0.1")
     port: int = int(os.getenv("KALSHI_MODEL_PORT", "8765"))
     poll_seconds: float = max(2.0, float(os.getenv("KALSHI_MODEL_POLL_SECONDS", "5")))
     live_update_seconds: float = max(
         0.1, float(os.getenv("KALSHI_MODEL_LIVE_UPDATE_SECONDS", "0.1"))
     )
-    open_browser: bool = os.getenv("KALSHI_MODEL_OPEN_BROWSER", "0") == "1"
+    open_browser: bool = os.getenv(
+        "KALSHI_MODEL_OPEN_BROWSER", "1" if FROZEN else "0"
+    ) == "1"
 
 
 DEFAULT_SETTINGS: dict[str, object] = {

@@ -881,7 +881,9 @@ async function resetPaperRound() {
 const percentSettingIds = ["min_edge", "fractional_kelly", "max_position_pct", "max_risk_per_trade_pct", "max_session_drawdown_pct"];
 
 async function loadSettings() {
-  const [settings, database] = await Promise.all([api("/api/settings"), api("/api/database")]);
+  const [settings, database, credentials] = await Promise.all([
+    api("/api/settings"), api("/api/database"), api("/api/credentials"),
+  ]);
   for (const [key, value] of Object.entries(settings)) {
     const input = document.getElementById(key);
     if (!input) continue;
@@ -890,7 +892,82 @@ async function loadSettings() {
   }
   $("#database-path").textContent = database.path;
   $("#database-counts").innerHTML = Object.entries(database.counts).map(([key, value]) => `<span>${key.replaceAll("_", " ")}: ${value}</span>`).join("");
+  renderCredentialStatus(credentials);
   syncThemeButtons();
+}
+
+function renderCredentialStatus(credentials) {
+  const stateLabel = $("#credential-state");
+  stateLabel.textContent = credentials.configured
+    ? credentials.source === "environment" ? "Configured in .env" : "Configured"
+    : "Not configured";
+  stateLabel.classList.toggle("configured", credentials.configured);
+  $("#credential-storage-path").textContent = credentials.storage_directory;
+  const keyInput = $("#kalshi-key-id");
+  keyInput.value = "";
+  keyInput.placeholder = credentials.key_id_hint
+    ? `Saved as ${credentials.key_id_hint}`
+    : "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx";
+  const removeButton = $("#remove-credentials");
+  removeButton.disabled = !credentials.local_credentials_saved;
+  removeButton.title = credentials.local_credentials_saved
+    ? "Remove the credentials saved by this form"
+    : credentials.source === "environment"
+      ? "These credentials are managed in .env"
+      : "No locally saved credentials";
+}
+
+async function saveKalshiCredentials(event) {
+  event.preventDefault();
+  const keyId = $("#kalshi-key-id").value.trim();
+  const fileInput = $("#kalshi-private-key");
+  const file = fileInput.files?.[0];
+  const resultPanel = $("#credential-result");
+  resultPanel.hidden = false;
+  if (!keyId || !file) {
+    resultPanel.textContent = "Enter the API Key ID and choose its downloaded private key file.";
+    return;
+  }
+
+  const button = $("#save-credentials");
+  button.disabled = true;
+  resultPanel.textContent = "Validating and saving credentials on this Mac...";
+  try {
+    const credentials = await api("/api/credentials", {
+      method: "POST",
+      body: JSON.stringify({ key_id: keyId, private_key: await file.text() }),
+    });
+    fileInput.value = "";
+    $("#credential-file-name").textContent = "Choose the file downloaded when the key was created.";
+    renderCredentialStatus(credentials);
+    resultPanel.textContent = "Credentials saved securely. The Kalshi WebSocket is connecting now.";
+    showToast("Kalshi credentials saved", "Live market-data streaming is connecting with the new key.");
+    await refreshDashboard();
+  } catch (error) {
+    resultPanel.textContent = error.message;
+  } finally {
+    button.disabled = false;
+  }
+}
+
+async function removeKalshiCredentials() {
+  const button = $("#remove-credentials");
+  const resultPanel = $("#credential-result");
+  button.disabled = true;
+  resultPanel.hidden = false;
+  resultPanel.textContent = "Removing locally saved credentials...";
+  try {
+    const credentials = await api("/api/credentials", { method: "DELETE" });
+    renderCredentialStatus(credentials);
+    resultPanel.textContent = credentials.configured
+      ? "Local credentials removed. Credentials from .env are still active."
+      : "Local credentials removed. Kalshi is using REST fallback.";
+    showToast("Saved credentials removed", "The private key copy was deleted from local app storage.");
+    await refreshDashboard();
+  } catch (error) {
+    resultPanel.textContent = error.message;
+    button.disabled = false;
+  }
 }
 
 async function saveSettings() {
@@ -982,6 +1059,14 @@ function bindEvents() {
     state.chartPoints = chart.points || []; drawChart();
   }));
   $("#save-settings").addEventListener("click", saveSettings);
+  $("#credential-form").addEventListener("submit", saveKalshiCredentials);
+  $("#remove-credentials").addEventListener("click", removeKalshiCredentials);
+  $("#kalshi-private-key").addEventListener("change", (event) => {
+    const file = event.target.files?.[0];
+    $("#credential-file-name").textContent = file
+      ? `${file.name} selected`
+      : "Choose the file downloaded when the key was created.";
+  });
   $("#run-backtest").addEventListener("click", runBacktest);
   $("#reset-paper-round").addEventListener("click", resetPaperRound);
   $("#run-bootstrap").addEventListener("click", runBootstrap);

@@ -93,10 +93,21 @@ The first launch creates a virtual environment, installs dependencies, creates t
 local database, and opens [http://127.0.0.1:8765](http://127.0.0.1:8765). Later
 launches reuse the same environment. Stop the app with `Control-C` in Terminal.
 
-## Optional Kalshi streaming credentials
+## Kalshi streaming credentials
 
 Public REST data works without credentials. Fluid Kalshi WebSocket updates require
 your own Kalshi API Key ID and RSA private key.
+
+1. In Kalshi, open **Account & security**, then **API Keys**.
+2. Create a key, choose read-only access when scopes are offered, and save the
+   downloaded private key file.
+3. In Kalshi Model, open **Settings** and use the **Kalshi credentials** form.
+
+The form validates the RSA key and saves a protected local copy under
+`~/Library/Application Support/Kalshi Model/`. It reconnects the market-data stream
+without exposing the private key to the UI or database.
+
+For environment-based setup instead, create `.env`:
 
 ```bash
 cp .env.example .env
@@ -111,6 +122,25 @@ KALSHI_PRIVATE_KEY_PATH=/absolute/path/to/your-private-key.pem
 
 Keep the private key outside this repository and restrict it with `chmod 600`.
 Never commit `.env` or the private key.
+
+## Build the macOS app
+
+```bash
+./scripts/build_macos_app.sh
+```
+
+This creates:
+
+- `dist/Kalshi Model.app`
+- `dist/Kalshi-Model-macOS-<architecture>.zip`
+
+The application bundle contains Python and its dependencies, opens the local UI on
+launch, uses the custom Kalshi Model icon, and stores packaged-app data under
+`~/Library/Application Support/Kalshi Model/`.
+
+The local build is ad-hoc signed. A public download may require the user to
+right-click the app and choose **Open** the first time. Frictionless public
+distribution requires an Apple Developer ID certificate and Apple notarization.
 
 ## Local data
 
