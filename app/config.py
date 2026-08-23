@@ -17,9 +17,21 @@ class AppConfig:
         "KALSHI_API_BASE", "https://external-api.kalshi.com/trade-api/v2"
     )
     kalshi_series: str = os.getenv("KALSHI_SERIES", "KXBTC15M")
+    kalshi_ws_url: str = os.getenv(
+        "KALSHI_WS_URL", "wss://external-api-ws.kalshi.com/trade-api/ws/v2"
+    )
+    kalshi_api_key_id: str | None = os.getenv("KALSHI_API_KEY_ID") or None
+    kalshi_private_key_path: Path | None = (
+        Path(value).expanduser()
+        if (value := os.getenv("KALSHI_PRIVATE_KEY_PATH"))
+        else None
+    )
     host: str = os.getenv("KALSHI_MODEL_HOST", "127.0.0.1")
     port: int = int(os.getenv("KALSHI_MODEL_PORT", "8765"))
     poll_seconds: float = max(2.0, float(os.getenv("KALSHI_MODEL_POLL_SECONDS", "5")))
+    live_update_seconds: float = max(
+        0.1, float(os.getenv("KALSHI_MODEL_LIVE_UPDATE_SECONDS", "0.1"))
+    )
     open_browser: bool = os.getenv("KALSHI_MODEL_OPEN_BROWSER", "0") == "1"
 
 

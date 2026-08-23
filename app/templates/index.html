@@ -141,8 +141,8 @@
           <section class="settings-section">
             <h3>Data quality</h3>
             <div class="field"><label for="max_exchange_dispersion_pct">Maximum exchange dispersion</label><div class="input-suffix"><input id="max_exchange_dispersion_pct" type="number" min="0.01" max="5" step="0.05"><span>%</span></div></div>
-            <div class="connection-row"><span>Kalshi public API</span><strong>No key required</strong></div>
-            <div class="connection-row"><span>BTC feeds</span><strong>Coinbase, Kraken, Bitstamp</strong></div>
+            <div class="connection-row"><span>Kalshi market feed</span><strong id="kalshi-connection">Checking</strong></div>
+            <div class="connection-row"><span>BTC feeds</span><strong id="btc-connection">Checking</strong></div>
           </section>
           <section class="settings-section wide">
             <div class="section-heading"><div><h3>Local database</h3><p id="database-path">Loading</p></div><div class="button-row"><button class="secondary-button" id="run-bootstrap">Refresh history</button><button class="secondary-button" id="backup-database">Create backup</button></div></div>

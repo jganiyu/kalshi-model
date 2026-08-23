@@ -37,6 +37,18 @@ class CompositeQuote:
         }
 
 
+def live_composite_quote(
+    quotes: list[ExchangeQuote], preferred_exchanges: set[str]
+) -> CompositeQuote:
+    full_price, dispersion = robust_composite([quote.price for quote in quotes])
+    preferred = [
+        quote.price for quote in quotes if quote.exchange in preferred_exchanges
+    ]
+    live_price, _ = robust_composite(preferred)
+    price = live_price if len(preferred) >= 2 else full_price
+    return CompositeQuote(price=price, dispersion_pct=dispersion, quotes=quotes, errors={})
+
+
 class BitcoinCompositeFeed:
     endpoints = {
         "Coinbase": "https://api.exchange.coinbase.com/products/BTC-USD/ticker",

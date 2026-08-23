@@ -5,7 +5,7 @@ from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from typing import Any
 
-from fastapi import Body, FastAPI, HTTPException, Query, Request
+from fastapi import Body, FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -58,6 +58,21 @@ async def health() -> dict[str, Any]:
 @app.get("/api/dashboard")
 async def dashboard() -> dict[str, Any]:
     return engine.dashboard
+
+
+@app.websocket("/ws/live")
+async def live(websocket: WebSocket) -> None:
+    await websocket.accept()
+    queue = engine.subscribe()
+    try:
+        await websocket.send_json({"type": "dashboard", "data": engine.dashboard})
+        while True:
+            await queue.get()
+            await websocket.send_json({"type": "dashboard", "data": engine.dashboard})
+    except WebSocketDisconnect:
+        pass
+    finally:
+        engine.unsubscribe(queue)
 
 
 @app.get("/api/chart")

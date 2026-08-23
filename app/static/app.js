@@ -5,6 +5,9 @@ const state = {
   closeTime: null,
   lastNotification: null,
   activePage: "dashboard",
+  liveSocket: null,
+  liveConnected: false,
+  liveRetryMs: 1000,
 };
 
 const $ = (selector) => document.querySelector(selector);
@@ -76,9 +79,12 @@ function renderDashboard(data) {
   const current = data.current;
   const btc = data.btc || {};
   const decision = current?.decision;
+  const streams = system.streams || {};
   const statusDot = $("#sidebar-status-dot");
   statusDot.className = `status-dot ${system.status || "degraded"}`;
-  $("#sidebar-status").textContent = system.status === "live" ? "Feeds live" : "Data guarded";
+  $("#sidebar-status").textContent = state.liveConnected
+    ? "Streaming live"
+    : system.status === "live" ? "REST fallback" : "Data guarded";
   $("#last-update").textContent = system.updated_at ? `Updated ${new Date(system.updated_at).toLocaleTimeString([], { hour: "numeric", minute: "2-digit", second: "2-digit" })}` : "Connecting";
 
   const band = $("#decision-band");
@@ -117,6 +123,17 @@ function renderDashboard(data) {
   const quality = current?.data_quality || { reliable: false, reason: "Waiting for market" };
   $("#quality-dot").className = `quality-dot ${quality.reliable ? "good" : "bad"}`;
   $("#quality-text").textContent = quality.reason || "Checking feeds";
+  const kalshiConnection = $("#kalshi-connection");
+  const btcConnection = $("#btc-connection");
+  if (kalshiConnection) {
+    kalshiConnection.textContent = streams.kalshi?.connected
+      ? "WebSocket live"
+      : streams.kalshi?.configured ? "Reconnecting" : "Key ID required";
+  }
+  if (btcConnection) {
+    const sources = streams.bitcoin?.sources || [];
+    btcConnection.textContent = sources.length ? `${sources.join(" + ")} live` : "REST fallback";
+  }
 
   renderNext(data.next);
   renderCalibrationGlance(data.calibration, data.model);
@@ -229,6 +246,49 @@ function drawChart() {
   }
   const lastIndex = points.length - 1;
   context.beginPath(); context.arc(x(lastIndex), y(Number(points[lastIndex].price)), 3.5, 0, Math.PI * 2); context.fillStyle = "#117a51"; context.fill();
+}
+
+function appendLiveChartPoint(data) {
+  const btc = data?.btc;
+  if (!btc?.observed_at || !Number.isFinite(Number(btc.price))) return;
+  const last = state.chartPoints.at(-1);
+  const point = {
+    observed_at: btc.observed_at,
+    price: Number(btc.price),
+    dispersion_pct: btc.dispersion_pct,
+    volatility_15m: btc.volatility_15m,
+  };
+  if (last?.observed_at === point.observed_at) state.chartPoints[state.chartPoints.length - 1] = point;
+  else state.chartPoints.push(point);
+  const cutoff = Date.now() - state.chartWindow * 60 * 1000;
+  state.chartPoints = state.chartPoints.filter((item) => new Date(item.observed_at).getTime() >= cutoff);
+}
+
+function connectLive() {
+  if (state.liveSocket && state.liveSocket.readyState < WebSocket.CLOSING) return;
+  const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+  const socket = new WebSocket(`${protocol}//${window.location.host}/ws/live`);
+  state.liveSocket = socket;
+  socket.addEventListener("open", () => {
+    state.liveConnected = true;
+    state.liveRetryMs = 1000;
+  });
+  socket.addEventListener("message", (event) => {
+    try {
+      const message = JSON.parse(event.data);
+      if (message.type !== "dashboard" || !message.data) return;
+      appendLiveChartPoint(message.data);
+      renderDashboard(message.data);
+    } catch (_) { /* Ignore malformed stream frames and wait for the next snapshot. */ }
+  });
+  socket.addEventListener("close", () => {
+    state.liveConnected = false;
+    state.liveSocket = null;
+    $("#sidebar-status").textContent = "Reconnecting";
+    window.setTimeout(connectLive, state.liveRetryMs);
+    state.liveRetryMs = Math.min(15000, state.liveRetryMs * 2);
+  });
+  socket.addEventListener("error", () => socket.close());
 }
 
 async function refreshDashboard() {
@@ -410,6 +470,7 @@ function bindEvents() {
 document.addEventListener("DOMContentLoaded", async () => {
   bindEvents();
   await refreshDashboard();
-  setInterval(refreshDashboard, 5000);
+  connectLive();
+  setInterval(refreshDashboard, 15000);
   setInterval(updateCountdown, 1000);
 });

@@ -27,8 +27,14 @@ from app.services.kalshi import (
     market_strike,
     orderbook_metrics,
 )
-from app.services.market_data import BitcoinCompositeFeed, CompositeQuote
+from app.services.market_data import (
+    BitcoinCompositeFeed,
+    CompositeQuote,
+    ExchangeQuote,
+    live_composite_quote,
+)
 from app.services.paper import PaperTradingService
+from app.services.streaming import BitcoinWebSocketFeeds, KalshiWebSocketFeed
 from app.services.training import ModelManager
 
 
@@ -53,10 +59,33 @@ class AnalysisEngine:
         }
         self._runner: asyncio.Task[None] | None = None
         self._bootstrap_task: asyncio.Task[None] | None = None
+        self._stream_tasks: list[asyncio.Task[None]] = []
+        self._subscribers: set[asyncio.Queue[None]] = set()
+        self._publish_task: asyncio.Task[None] | None = None
+        self._live_refresh_task: asyncio.Task[None] | None = None
         self._stopping = asyncio.Event()
+        self._update_lock = asyncio.Lock()
         self._previous_ticker: str | None = None
         self._pending_settlements: set[str] = set()
         self._last_settlement_check = 0.0
+        self._last_live_update = 0.0
+        self._last_btc_persist = 0.0
+        self._last_kalshi_persist = 0.0
+        self._latest_quotes: dict[str, ExchangeQuote] = {}
+        self._latest_btc: dict[str, Any] | None = None
+        self._current_market: dict[str, Any] | None = None
+        self._next_market: dict[str, Any] | None = None
+        self._market_state: dict[str, Any] | None = None
+        self._stream_status: dict[str, dict[str, Any]] = {
+            "Coinbase": {"connected": False},
+            "Kraken": {"connected": False},
+            "Kalshi": {
+                "connected": False,
+                "configured": bool(
+                    config.kalshi_api_key_id and config.kalshi_private_key_path
+                ),
+            },
+        }
 
     async def start(self) -> None:
         self.http = httpx.AsyncClient(
@@ -69,6 +98,25 @@ class AnalysisEngine:
         )
         await self.collect_once()
         self._runner = asyncio.create_task(self._run_loop())
+        bitcoin_streams = BitcoinWebSocketFeeds(
+            self._handle_stream_quote, self._handle_stream_status
+        )
+        self._stream_tasks.extend(
+            [
+                asyncio.create_task(bitcoin_streams.run_coinbase()),
+                asyncio.create_task(bitcoin_streams.run_kraken()),
+            ]
+        )
+        if self.config.kalshi_api_key_id and self.config.kalshi_private_key_path:
+            kalshi_stream = KalshiWebSocketFeed(
+                self.config.kalshi_ws_url,
+                self.config.kalshi_api_key_id,
+                self.config.kalshi_private_key_path,
+                lambda: str(self._current_market["ticker"]) if self._current_market else None,
+                self._handle_kalshi_message,
+                self._handle_stream_status,
+            )
+            self._stream_tasks.append(asyncio.create_task(kalshi_stream.run()))
         existing = self.db.fetch_one(
             "SELECT COUNT(*) AS count FROM signal_snapshots WHERE material_reason='historical bootstrap'"
         )
@@ -77,9 +125,18 @@ class AnalysisEngine:
 
     async def stop(self) -> None:
         self._stopping.set()
-        for task in (self._runner, self._bootstrap_task):
+        for task in (
+            self._runner,
+            self._bootstrap_task,
+            self._publish_task,
+            self._live_refresh_task,
+            *self._stream_tasks,
+        ):
             if task:
                 task.cancel()
+        await asyncio.gather(
+            *(task for task in self._stream_tasks if task), return_exceptions=True
+        )
         if self.http:
             await self.http.aclose()
 
@@ -127,6 +184,10 @@ class AnalysisEngine:
         current_market, next_market = market_pair
         observed_at = iso_now()
         btc_state = self._save_bitcoin(composite, observed_at)
+        self._latest_quotes = {quote.exchange: quote for quote in composite.quotes}
+        self._latest_btc = btc_state
+        self._current_market = current_market
+        self._next_market = next_market
         settings = self.db.settings()
         current_payload = None
         notification = None
@@ -138,6 +199,7 @@ class AnalysisEngine:
             market_state = self._save_kalshi_snapshot(
                 current_market, orderbook_payload, observed_at
             )
+            self._market_state = market_state
             current_payload, notification = self._analyze(
                 current_market, market_state, btc_state, settings, observed_at
             )
@@ -145,6 +207,7 @@ class AnalysisEngine:
                 self._pending_settlements.add(self._previous_ticker)
             self._previous_ticker = ticker
         elif current_market:
+            self._market_state = None
             self._save_market(current_market, observed_at)
             reason = (
                 "The contract threshold is missing from the Kalshi response."
@@ -155,6 +218,7 @@ class AnalysisEngine:
                 current_market, reason
             )
         elif self._previous_ticker:
+            self._market_state = None
             self._pending_settlements.add(self._previous_ticker)
             self._previous_ticker = None
 
@@ -167,13 +231,7 @@ class AnalysisEngine:
         reliability = bool(current_payload and current_payload["decision"]["reason_code"] != "DATA_UNRELIABLE")
         self.dashboard = {
             **self.dashboard,
-            "system": {
-                "status": "live" if reliability else "degraded",
-                "message": "Live public feeds" if reliability else "Signal withheld until critical data recovers",
-                "updated_at": observed_at,
-                "poll_seconds": self.config.poll_seconds,
-                "read_only": True,
-            },
+            "system": self._system_state(reliability, observed_at),
             "btc": btc_state,
             "current": current_payload,
             "next": self._market_summary(next_market) if next_market else None,
@@ -182,26 +240,248 @@ class AnalysisEngine:
             "calibration": self.calibration_summary(),
             "model": self.models.active(),
         }
+        self._schedule_publish()
 
-    def _save_bitcoin(self, composite: CompositeQuote, observed_at: str) -> dict[str, Any]:
+    def subscribe(self) -> asyncio.Queue[None]:
+        queue: asyncio.Queue[None] = asyncio.Queue(maxsize=1)
+        self._subscribers.add(queue)
+        return queue
+
+    def unsubscribe(self, queue: asyncio.Queue[None]) -> None:
+        self._subscribers.discard(queue)
+
+    def _schedule_publish(self) -> None:
+        if self._publish_task and not self._publish_task.done():
+            return
+        self._publish_task = asyncio.create_task(self._publish_after_delay())
+
+    async def _publish_after_delay(self) -> None:
+        await asyncio.sleep(self.config.live_update_seconds)
+        for queue in tuple(self._subscribers):
+            if queue.full():
+                try:
+                    queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    pass
+            queue.put_nowait(None)
+
+    def _system_state(self, reliable: bool, observed_at: str) -> dict[str, Any]:
+        bitcoin_sources = [
+            name
+            for name in ("Coinbase", "Kraken")
+            if self._stream_status[name].get("connected")
+        ]
+        kalshi_status = self._stream_status["Kalshi"]
+        streaming = bool(bitcoin_sources or kalshi_status.get("connected"))
+        return {
+            "status": "live" if reliable else "degraded",
+            "message": (
+                "Live WebSocket feeds"
+                if reliable and streaming
+                else "Live REST fallback"
+                if reliable
+                else "Signal withheld until critical data recovers"
+            ),
+            "updated_at": observed_at,
+            "poll_seconds": self.config.poll_seconds,
+            "live_update_seconds": self.config.live_update_seconds,
+            "read_only": True,
+            "streams": {
+                "bitcoin": {
+                    "connected": bool(bitcoin_sources),
+                    "sources": bitcoin_sources,
+                },
+                "kalshi": {
+                    "connected": bool(kalshi_status.get("connected")),
+                    "configured": bool(kalshi_status.get("configured")),
+                    "error": kalshi_status.get("error"),
+                },
+            },
+        }
+
+    async def _handle_stream_status(
+        self, source: str, connected: bool, error: str | None
+    ) -> None:
+        status = self._stream_status.setdefault(source, {})
+        status["connected"] = connected
+        if error:
+            status["error"] = error
+        else:
+            status.pop("error", None)
+        current = self.dashboard.get("current") or {}
+        reliable = bool(
+            current
+            and current.get("decision", {}).get("reason_code") != "DATA_UNRELIABLE"
+        )
+        self.dashboard["system"] = self._system_state(reliable, iso_now())
+        self._schedule_publish()
+
+    async def _handle_stream_quote(self, quote: ExchangeQuote) -> None:
+        self._latest_quotes[quote.exchange] = quote
+        self._schedule_live_refresh()
+
+    def _schedule_live_refresh(self) -> None:
+        if self._live_refresh_task and not self._live_refresh_task.done():
+            return
+        elapsed = time.monotonic() - self._last_live_update
+        delay = max(0.0, self.config.live_update_seconds - elapsed)
+        self._live_refresh_task = asyncio.create_task(self._refresh_live_after(delay))
+
+    async def _refresh_live_after(self, delay: float) -> None:
+        if delay:
+            await asyncio.sleep(delay)
+        async with self._update_lock:
+            quotes = list(self._latest_quotes.values())
+            observed_at = iso_now()
+            preferred = {
+                name
+                for name in ("Coinbase", "Kraken")
+                if self._stream_status[name].get("connected")
+            }
+            composite = live_composite_quote(quotes, preferred)
+            if composite.price is not None:
+                now = time.monotonic()
+                persist = now - self._last_btc_persist >= 1.0
+                self._latest_btc = self._save_bitcoin(
+                    composite, observed_at, persist=persist
+                )
+                if persist:
+                    self._last_btc_persist = now
+            self._refresh_cached_dashboard(observed_at)
+            self._last_live_update = time.monotonic()
+
+    async def _handle_kalshi_message(
+        self, message: dict[str, Any], book_metrics: dict[str, Any] | None
+    ) -> None:
+        if not self._current_market:
+            return
+        payload = message.get("msg") or {}
+        if payload.get("market_ticker") != self._current_market.get("ticker"):
+            return
+        async with self._update_lock:
+            for key in (
+                "yes_bid_dollars",
+                "yes_ask_dollars",
+                "yes_bid_size_fp",
+                "yes_ask_size_fp",
+                "volume_fp",
+                "open_interest_fp",
+            ):
+                if payload.get(key) is not None:
+                    self._current_market[key] = payload[key]
+            if book_metrics is not None:
+                now = time.monotonic()
+                persist = now - self._last_kalshi_persist >= 1.0
+                book_payload = {
+                    "orderbook_fp": {
+                        "yes_dollars": book_metrics["yes_bids"],
+                        "no_dollars": book_metrics["no_bids"],
+                    }
+                }
+                self._market_state = self._save_kalshi_snapshot(
+                    self._current_market,
+                    book_payload,
+                    iso_now(),
+                    persist=persist,
+                )
+                if persist:
+                    self._last_kalshi_persist = now
+            elif message.get("type") == "ticker":
+                self._market_state = self._ticker_market_state(
+                    self._current_market, self._market_state
+                )
+        self._schedule_live_refresh()
+
+    @staticmethod
+    def _ticker_market_state(
+        market: dict[str, Any], previous: dict[str, Any] | None
+    ) -> dict[str, Any]:
+        state = dict(previous or {})
+        old_mid = None
+        if state.get("yes_bid") is not None and state.get("yes_ask") is not None:
+            old_mid = (float(state["yes_bid"]) + float(state["yes_ask"])) / 2
+        yes_bid = as_float(market.get("yes_bid_dollars"))
+        yes_ask = as_float(market.get("yes_ask_dollars"))
+        if yes_bid is None:
+            yes_bid = state.get("yes_bid")
+        if yes_ask is None:
+            yes_ask = state.get("yes_ask")
+        new_mid = (
+            (float(yes_bid) + float(yes_ask)) / 2
+            if yes_bid is not None and yes_ask is not None
+            else None
+        )
+        state.update(
+            {
+                "ticker": market["ticker"],
+                "yes_bid": yes_bid,
+                "yes_ask": yes_ask,
+                "no_bid": 1.0 - float(yes_ask) if yes_ask is not None else None,
+                "no_ask": 1.0 - float(yes_bid) if yes_bid is not None else None,
+                "spread": (
+                    float(yes_ask) - float(yes_bid)
+                    if yes_bid is not None and yes_ask is not None
+                    else None
+                ),
+                "liquidity": as_float(market.get("liquidity_dollars")) or state.get("liquidity", 0.0),
+                "open_interest": as_float(market.get("open_interest_fp")) or state.get("open_interest", 0.0),
+                "volume": as_float(market.get("volume_fp")) or state.get("volume", 0.0),
+                "yes_bid_size": as_float(market.get("yes_bid_size_fp")) or state.get("yes_bid_size"),
+                "yes_ask_size": as_float(market.get("yes_ask_size_fp")) or state.get("yes_ask_size"),
+                "no_ask_size": as_float(market.get("yes_bid_size_fp")) or state.get("no_ask_size"),
+                "rapid_repricing": (
+                    new_mid - old_mid
+                    if new_mid is not None and old_mid is not None
+                    else 0.0
+                ),
+            }
+        )
+        return state
+
+    def _refresh_cached_dashboard(self, observed_at: str) -> None:
+        if not (self._current_market and self._market_state and self._latest_btc):
+            return
+        current, notification = self._analyze(
+            self._current_market,
+            self._market_state,
+            self._latest_btc,
+            self.db.settings(),
+            observed_at,
+        )
+        reliable = current["decision"]["reason_code"] != "DATA_UNRELIABLE"
+        self.dashboard = {
+            **self.dashboard,
+            "system": self._system_state(reliable, observed_at),
+            "btc": self._latest_btc,
+            "current": current,
+            "next": self._market_summary(self._next_market) if self._next_market else None,
+            "notification": notification,
+            "paper": self._portfolio_summary(),
+        }
+        self._schedule_publish()
+
+    def _save_bitcoin(
+        self, composite: CompositeQuote, observed_at: str, *, persist: bool = True
+    ) -> dict[str, Any]:
         if composite.price is None:
             return {
                 "price": None,
                 "exchange_count": len(composite.quotes),
                 "errors": composite.errors,
             }
-        for quote in composite.quotes:
-            self.db.execute(
-                """
-                INSERT INTO exchange_quotes(
-                    observed_at,exchange,price,bid,ask,volume,latency_ms
-                ) VALUES (?,?,?,?,?,?,?)
-                """,
-                (
-                    observed_at, quote.exchange, quote.price, quote.bid, quote.ask,
-                    quote.volume, quote.latency_ms,
-                ),
-            )
+        if persist:
+            for quote in composite.quotes:
+                self.db.execute(
+                    """
+                    INSERT INTO exchange_quotes(
+                        observed_at,exchange,price,bid,ask,volume,latency_ms
+                    ) VALUES (?,?,?,?,?,?,?)
+                    """,
+                    (
+                        observed_at, quote.exchange, quote.price, quote.bid, quote.ask,
+                        quote.volume, quote.latency_ms,
+                    ),
+                )
         recent = self.db.fetch_all(
             """
             SELECT observed_at, composite_price, source_json FROM btc_ticks
@@ -250,21 +530,22 @@ class AnalysisEngine:
                 second_rate = (volume_points[-1][1] - volume_points[-2][1]) / second_dt
                 volume_acceleration = second_rate - first_rate
         source = composite.as_dict()
-        self.db.execute(
-            """
-            INSERT INTO btc_ticks(
-                observed_at,composite_price,dispersion_pct,exchange_count,
-                volatility_5m,volatility_15m,volatility_60m,momentum_1m,
-                momentum_5m,volume_acceleration,source_json,high_low_5m_pct
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
-            """,
-            (
-                observed_at, composite.price, composite.dispersion_pct or 0.0,
-                len(composite.quotes), vol_5m, vol_15m, vol_60m,
-                momentum_1m, momentum_5m, volume_acceleration, json.dumps(source),
-                high_low_5m_pct,
-            ),
-        )
+        if persist:
+            self.db.execute(
+                """
+                INSERT INTO btc_ticks(
+                    observed_at,composite_price,dispersion_pct,exchange_count,
+                    volatility_5m,volatility_15m,volatility_60m,momentum_1m,
+                    momentum_5m,volume_acceleration,source_json,high_low_5m_pct
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    observed_at, composite.price, composite.dispersion_pct or 0.0,
+                    len(composite.quotes), vol_5m, vol_15m, vol_60m,
+                    momentum_1m, momentum_5m, volume_acceleration, json.dumps(source),
+                    high_low_5m_pct,
+                ),
+            )
         return {
             **source,
             "observed_at": observed_at,
@@ -302,7 +583,12 @@ class AnalysisEngine:
         )
 
     def _save_kalshi_snapshot(
-        self, market: dict[str, Any], book_payload: dict[str, Any], observed_at: str
+        self,
+        market: dict[str, Any],
+        book_payload: dict[str, Any],
+        observed_at: str,
+        *,
+        persist: bool = True,
     ) -> dict[str, Any]:
         metrics = orderbook_metrics(book_payload)
         # The list-markets response can lag the dedicated order book. Executability
@@ -338,21 +624,22 @@ class AnalysisEngine:
             "rapid_repricing": rapid,
             "orderbook": metrics,
         }
-        self.db.execute(
-            """
-            INSERT INTO kalshi_snapshots(
-                observed_at,ticker,yes_bid,yes_ask,no_bid,no_ask,spread,liquidity,
-                open_interest,volume,yes_bid_size,yes_ask_size,imbalance,
-                rapid_repricing,orderbook_json
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-            """,
-            (
-                observed_at, market["ticker"], yes_bid, yes_ask, no_bid, no_ask, spread,
-                state["liquidity"], state["open_interest"], state["volume"],
-                state["yes_bid_size"], state["yes_ask_size"], state["imbalance"],
-                rapid, json.dumps(metrics),
-            ),
-        )
+        if persist:
+            self.db.execute(
+                """
+                INSERT INTO kalshi_snapshots(
+                    observed_at,ticker,yes_bid,yes_ask,no_bid,no_ask,spread,liquidity,
+                    open_interest,volume,yes_bid_size,yes_ask_size,imbalance,
+                    rapid_repricing,orderbook_json
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    observed_at, market["ticker"], yes_bid, yes_ask, no_bid, no_ask, spread,
+                    state["liquidity"], state["open_interest"], state["volume"],
+                    state["yes_bid_size"], state["yes_ask_size"], state["imbalance"],
+                    rapid, json.dumps(metrics),
+                ),
+            )
         return state
 
     def _analyze(
