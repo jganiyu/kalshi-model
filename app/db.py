@@ -192,6 +192,71 @@ MIGRATIONS: list[tuple[int, str]] = [
         ALTER TABLE btc_ticks ADD COLUMN high_low_5m_pct REAL;
         """,
     ),
+    (
+        3,
+        """
+        ALTER TABLE paper_trades RENAME TO paper_trades_legacy;
+        CREATE TABLE paper_trades (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ticker TEXT NOT NULL,
+            side TEXT NOT NULL,
+            opened_at TEXT NOT NULL,
+            entry_price REAL NOT NULL,
+            contracts INTEGER NOT NULL,
+            entry_cost REAL NOT NULL,
+            fees REAL NOT NULL,
+            model_probability REAL NOT NULL,
+            market_probability REAL NOT NULL,
+            edge REAL NOT NULL,
+            expected_value REAL NOT NULL,
+            confidence TEXT NOT NULL,
+            model_version TEXT NOT NULL,
+            status TEXT NOT NULL,
+            settled_at TEXT,
+            outcome INTEGER,
+            payout REAL,
+            realized_pnl REAL,
+            source TEXT NOT NULL DEFAULT 'automatic'
+        );
+        INSERT INTO paper_trades(
+            id,ticker,side,opened_at,entry_price,contracts,entry_cost,fees,
+            model_probability,market_probability,edge,expected_value,confidence,
+            model_version,status,settled_at,outcome,payout,realized_pnl,source
+        )
+        SELECT
+            id,ticker,side,opened_at,entry_price,contracts,entry_cost,fees,
+            model_probability,market_probability,edge,expected_value,confidence,
+            model_version,status,settled_at,outcome,payout,realized_pnl,'automatic'
+        FROM paper_trades_legacy;
+        DROP TABLE paper_trades_legacy;
+        CREATE INDEX idx_paper_trades_ticker_status
+            ON paper_trades(ticker, status);
+
+        CREATE TABLE paper_orders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ticker TEXT NOT NULL,
+            side TEXT NOT NULL,
+            action TEXT NOT NULL,
+            order_type TEXT NOT NULL,
+            status TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            requested_dollars REAL,
+            requested_contracts INTEGER,
+            limit_price REAL,
+            filled_price REAL,
+            filled_contracts INTEGER,
+            fees REAL NOT NULL DEFAULT 0,
+            realized_pnl REAL,
+            filled_at TEXT,
+            canceled_at TEXT,
+            source TEXT NOT NULL DEFAULT 'manual',
+            error TEXT,
+            FOREIGN KEY(ticker) REFERENCES markets(ticker)
+        );
+        CREATE INDEX idx_paper_orders_status_ticker
+            ON paper_orders(status, ticker);
+        """,
+    ),
 ]
 
 

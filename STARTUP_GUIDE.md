@@ -23,9 +23,9 @@ through the live feed. Kalshi prices also stream once the Key ID is configured.
 ## Read The Dashboard
 
 - **BTC vs threshold:** Where Bitcoin is relative to the settlement target.
-- **Model vs market:** Our estimated YES probability compared with Kalshi's price.
+- **Model vs market:** Our estimated Up probability compared with Kalshi's price.
 - **Edge and EV:** Whether the difference survives spread, fees, and slippage.
-- **Signal:** `TRADE YES`, `TRADE NO`, or, most often, `NO TRADE`.
+- **Signal:** `UP`, `DOWN`, or, most often, `HOLD`.
 - **Position:** A conservative paper amount based on the configured bankroll.
 
 Confidence measures data quality, calibration, model agreement, liquidity, and
@@ -43,7 +43,7 @@ spread. It is not a measure of how dramatic the number looks. Convenient, I know
 This system cannot place real trades. It uses public read-only data and records
 paper positions locally in SQLite.
 
-If you see `NO TRADE - Data Unreliable`, hold position. A stale feed, missing ask,
+If you see `HOLD - Data Unreliable`, hold position. A stale feed, missing ask,
 market transition, or exchange disagreement has made the estimate unsafe.
 
 To shut the app down, return to Terminal and press `Control-C`.

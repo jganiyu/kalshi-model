@@ -200,6 +200,7 @@ class AnalysisEngine:
                 current_market, orderbook_payload, observed_at
             )
             self._market_state = market_state
+            self.paper.process_open_orders(ticker, market_state)
             current_payload, notification = self._analyze(
                 current_market, market_state, btc_state, settings, observed_at
             )
@@ -441,6 +442,9 @@ class AnalysisEngine:
     def _refresh_cached_dashboard(self, observed_at: str) -> None:
         if not (self._current_market and self._market_state and self._latest_btc):
             return
+        self.paper.process_open_orders(
+            str(self._current_market["ticker"]), self._market_state
+        )
         current, notification = self._analyze(
             self._current_market,
             self._market_state,
@@ -853,7 +857,50 @@ class AnalysisEngine:
 
     def _portfolio_summary(self) -> dict[str, Any]:
         portfolio = self.paper.portfolio()
-        return {key: value for key, value in portfolio.items() if key != "trades"}
+        return {
+            key: value
+            for key, value in portfolio.items()
+            if key not in {"trades", "orders"}
+        }
+
+    async def place_manual_paper_order(self, payload: dict[str, Any]) -> dict[str, Any]:
+        async with self._update_lock:
+            current = self.dashboard.get("current")
+            if not current or not current.get("ticker"):
+                raise ValueError("There is no active Kalshi contract.")
+            quality = current.get("data_quality") or {}
+            if not quality.get("reliable", False):
+                raise ValueError(
+                    quality.get("reason") or "Live market data is not reliable enough to trade."
+                )
+            order_type = str(payload.get("order_type", "market")).upper()
+            limit_price = None
+            if order_type == "LIMIT":
+                try:
+                    limit_price = float(payload.get("limit_price_cents")) / 100
+                except (TypeError, ValueError) as exc:
+                    raise ValueError("Enter a valid limit price in cents.") from exc
+            order = self.paper.place_order(
+                ticker=str(current["ticker"]),
+                side=str(payload.get("side", "")),
+                action=str(payload.get("action", "")),
+                order_type=order_type,
+                market=current,
+                dollars=payload.get("dollars"),
+                contracts=payload.get("contracts"),
+                limit_price=limit_price,
+            )
+            self.dashboard["paper"] = self._portfolio_summary()
+            self._schedule_publish()
+            return {"order": order, "portfolio": self.paper.portfolio()}
+
+    async def cancel_manual_paper_order(self, order_id: int) -> dict[str, Any]:
+        async with self._update_lock:
+            if not self.paper.cancel_order(order_id):
+                raise ValueError("That limit order is no longer open.")
+            self.dashboard["paper"] = self._portfolio_summary()
+            self._schedule_publish()
+            return {"canceled": order_id, "portfolio": self.paper.portfolio()}
 
     def calibration_summary(self) -> dict[str, Any]:
         observations = self.models.observations()

@@ -43,7 +43,7 @@ and restrict it with `chmod 600`. Coinbase and Kraken streams require no credent
 - Models the actual settlement condition: the closing 60-second average of CF
   Benchmarks BRTI must be at least the opening 60-second average/target.
 - Starts with an interpretable distance-to-threshold/volatility probability model.
-- Uses executable YES/NO asks, current taker fees, configurable slippage, and
+- Uses executable Up/Down asks, current taker fees, configurable slippage, and
   available ask size before showing a trade signal.
 - Defaults to no trade unless positive EV and the configured executable-edge margin
   both survive costs.
@@ -63,7 +63,7 @@ There is no assumed free historical BRTI order-book feed in this project. Live
 analysis therefore uses a robust multi-exchange spot proxy and adds basis
 uncertainty. If fewer than two feeds respond, exchange dispersion is too high,
 the contract is transitioning, or an executable Kalshi ask is absent, the app
-shows `NO TRADE — Data Unreliable`.
+shows `HOLD — Data Unreliable`.
 
 The automatic bootstrap uses recent Kalshi one-minute market candlesticks and
 Coinbase one-minute BTC candles at a fixed point five minutes before settlement.
@@ -121,7 +121,7 @@ The database defaults to `data/kalshi_model.db`. Backups are written to
 .venv/bin/python -m pytest
 ```
 
-Tests cover probability behavior, fee and EV math, symmetric YES/NO decisions,
+Tests cover probability behavior, fee and EV math, symmetric Up/Down decisions,
 Kelly caps, stale-data and drawdown gates, SQLite migration/persistence, paper
 settlement, calibration metrics, time-ordered model promotion, WebSocket signing,
 and streamed order-book deltas.

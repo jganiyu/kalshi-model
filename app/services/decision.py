@@ -72,6 +72,7 @@ def make_decision(
     yes_ev = expected_value(yes_probability, executable_yes)
     no_ev = expected_value(no_probability, executable_no)
     side = "YES" if yes_ev >= no_ev else "NO"
+    side_label = "UP" if side == "YES" else "DOWN"
     probability = yes_probability if side == "YES" else no_probability
     price = executable_yes if side == "YES" else executable_no
     ev = yes_ev if side == "YES" else no_ev
@@ -119,7 +120,7 @@ def make_decision(
     ):
         confidence = "High"
     explanation = (
-        f"The model prices {side} above its executable cost by "
+        f"The model prices {side_label} above its executable cost by "
         f"{executable_edge * 100:.1f} points after a conservative slippage allowance."
     )
     return Decision(

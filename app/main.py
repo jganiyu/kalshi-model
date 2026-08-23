@@ -85,6 +85,22 @@ async def paper() -> dict[str, Any]:
     return engine.paper.portfolio()
 
 
+@app.post("/api/paper/orders")
+async def place_paper_order(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    try:
+        return await engine.place_manual_paper_order(payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.delete("/api/paper/orders/{order_id}")
+async def cancel_paper_order(order_id: int) -> dict[str, Any]:
+    try:
+        return await engine.cancel_manual_paper_order(order_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
 @app.get("/api/signals")
 async def signals(limit: int = Query(default=100, ge=1, le=500)) -> dict[str, Any]:
     rows = db.fetch_all(
@@ -174,6 +190,7 @@ async def database_info() -> dict[str, Any]:
     counts = {}
     for table in (
         "btc_ticks", "markets", "signal_snapshots", "settlements", "paper_trades",
+        "paper_orders",
         "calibration_reports", "model_versions",
     ):
         counts[table] = db.fetch_one(f"SELECT COUNT(*) AS count FROM {table}")["count"]
