@@ -15,6 +15,47 @@ Chief, Kalshi Model is a local Mac command center for Kalshi's 15-minute Bitcoin
   </tr>
 </table>
 
+## Get the app
+
+Choose one route; most people should use the download.
+
+### 1. Download the Mac app (recommended)
+
+[**Download the latest Apple Silicon Mac ZIP**](https://github.com/jganiyu/kalshi-model/releases/latest/download/Kalshi-Model-macOS-arm64.zip)
+
+1. Download and open the ZIP.
+2. Move `Kalshi Model.app` to your Applications folder.
+3. On first launch, right-click the app and choose **Open**.
+4. Add your Kalshi credentials in the app's **Settings** page.
+
+This route needs no Python or Terminal; private-repository collaborators must be signed in to GitHub.
+
+### 2. Run from source
+
+Use this route for development or code changes.
+
+```bash
+git clone https://github.com/jganiyu/kalshi-model.git
+cd kalshi-model
+./start.sh
+```
+
+This requires macOS, Python 3.11 or newer, and opens the app at [http://127.0.0.1:8765](http://127.0.0.1:8765).
+
+### 3. Build the Mac app yourself
+
+Use this route to create a fresh `.app` and ZIP from the source code.
+
+```bash
+git clone https://github.com/jganiyu/kalshi-model.git
+cd kalshi-model
+./scripts/build_macos_app.sh
+```
+
+You do not run `./start.sh` first; the build script creates its own environment and writes both files to `dist/`.
+
+`git clone` downloads the project from GitHub; the build script then works entirely on your Mac.
+
 ## What it does
 
 - **Dashboard:** Shows the live model, BTC chart, current contract, paper controls, and Kalshi order books.
@@ -75,7 +116,10 @@ Chief, Kalshi Model is a local Mac command center for Kalshi's 15-minute Bitcoin
 - **Storage:** The app saves a protected local copy under `~/Library/Application Support/Kalshi Model/`.
 - **Security:** Never commit `.env`, your Key ID, or your private key.
 
-Environment setup is also supported:
+<details>
+<summary>Developer alternative: configure credentials with <code>.env</code></summary>
+
+Create the local environment file:
 
 ```bash
 cp .env.example .env
@@ -86,27 +130,7 @@ KALSHI_API_KEY_ID=your-key-id
 KALSHI_PRIVATE_KEY_PATH=/absolute/path/to/your-private-key.pem
 ```
 
-## Run on a Mac
-
-Requires macOS, Python 3.11 or newer, and an internet connection.
-
-```bash
-git clone https://github.com/jganiyu/kalshi-model.git
-cd kalshi-model
-./start.sh
-```
-
-The first launch installs dependencies, creates the local database, and opens [http://127.0.0.1:8765](http://127.0.0.1:8765).
-
-## Build the Mac app
-
-```bash
-./scripts/build_macos_app.sh
-```
-
-This creates `dist/Kalshi Model.app` and `dist/Kalshi-Model-macOS-<architecture>.zip`.
-
-The local build is ad-hoc signed; public distribution without a first-launch warning requires Apple Developer ID signing and notarization.
+</details>
 
 ## Local data
 
