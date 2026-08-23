@@ -79,7 +79,7 @@ class PaperTradingService:
         )
         session_peak = max(starting + realized - session_pnl, starting + realized)
         session_drawdown = max(0.0, -session_pnl / session_peak) if session_peak else 0.0
-        automatic_enabled = bool(settings.get("paper_trading_enabled", True))
+        automatic_enabled = bool(settings.get("paper_trading_enabled", False))
         automatic_block_reason = None
         if not automatic_enabled:
             automatic_block_reason = "Automatic paper trading is off."

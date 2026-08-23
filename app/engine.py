@@ -753,7 +753,7 @@ class AnalysisEngine:
                 market["ticker"], decision, model_version, features, btc,
                 market_state, reason, observed_at,
             )
-            if settings.get("paper_trading_enabled", True):
+            if settings.get("paper_trading_enabled", False):
                 self.paper.open_from_decision(market["ticker"], decision, model_version)
             if previous and previous.get("signal") != decision.signal:
                 notification = {

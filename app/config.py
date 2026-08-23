@@ -60,7 +60,7 @@ class AppConfig:
 
 DEFAULT_SETTINGS: dict[str, object] = {
     "starting_bankroll": 1000.0,
-    "paper_trading_enabled": True,
+    "paper_trading_enabled": False,
     "risk_controls_enabled": True,
     "min_edge": 0.05,
     "fractional_kelly": 0.25,

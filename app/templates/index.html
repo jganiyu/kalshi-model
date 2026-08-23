@@ -9,7 +9,7 @@
   <link rel="apple-touch-icon" href="/static/icon-180.png">
   <script>
     (() => {
-      const preference = localStorage.getItem("kalshi-theme") || "system";
+      const preference = localStorage.getItem("kalshi-theme-v2") || "light";
       const dark = preference === "dark" || (preference === "system" && matchMedia("(prefers-color-scheme: dark)").matches);
       document.documentElement.dataset.theme = dark ? "dark" : "light";
       document.documentElement.dataset.themePreference = preference;

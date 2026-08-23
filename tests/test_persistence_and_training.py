@@ -39,8 +39,23 @@ def test_database_migrations_and_settings_persist(tmp_path: Path) -> None:
     assert reopened.fetch_one("SELECT MAX(version) version FROM schema_migrations")["version"] == 3
 
 
+def test_new_database_starts_with_clean_manual_paper_account(tmp_path: Path) -> None:
+    db = make_db(tmp_path)
+    settings = db.settings()
+    portfolio = PaperTradingService(db).portfolio()
+
+    assert settings["starting_bankroll"] == 1_000.0
+    assert settings["paper_trading_enabled"] is False
+    assert portfolio["starting_bankroll"] == 1_000.0
+    assert portfolio["current_bankroll"] == 1_000.0
+    assert portfolio["automatic_trading_enabled"] is False
+    assert portfolio["trades"] == []
+    assert portfolio["orders"] == []
+
+
 def test_paper_trade_settlement_uses_actual_binary_outcome(tmp_path: Path) -> None:
     db = make_db(tmp_path)
+    db.update_settings({"paper_trading_enabled": True})
     add_market(db, "TEST-YES")
     service = PaperTradingService(db)
     decision = Decision(

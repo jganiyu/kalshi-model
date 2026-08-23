@@ -221,6 +221,7 @@ def test_drawdown_blocks_execution_without_replacing_model_signal(tmp_path: Path
     db = make_db(tmp_path)
     add_market(db)
     db.update_settings({
+        "paper_trading_enabled": True,
         "risk_controls_enabled": True,
         "max_session_drawdown_pct": 0.0,
     })

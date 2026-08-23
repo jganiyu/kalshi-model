@@ -12,7 +12,7 @@ const state = {
   chartLastFrame: 0,
   chartTicker: null,
   priceMovement: { direction: null, until: 0 },
-  themePreference: localStorage.getItem("kalshi-theme") || "system",
+  themePreference: localStorage.getItem("kalshi-theme-v2") || "light",
   paperOrder: { side: "YES", action: "BUY", limit: false, submitting: false },
   paperReset: { confirming: false, resetting: false, timer: null },
 };
@@ -31,7 +31,7 @@ function syncThemeButtons() {
 
 function applyTheme(preference = state.themePreference) {
   state.themePreference = preference;
-  localStorage.setItem("kalshi-theme", preference);
+  localStorage.setItem("kalshi-theme-v2", preference);
   const dark = preference === "dark" || (preference === "system" && themeMedia.matches);
   document.documentElement.dataset.theme = dark ? "dark" : "light";
   document.documentElement.dataset.themePreference = preference;
