@@ -6,8 +6,8 @@ A local macOS research and paper-trading app for Kalshi's 15-minute Bitcoin Up o
 
 <table>
   <tr>
-    <td width="50%"><img src="docs/screenshots/dashboard-light.jpg" alt="Kalshi Model dashboard in light mode"></td>
-    <td width="50%"><img src="docs/screenshots/dashboard-dark.jpg" alt="Kalshi Model dashboard in dark mode"></td>
+    <td width="50%"><img src="docs/screenshots/dashboard-forecast-light.jpg" alt="Kalshi Model dashboard in light mode"></td>
+    <td width="50%"><img src="docs/screenshots/dashboard-forecast-dark.jpg" alt="Kalshi Model dashboard in dark mode"></td>
   </tr>
   <tr>
     <td align="center"><strong>Light</strong></td>
@@ -25,7 +25,7 @@ A local macOS research and paper-trading app for Kalshi's 15-minute Bitcoin Up o
 
 ## Outcome forecast
 
-![Outcome forecast panel](docs/screenshots/current-signal.jpg)
+![Outcome forecast panel](docs/screenshots/outcome-forecast.jpg)
 
 - **Likely Up:** Up probability is 60% or higher.
 - **Uncertain:** Up probability is above 40% and below 60%.
