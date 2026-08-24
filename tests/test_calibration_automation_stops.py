@@ -9,6 +9,7 @@ from app.db import Database
 from app.domain import iso_now
 from app.main import clean_settings_payload
 from app.services.decision import Decision
+from app.services.forecast import make_forecast
 from app.services.paper import PaperTradingService
 
 
@@ -196,6 +197,27 @@ def test_speculative_signal_never_enters_automatically(tmp_path: Path) -> None:
         seconds_remaining=190, model_version="test", now=10,
     )
 
+    assert result["entered"] is False
+    assert db.fetch_one("SELECT COUNT(*) count FROM paper_entries")["count"] == 0
+
+
+def test_forecast_direction_alone_cannot_trigger_automatic_entry(tmp_path: Path) -> None:
+    db = make_db(tmp_path)
+    add_market(db, "FORECAST-ONLY")
+    db.update_settings({"paper_trading_enabled": True, "automatic_min_confidence": "Low"})
+    service = PaperTradingService(db)
+    forecast = make_forecast(0.80)
+
+    service.consider_automatic_entry(
+        ticker="FORECAST-ONLY", decision=decision("HOLD"),
+        seconds_remaining=200, model_version="test", now=0,
+    )
+    result = service.consider_automatic_entry(
+        ticker="FORECAST-ONLY", decision=decision("HOLD"),
+        seconds_remaining=190, model_version="test", now=10,
+    )
+
+    assert forecast.signal == "LIKELY_UP"
     assert result["entered"] is False
     assert db.fetch_one("SELECT COUNT(*) count FROM paper_entries")["count"] == 0
 

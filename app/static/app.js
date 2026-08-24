@@ -125,19 +125,19 @@ async function api(path, options = {}) {
   return response.json();
 }
 
-function signalPosition(decision) {
-  if (decision?.signal === "BUY") return "buy";
-  if (decision?.signal === "SPECULATIVE") return "speculative";
-  if (decision?.signal === "SELL") return "sell";
-  return "hold";
+function forecastPosition(forecast) {
+  if (forecast?.signal === "LIKELY_UP") return "up";
+  if (forecast?.signal === "LIKELY_DOWN") return "down";
+  return "uncertain";
 }
 
-function signalTitle(decision) {
-  if (!decision || signalPosition(decision) === "hold") return "";
-  if (decision.signal === "SPECULATIVE") {
-    return `Speculative ${marketSideLabel(decision.side)} Value · ${decision.confidence} Edge`;
-  }
-  return `${decision.confidence} Edge`;
+function tradeActionLabel(decision) {
+  if (!decision) return "--";
+  const side = marketSideLabel(decision.side);
+  if (decision.signal === "BUY") return `Buy ${side}`;
+  if (decision.signal === "SPECULATIVE") return `Speculative ${side}`;
+  if (decision.signal === "SELL") return `Sell ${side}`;
+  return `Hold ${side}`;
 }
 
 function normalizeBookLevels(levels) {
@@ -195,7 +195,8 @@ function renderDashboard(data) {
   const system = data.system || {};
   const current = data.current;
   const btc = data.btc || {};
-  const decision = current?.decision;
+  const forecast = current?.forecast;
+  const decision = current?.trade_decision || current?.decision;
   const streams = system.streams || {};
   if (current?.ticker && current.ticker !== state.chartTicker) {
     state.chartTicker = current.ticker;
@@ -209,29 +210,17 @@ function renderDashboard(data) {
   $("#last-update").textContent = system.updated_at ? `Updated ${new Date(system.updated_at).toLocaleTimeString([], { hour: "numeric", minute: "2-digit", second: "2-digit" })}` : "Connecting";
   $("#header-model-version").textContent = data.model?.version || "baseline-1.0";
 
-  const position = signalPosition(decision);
+  const position = forecastPosition(forecast);
   const selectedSide = current?.selected_side || data.paper?.selected_side || "YES";
   if (!state.paperOrder.sideUpdating) state.paperOrder.side = selectedSide;
   const selectedLabel = marketSideLabel(selectedSide);
   const pill = $("#signal-pill");
   pill.dataset.position = position;
-  pill.querySelector('[data-signal-option="buy"]').textContent = `Buy ${selectedLabel}`;
-  pill.querySelector('[data-signal-option="hold"]').textContent = position === "speculative" ? "Speculative" : "Hold";
-  pill.querySelector('[data-signal-option="sell"]').textContent = `Sell ${selectedLabel}`;
-  const signalLabel = position === "buy"
-    ? `Buy ${selectedLabel}`
-    : position === "speculative"
-      ? `Speculative ${selectedLabel} Value`
-      : position === "sell" ? `Sell ${selectedLabel}` : "Hold";
-  pill.setAttribute("aria-label", `Current signal: ${signalLabel}`);
-  const activeOption = position === "speculative" ? "hold" : position;
+  const forecastLabel = position === "up" ? "Likely Up" : position === "down" ? "Likely Down" : "Uncertain";
+  pill.setAttribute("aria-label", `Outcome forecast: ${forecastLabel}`);
   pill.querySelectorAll("[data-signal-option]").forEach((option) => {
-    option.classList.toggle("active", option.dataset.signalOption === activeOption);
+    option.classList.toggle("active", option.dataset.signalOption === position);
   });
-  const confidence = signalTitle(decision);
-  const signalTitleElement = $("#signal-title");
-  signalTitleElement.textContent = confidence;
-  signalTitleElement.hidden = !confidence;
   const paperPermission = $("#paper-permission");
   const paper = data.paper || {};
   const automaticTradingEnabled = Boolean(paper.automatic_trading_enabled);
@@ -250,18 +239,18 @@ function renderDashboard(data) {
   paperPermission.classList.toggle("paused", paperBlocked);
   paperPermission.textContent = automaticTradingStatus;
   paperPermission.title = automaticTradingStatus;
-  $("#signal-explanation").textContent = formatMarketLanguage(decision?.explanation || system.message || "Connecting to public feeds.");
-  $("#model-probability-label").textContent = `${selectedLabel} win chance`;
-  $("#worthless-risk-label").textContent = `${selectedLabel} worthless risk`;
-  $("#model-probability").textContent = percent(decision?.model_probability, 1);
-  $("#worthless-risk").textContent = decision?.model_probability === null || decision?.model_probability === undefined
-    ? "--"
-    : percent(1 - Number(decision.model_probability), 1);
-  $("#market-probability").textContent = percent(decision?.market_probability, 1);
-  $("#edge").textContent = points(decision?.edge);
-  $("#ev").textContent = decision?.expected_value === null || decision?.expected_value === undefined ? "--" : money(decision.expected_value, 3);
-  $("#edge").className = Number(decision?.edge) > 0 ? "positive" : Number(decision?.edge) < 0 ? "negative" : "";
-  $("#ev").className = Number(decision?.expected_value) > 0 ? "positive" : Number(decision?.expected_value) < 0 ? "negative" : "";
+  $("#signal-explanation").textContent = forecast?.explanation || system.message || "Connecting to public feeds.";
+  $("#up-probability").textContent = percent(forecast?.up_probability, 1);
+  $("#down-probability").textContent = percent(forecast?.down_probability, 1);
+  $("#trade-assessment-side").textContent = `Selected: ${selectedLabel}`;
+  $("#trade-action").textContent = tradeActionLabel(decision);
+  $("#trade-price").textContent = cents(decision?.executable_price);
+  $("#trade-edge").textContent = points(decision?.edge);
+  $("#trade-ev").textContent = decision?.expected_value === null || decision?.expected_value === undefined ? "--" : money(decision.expected_value, 3);
+  $("#trade-strength").textContent = decision?.confidence || "--";
+  $("#trade-explanation").textContent = formatMarketLanguage(decision?.explanation || "Waiting for an executable quote.");
+  $("#trade-edge").className = Number(decision?.edge) > 0 ? "positive" : Number(decision?.edge) < 0 ? "negative" : "";
+  $("#trade-ev").className = Number(decision?.expected_value) > 0 ? "positive" : Number(decision?.expected_value) < 0 ? "negative" : "";
 
   const referencePrice = numberOrNull(btc.price);
   const threshold = numberOrNull(current?.strike);
@@ -870,19 +859,19 @@ const calibrationGroups = [
     { id: "slippage_cents", label: "Slippage allowance", unit: "cents", min: 0, max: 10, step: .1, tip: "Price movement assumed between signal and simulated execution. Default: 0.5 cents." },
     { id: "confidence_moderate_edge", label: "Moderate edge strength", unit: "%", min: 0, max: 50, step: .5, scale: 100, tip: "Minimum net edge for a Moderate Edge label. Default: 8%." },
     { id: "confidence_high_edge", label: "High edge strength", unit: "%", min: 0, max: 50, step: .5, scale: 100, tip: "Minimum net edge for a High Edge label. Default: 12%." },
-    { id: "confidence_moderate_max_spread", label: "Moderate max spread", unit: "%", min: 0, max: 50, step: .5, scale: 100, tip: "Widest contract spread allowed for Moderate confidence. Default: 3%." },
-    { id: "confidence_high_max_spread", label: "High max spread", unit: "%", min: 0, max: 50, step: .5, scale: 100, tip: "Widest contract spread allowed for High confidence. Default: 2%." },
-    { id: "confidence_moderate_max_variant_spread", label: "Moderate model dispersion", unit: "%", min: 0, max: 100, step: 1, scale: 100, tip: "Maximum spread among model variants for Moderate confidence. Default: 7%." },
-    { id: "confidence_high_max_variant_spread", label: "High model dispersion", unit: "%", min: 0, max: 100, step: 1, scale: 100, tip: "Maximum spread among model variants for High confidence. Default: 4%." },
-    { id: "confidence_high_min_samples", label: "High-confidence sample", unit: "samples", min: 1, max: 100000, step: 1, integer: true, tip: "Settled forecasts required before confidence may be High. Default: 150 samples." },
-    { id: "confidence_high_max_calibration_error", label: "High max calibration error", unit: "%", min: 0, max: 100, step: .5, scale: 100, tip: "Largest calibration error compatible with High confidence. Default: 7%." },
+    { id: "confidence_moderate_max_spread", label: "Moderate max spread", unit: "%", min: 0, max: 50, step: .5, scale: 100, tip: "Widest contract spread allowed for Moderate edge strength. Default: 3%." },
+    { id: "confidence_high_max_spread", label: "High max spread", unit: "%", min: 0, max: 50, step: .5, scale: 100, tip: "Widest contract spread allowed for High edge strength. Default: 2%." },
+    { id: "confidence_moderate_max_variant_spread", label: "Moderate model dispersion", unit: "%", min: 0, max: 100, step: 1, scale: 100, tip: "Maximum model-variant spread allowed for Moderate edge strength. Default: 7%." },
+    { id: "confidence_high_max_variant_spread", label: "High model dispersion", unit: "%", min: 0, max: 100, step: 1, scale: 100, tip: "Maximum model-variant spread allowed for High edge strength. Default: 4%." },
+    { id: "confidence_high_min_samples", label: "High-strength sample", unit: "samples", min: 1, max: 100000, step: 1, integer: true, tip: "Settled forecasts required before edge strength may be High. Default: 150 samples." },
+    { id: "confidence_high_max_calibration_error", label: "High max calibration error", unit: "%", min: 0, max: 100, step: .5, scale: 100, tip: "Largest calibration error compatible with High edge strength. Default: 7%." },
   ]],
   ["Automatic Entry", [
     { id: "paper_trading_enabled", label: "Automatic paper trading", type: "toggle", tip: "Enables simulated entries only; no real Kalshi order is ever placed. Default: off." },
     { id: "automatic_entry_window_minutes", label: "Entry window", unit: "minutes", min: .25, max: 15, step: .25, tip: "Automatic confirmation can arm only this close to market end. Default: final 5 minutes." },
     { id: "automatic_confirmation_seconds", label: "Confirmation period", unit: "seconds", min: 1, max: 120, step: 1, tip: "Rolling elapsed-time window used to confirm Buy signals. Default: 10 seconds." },
     { id: "automatic_buy_duration_pct", label: "Required Buy duration", unit: "%", min: 50, max: 100, step: 1, scale: 100, tip: "Share of the confirmation period that must be spent in Buy. Default: 70%." },
-    { id: "automatic_min_confidence", label: "Minimum edge strength", type: "select", options: ["Low", "Moderate", "High"], tip: "Lowest edge-strength label allowed for an automatic entry. Speculative signals never enter automatically. Default: High." },
+    { id: "automatic_min_confidence", label: "Minimum edge strength", type: "select", options: ["Low", "Moderate", "High"], tip: "Lowest edge-strength label allowed for an automatic entry. Speculative trade assessments never enter automatically. Default: High." },
   ]],
   ["Stops and Exits", [
     { id: "default_stop_loss_cents", label: "Default stop-loss", unit: "cents", min: 1, max: 99, step: 1, nullable: true, tip: "Optional absolute bid trigger prefilled on new Buy drafts. Blank by default; existing stops never change." },

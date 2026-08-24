@@ -325,6 +325,13 @@ MIGRATIONS: list[tuple[int, str]] = [
         );
         """,
     ),
+    (
+        6,
+        """
+        ALTER TABLE signal_snapshots ADD COLUMN forecast_signal TEXT;
+        ALTER TABLE signal_snapshots ADD COLUMN forecast_explanation TEXT;
+        """,
+    ),
 ]
 
 

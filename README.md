@@ -17,20 +17,20 @@ A local macOS research and paper-trading app for Kalshi's 15-minute Bitcoin Up o
 
 ## Features
 
-- **Dashboard:** Live BTC proxy, Kalshi contract, chart, order books, signal, and paper controls.
+- **Dashboard:** Live BTC proxy, outcome forecast, Kalshi contract, chart, order books, and paper controls.
 - **BTC proxy:** Median Coinbase, Kraken, and Bitstamp price with learned BRTI uncertainty.
 - **Paper trading:** Manual, limit, and confirmed automatic entries with per-entry stop-losses.
 - **Calibration:** Tune decision, automation, risk, data-quality, and promotion rules in one place.
 - **Local data:** Settings, evidence, trades, snapshots, reports, and backups stay in SQLite on your Mac.
 
-## Current signal
+## Outcome forecast
 
-![Current signal panel](docs/screenshots/current-signal.jpg)
+![Outcome forecast panel](docs/screenshots/current-signal.jpg)
 
-- **Buy:** The selected contract clears its executable edge and has at least a 55% estimated win chance.
-- **Speculative:** The contract has positive edge but stays below the Buy win-probability floor.
-- **Hold:** Neither side clears its rule, or required market data is unsafe.
-- **Sell:** The selected contract's bid clears the sell rule; without holdings it stays informational.
+- **Likely Up:** Up probability is 60% or higher.
+- **Uncertain:** Up probability is above 40% and below 60%.
+- **Likely Down:** Up probability is 40% or lower.
+- The forecast always describes the expected outcome; price, edge, and trade action stay in **Trade assessment**.
 
 ## Calibration
 
@@ -38,7 +38,7 @@ A local macOS research and paper-trading app for Kalshi's 15-minute Bitcoin Up o
 
 - Apply saves one auditable configuration snapshot; Discard and Restore are reversible.
 - Results show settled samples, Brier score, and calibration in 10-point probability ranges.
-- Automatic entries require a sustained Buy signal; Speculative signals never enter automatically.
+- Automatic entries require a valid sustained trade decision; the outcome forecast never opens a position by itself.
 
 ## Kalshi credentials
 
@@ -82,6 +82,8 @@ A small, time-decaying momentum adjustment is added before the resulting standar
 
 The model also records volatility, momentum, recent range, volume acceleration, exchange dispersion, order-book imbalance, market price, time remaining, closing-window progress, and benchmark uncertainty.
 
+The forecast is Likely Up at 60% or more, Likely Down at 40% or less, and Uncertain between those levels.
+
 ### 3. Let a trained model earn promotion
 
 The baseline remains active until enough settled markets exist to train a regularized logistic model on those recorded features.
@@ -90,24 +92,28 @@ Every candidate is tested one market at a time with expanding-window forward val
 
 A candidate replaces the active model only after meeting the sample and time requirements, improving Brier score by the required margin, and avoiding a material loss of calibration.
 
-### 4. Calculate executable edge
+### 4. Price the trade separately
 
 For Up, the model uses its Up probability; for Down, it uses `1 − Up probability`.
 
 - `Buy edge = selected probability − (ask + slippage) − estimated fee`
 - `Sell edge = (bid − slippage) − estimated fee − selected probability`
 
-Buy appears only when its executable edge clears the configured threshold and its estimated win chance is at least 55%; lower-probability positive-edge contracts are marked Speculative instead.
+Trade assessment compares the selected contract with its executable bid or ask; changing that selection never changes the Up forecast.
+
+Buy appears only when executable edge clears the configured threshold and estimated win chance is at least 55%; lower-probability positive-edge contracts remain Speculative trades even when the forecast is Likely Down.
 
 For example, a 65% Up estimate against a 55¢ ask becomes about 55.5¢ after default slippage and roughly 1.7¢ in fees, leaving about 7.8 percentage points of Buy edge before the remaining safety checks.
 
-### 5. Apply safety and signal checks
+### 5. Apply trade safeguards
 
 The model holds when feeds are stale, exchanges disagree, executable quotes are missing, the market is closing, final-minute coverage is sparse, or the projected value sits inside the learned BRTI uncertainty band.
 
-Edge strength rises only when edge is larger, spreads are tighter, probability estimates agree across volatility assumptions, and the calibration record is deep and accurate enough.
+Edge strength rises only when edge is larger, spreads are tighter, probability estimates agree across volatility assumptions, and the calibration record is deep and accurate enough; it is not model confidence.
 
-The dashboard shows both win chance and the chance of expiring worthless, while calibration is reported in 10-point probability ranges so weak low-probability estimates remain visible.
+Automatic entries also require minimum win probability, positive edge after fees and slippage, confirmation time, minimum edge strength, liquidity, and risk approval.
+
+Calibration measures the underlying Up probability in 10-point ranges, not the trade action.
 
 ### 6. Size the position
 
@@ -115,7 +121,7 @@ Suggested size uses fractional Kelly sizing, then applies stricter caps for bank
 
 ### Using it well
 
-- Buy an edge, not merely the outcome the model considers more likely; a good forecast can still be a bad trade at the wrong price.
+- Separate forecast from price: a likely outcome can be a bad trade, while an unlikely outcome can be underpriced.
 - Treat probability as uncertainty, not certainty; even a well-calibrated 70% forecast should lose about 3 times in 10.
 - Judge the model across many settled markets using calibration, Brier score, and paper profit rather than a short streak.
 - Paper trade new settings first and avoid repeatedly tuning rules to recent results, which can overfit noise.

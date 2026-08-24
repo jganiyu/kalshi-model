@@ -27,6 +27,7 @@ from app.domain import (
 )
 from app.services.bootstrap import HistoricalBootstrapService
 from app.services.decision import Decision, make_decision, material_change
+from app.services.forecast import Forecast, forecast_label, make_forecast
 from app.services.kalshi import (
     KalshiPublicClient,
     as_float,
@@ -804,6 +805,7 @@ class AnalysisEngine:
             "benchmark_uncertainty_pct": benchmark_uncertainty,
         }
         probability, model_version = self.models.predict(features, baseline.probability)
+        forecast = make_forecast(probability)
         variants = []
         for vol in (btc.get("volatility_5m"), btc.get("volatility_60m")):
             if vol:
@@ -860,21 +862,35 @@ class AnalysisEngine:
                 previous_side = json.loads(previous["input_json"]).get("selected_side")
             except (TypeError, json.JSONDecodeError):
                 previous_side = None
-        reason = (
+        trade_reason = (
             "selected side changed"
             if previous and previous_side != selected_side
             else material_change(previous, decision, float(settings.get("buy_edge", 0.05)))
         )
+        previous_forecast = previous.get("forecast_signal") if previous else None
+        forecast_reason = (
+            "initial forecast"
+            if not previous_forecast
+            else (
+                f"forecast changed: {previous_forecast} -> {forecast.signal}"
+                if previous_forecast and previous_forecast != forecast.signal
+                else None
+            )
+        )
+        reason = forecast_reason or trade_reason
         notification = None
         if reason:
             signal_id = self._save_signal(
-                market["ticker"], decision, model_version, features, btc,
+                market["ticker"], forecast, decision, model_version, features, btc,
                 market_state, reason, observed_at, probability, selected_side,
             )
-            if previous and previous.get("signal") != decision.signal:
+            if previous_forecast and previous_forecast != forecast.signal:
                 notification = {
-                    "title": f"Signal changed: {previous.get('signal')} -> {decision.signal}",
-                    "detail": f"Edge is {decision.edge * 100:+.1f} points." if decision.edge is not None else decision.explanation,
+                    "title": (
+                        f"Forecast changed: {forecast_label(previous_forecast)} "
+                        f"→ {forecast_label(forecast.signal)}"
+                    ),
+                    "detail": forecast.explanation,
                     "signal_id": signal_id,
                 }
         automatic_entry = self.paper.consider_automatic_entry(
@@ -902,6 +918,8 @@ class AnalysisEngine:
                 ),
                 "model_variant_spread": variant_spread,
                 "data_quality": quality,
+                "forecast": forecast.as_dict(),
+                "trade_decision": decision.as_dict(),
                 "decision": decision.as_dict(),
                 "automatic_entry": automatic_entry,
             }
@@ -973,6 +991,7 @@ class AnalysisEngine:
     def _save_signal(
         self,
         ticker: str,
+        forecast: Forecast,
         decision: Decision,
         model_version: str,
         features: dict[str, Any],
@@ -989,8 +1008,9 @@ class AnalysisEngine:
                 observed_at,ticker,signal,reason_code,confidence,explanation,
                 model_probability,market_probability,edge,expected_value,
                 suggested_fraction,suggested_dollars,suggested_contracts,model_version,
-                input_json,btc_state_json,kalshi_state_json,material_reason
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                input_json,btc_state_json,kalshi_state_json,material_reason,
+                forecast_signal,forecast_explanation
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 observed_at, ticker, decision.signal, decision.reason_code,
@@ -1000,6 +1020,7 @@ class AnalysisEngine:
                 decision.suggested_contracts, model_version,
                 json.dumps({"features": features, "selected_side": selected_side}),
                 json.dumps(btc), json.dumps(market), reason,
+                forecast.signal, forecast.explanation,
             ),
         )
 
@@ -1052,10 +1073,13 @@ class AnalysisEngine:
     def _unreliable_current(self, market: dict[str, Any], reason: str) -> dict[str, Any]:
         summary = self._market_summary(market)
         side = str(self.db.settings().get("selected_side", "YES"))
-        summary["decision"] = Decision(
+        trade_decision = Decision(
             "HOLD", "DATA_UNRELIABLE", "Low", f"Hold: {reason}",
             None, None, None, None, None, None, 0, 0, 0, side,
         ).as_dict()
+        summary["trade_decision"] = trade_decision
+        summary["decision"] = trade_decision
+        summary["forecast"] = None
         summary["selected_side"] = side
         summary["data_quality"] = {"reliable": False, "reason": reason}
         return summary
@@ -1198,12 +1222,14 @@ class AnalysisEngine:
         current = self.dashboard.get("current")
         if current:
             current = dict(current)
-            current["decision"] = Decision(
+            trade_decision = Decision(
                 "HOLD", "DATA_UNRELIABLE", "Low",
                 "Hold: the most recent refresh failed.",
                 current.get("model_probability"), None, None, None, None, None,
                 0, 0, 0, current.get("selected_side"),
             ).as_dict()
+            current["trade_decision"] = trade_decision
+            current["decision"] = trade_decision
         self.dashboard = {
             **self.dashboard,
             "current": current,

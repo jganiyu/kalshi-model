@@ -15,7 +15,7 @@
       document.documentElement.dataset.themePreference = preference;
     })();
   </script>
-  <link rel="stylesheet" href="/static/styles.css?v=0.2.0">
+  <link rel="stylesheet" href="/static/styles.css?v=0.3.0">
 </head>
 <body>
   <div class="app-shell">
@@ -47,23 +47,19 @@
 
         <section class="decision-band" id="decision-band">
           <div class="decision-summary">
-            <p class="decision-label">CURRENT SIGNAL</p>
+            <p class="decision-label">OUTCOME FORECAST</p>
             <div class="signal-row">
-              <div class="signal-pill" id="signal-pill" data-position="hold" aria-label="Current signal: Hold">
-                <span data-signal-option="buy">Buy Up</span>
-                <span class="active" data-signal-option="hold">Hold</span>
-                <span data-signal-option="sell">Sell Up</span>
+              <div class="signal-pill" id="signal-pill" data-position="uncertain" aria-label="Outcome forecast: Uncertain">
+                <span data-signal-option="up">Likely Up</span>
+                <span class="active" data-signal-option="uncertain">Uncertain</span>
+                <span data-signal-option="down">Likely Down</span>
               </div>
-              <h2 id="signal-title" hidden></h2>
             </div>
             <p id="signal-explanation">Connecting to Kalshi and public BTC feeds.</p>
           </div>
           <div class="decision-numbers">
-            <div><span id="model-probability-label">UP win chance</span><strong id="model-probability">--</strong></div>
-            <div><span id="worthless-risk-label">UP worthless risk</span><strong id="worthless-risk">--</strong></div>
-            <div><span>Kalshi implied</span><strong id="market-probability">--</strong></div>
-            <div><span>Edge</span><strong id="edge">--</strong></div>
-            <div><span>EV / contract</span><strong id="ev">--</strong></div>
+            <div><span>Up chance</span><strong id="up-probability">--</strong></div>
+            <div><span>Down chance</span><strong id="down-probability">--</strong></div>
           </div>
         </section>
 
@@ -130,6 +126,17 @@
               <span class="simulated-label">SIMULATED</span>
             </div>
             <span class="paper-permission" id="paper-permission" hidden></span>
+            <section class="trade-assessment" aria-labelledby="trade-assessment-title">
+              <div class="trade-assessment-heading"><strong id="trade-assessment-title">Trade assessment</strong><span id="trade-assessment-side">Selected: Up</span></div>
+              <div class="trade-assessment-grid">
+                <div><span>Recommendation</span><strong id="trade-action">--</strong></div>
+                <div><span>Executable</span><strong id="trade-price">--</strong></div>
+                <div><span>Edge</span><strong id="trade-edge">--</strong></div>
+                <div><span>EV / contract</span><strong id="trade-ev">--</strong></div>
+                <div><span>Edge strength</span><strong id="trade-strength">--</strong></div>
+              </div>
+              <p id="trade-explanation">Waiting for an executable quote.</p>
+            </section>
             <div class="paper-order-toolbar">
               <div class="segmented order-action-picker" role="group" aria-label="Order action">
                 <button type="button" class="active" data-paper-action="BUY">Buy</button>
@@ -304,6 +311,6 @@
     </main>
   </div>
   <div class="toast" id="toast" role="status" aria-live="polite" hidden><strong id="toast-title"></strong><span id="toast-detail"></span></div>
-  <script src="/static/app.js?v=0.2.0" defer></script>
+  <script src="/static/app.js?v=0.3.0" defer></script>
 </body>
 </html>
