@@ -89,10 +89,15 @@ def test_calibration_validation_accepts_nullable_stop_and_rejects_unsafe_values(
     assert clean_settings_payload({"automatic_buy_duration_pct": 0.70})[
         "automatic_buy_duration_pct"
     ] == pytest.approx(0.70)
+    assert clean_settings_payload({"minimum_buy_probability": 0.55})[
+        "minimum_buy_probability"
+    ] == pytest.approx(0.55)
     with pytest.raises(HTTPException):
         clean_settings_payload({"default_stop_loss_cents": 100})
     with pytest.raises(HTTPException):
         clean_settings_payload({"automatic_confirmation_seconds": 0})
+    with pytest.raises(HTTPException):
+        clean_settings_payload({"minimum_buy_probability": 0.49})
     with pytest.raises(HTTPException):
         clean_settings_payload({"training_min_samples": 12.5})
     with pytest.raises(HTTPException):
@@ -174,6 +179,25 @@ def test_automatic_confirmation_resets_and_requires_buy_at_completion(tmp_path: 
         model_version="test", now=50,
     )
     assert side_reset["progress"] == 0
+
+
+def test_speculative_signal_never_enters_automatically(tmp_path: Path) -> None:
+    db = make_db(tmp_path)
+    add_market(db, "SPECULATIVE")
+    db.update_settings({"paper_trading_enabled": True, "automatic_min_confidence": "Low"})
+    service = PaperTradingService(db)
+
+    service.consider_automatic_entry(
+        ticker="SPECULATIVE", decision=decision("SPECULATIVE"),
+        seconds_remaining=200, model_version="test", now=0,
+    )
+    result = service.consider_automatic_entry(
+        ticker="SPECULATIVE", decision=decision("SPECULATIVE"),
+        seconds_remaining=190, model_version="test", now=10,
+    )
+
+    assert result["entered"] is False
+    assert db.fetch_one("SELECT COUNT(*) count FROM paper_entries")["count"] == 0
 
 
 def test_automatic_position_ignores_later_model_sell(tmp_path: Path) -> None:

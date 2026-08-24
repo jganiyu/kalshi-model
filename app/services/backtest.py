@@ -12,6 +12,9 @@ class BacktestService:
         self.db = db
 
     def run(self, min_edge: float, starting_bankroll: float = 1000.0) -> dict[str, Any]:
+        minimum_buy_probability = float(
+            self.db.settings().get("minimum_buy_probability", 0.55)
+        )
         rows = self.db.fetch_all(
             """
             SELECT s.ticker, s.observed_at, s.model_probability, s.market_probability,
@@ -34,7 +37,8 @@ class BacktestService:
             yes_edge = probability - market_probability
             side = "YES" if yes_edge >= 0 else "NO"
             edge = abs(yes_edge)
-            if edge < min_edge:
+            selected_probability = probability if side == "YES" else 1.0 - probability
+            if edge < min_edge or selected_probability < minimum_buy_probability:
                 continue
             price = market_probability if side == "YES" else 1 - market_probability
             price = min(0.99, price + 0.005)
@@ -53,6 +57,7 @@ class BacktestService:
             "method": "Stored point-in-time predictions; each market used once at its final saved signal.",
             "look_ahead_guard": "Rows are ordered by observation time and no settlement is used as an input.",
             "min_edge": min_edge,
+            "minimum_buy_probability": minimum_buy_probability,
             "sample_size": len(rows),
             "trades": len(trades),
             "wins": wins,
@@ -64,6 +69,15 @@ class BacktestService:
         }
         self.db.execute(
             "INSERT INTO backtest_runs(created_at, parameters_json, results_json) VALUES (?, ?, ?)",
-            (iso_now(), json.dumps({"min_edge": min_edge}), json.dumps(result)),
+            (
+                iso_now(),
+                json.dumps(
+                    {
+                        "min_edge": min_edge,
+                        "minimum_buy_probability": minimum_buy_probability,
+                    }
+                ),
+                json.dumps(result),
+            ),
         )
         return result

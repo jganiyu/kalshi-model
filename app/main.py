@@ -213,6 +213,7 @@ def clean_settings_payload(payload: dict[str, Any]) -> dict[str, Any]:
         "starting_bankroll": (1.0, 100_000_000.0),
         "min_edge": (0.0, 0.50),
         "buy_edge": (0.0, 0.50),
+        "minimum_buy_probability": (0.50, 0.99),
         "sell_edge": (0.0, 0.50),
         "hold_buffer": (0.0, 0.10),
         "fractional_kelly": (0.0, 1.0),

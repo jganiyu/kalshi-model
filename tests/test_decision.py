@@ -69,6 +69,36 @@ def test_positive_ev_produces_yes_signal_and_conservative_size() -> None:
     assert result.confidence in {"Moderate", "High"}
 
 
+def test_low_probability_positive_ev_is_speculative_not_buy() -> None:
+    long_shot = {
+        **MARKET,
+        "yes_bid": 0.061,
+        "yes_ask": 0.062,
+    }
+    result = decide(model_probability=0.155, market=long_shot)
+
+    assert result.signal == "SPECULATIVE"
+    assert result.reason_code == "LOW_WIN_PROBABILITY"
+    assert result.expected_value > 0
+    assert result.suggested_contracts == 0
+    assert "84.5% chance of expiring worthless" in result.explanation
+
+
+def test_minimum_buy_probability_is_configurable() -> None:
+    long_shot = {
+        **MARKET,
+        "yes_bid": 0.39,
+        "yes_ask": 0.40,
+    }
+    result = decide(
+        model_probability=0.52,
+        market=long_shot,
+        settings={**SETTINGS, "minimum_buy_probability": 0.50},
+    )
+
+    assert result.signal == "BUY"
+
+
 def test_selected_side_is_not_replaced_by_a_more_profitable_outcome() -> None:
     expensive = {**MARKET, "yes_bid": 0.78, "yes_ask": 0.80, "no_ask": 0.22}
     result = decide(model_probability=0.72, market=expensive)

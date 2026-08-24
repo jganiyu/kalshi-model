@@ -95,3 +95,6 @@ def test_calibration_metrics_are_probability_metrics() -> None:
     assert metrics["sample_size"] == 4
     assert metrics["brier_score"] == pytest.approx(0.025)
     assert metrics["calibration_error"] == pytest.approx(0.15)
+    assert [bucket["label"] for bucket in metrics["buckets"]] == [
+        "10-20%", "20-30%", "80-90%", "90-100%"
+    ]

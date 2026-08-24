@@ -94,16 +94,17 @@ def make_decision(
     buy_edge = probability - buy_price - buy_fee
     sell_edge = sell_price - sell_fee - probability
     configured_buy_edge = float(settings.get("buy_edge", settings.get("min_edge", 0.05)))
+    minimum_buy_probability = float(settings.get("minimum_buy_probability", 0.55))
     configured_sell_edge = float(settings.get("sell_edge", 0.03))
     hold_buffer = float(settings.get("hold_buffer", 0.005))
     action = "HOLD"
     if buy_edge >= configured_buy_edge + hold_buffer:
-        action = "BUY"
+        action = "BUY" if probability >= minimum_buy_probability else "SPECULATIVE"
     elif sell_edge >= configured_sell_edge + hold_buffer:
         action = "SELL"
 
     spread = max(0.0, float(ask) - float(bid))
-    action_edge = buy_edge if action == "BUY" else sell_edge if action == "SELL" else probability - float(implied)
+    action_edge = buy_edge if action in {"BUY", "SPECULATIVE"} else sell_edge if action == "SELL" else probability - float(implied)
     confidence_basis = max(buy_edge, sell_edge, 0.0)
     sample_size = int(calibration.get("sample_size") or 0)
     calibration_error = calibration.get("calibration_error")
@@ -150,6 +151,17 @@ def make_decision(
             0.0, 0.0, 0, side,
         )
 
+    if action == "SPECULATIVE":
+        return Decision(
+            "SPECULATIVE", "LOW_WIN_PROBABILITY", confidence,
+            f"Speculative {side_label} value: the estimated win chance is "
+            f"{probability * 100:.1f}%, with a {(1.0 - probability) * 100:.1f}% chance "
+            f"of expiring worthless. Net edge is {buy_edge * 100:.1f} points after "
+            "fees and slippage, but this is not a Buy signal.",
+            probability, implied, buy_edge, buy_ev, buy_price, buy_fee,
+            0.0, 0.0, 0, side,
+        )
+
     available = market.get(f"{side.lower()}_ask_size")
     minimum_liquidity = int(settings.get("minimum_liquidity_contracts", 1))
     if available is not None and float(available) < minimum_liquidity:
@@ -177,8 +189,9 @@ def make_decision(
             0.0, 0.0, 0, side,
         )
     explanation = (
-        f"Buy {side_label}: the model value exceeds the executable ask by "
-        f"{buy_edge * 100:.1f} points after fees and slippage."
+        f"Buy {side_label}: the estimated win chance is {probability * 100:.1f}%, "
+        f"with a {(1.0 - probability) * 100:.1f}% chance of expiring worthless. "
+        f"Net edge is {buy_edge * 100:.1f} points after fees and slippage."
     )
     return Decision(
         "BUY", "BUY_EDGE", confidence, explanation,

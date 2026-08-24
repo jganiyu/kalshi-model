@@ -127,13 +127,17 @@ async function api(path, options = {}) {
 
 function signalPosition(decision) {
   if (decision?.signal === "BUY") return "buy";
+  if (decision?.signal === "SPECULATIVE") return "speculative";
   if (decision?.signal === "SELL") return "sell";
   return "hold";
 }
 
 function signalTitle(decision) {
   if (!decision || signalPosition(decision) === "hold") return "";
-  return `${decision.confidence} Confidence`;
+  if (decision.signal === "SPECULATIVE") {
+    return `Speculative ${marketSideLabel(decision.side)} Value · ${decision.confidence} Edge`;
+  }
+  return `${decision.confidence} Edge`;
 }
 
 function normalizeBookLevels(levels) {
@@ -212,11 +216,17 @@ function renderDashboard(data) {
   const pill = $("#signal-pill");
   pill.dataset.position = position;
   pill.querySelector('[data-signal-option="buy"]').textContent = `Buy ${selectedLabel}`;
+  pill.querySelector('[data-signal-option="hold"]').textContent = position === "speculative" ? "Speculative" : "Hold";
   pill.querySelector('[data-signal-option="sell"]').textContent = `Sell ${selectedLabel}`;
-  const signalLabel = position === "buy" ? `Buy ${selectedLabel}` : position === "sell" ? `Sell ${selectedLabel}` : "Hold";
+  const signalLabel = position === "buy"
+    ? `Buy ${selectedLabel}`
+    : position === "speculative"
+      ? `Speculative ${selectedLabel} Value`
+      : position === "sell" ? `Sell ${selectedLabel}` : "Hold";
   pill.setAttribute("aria-label", `Current signal: ${signalLabel}`);
+  const activeOption = position === "speculative" ? "hold" : position;
   pill.querySelectorAll("[data-signal-option]").forEach((option) => {
-    option.classList.toggle("active", option.dataset.signalOption === position);
+    option.classList.toggle("active", option.dataset.signalOption === activeOption);
   });
   const confidence = signalTitle(decision);
   const signalTitleElement = $("#signal-title");
@@ -241,7 +251,12 @@ function renderDashboard(data) {
   paperPermission.textContent = automaticTradingStatus;
   paperPermission.title = automaticTradingStatus;
   $("#signal-explanation").textContent = formatMarketLanguage(decision?.explanation || system.message || "Connecting to public feeds.");
+  $("#model-probability-label").textContent = `${selectedLabel} win chance`;
+  $("#worthless-risk-label").textContent = `${selectedLabel} worthless risk`;
   $("#model-probability").textContent = percent(decision?.model_probability, 1);
+  $("#worthless-risk").textContent = decision?.model_probability === null || decision?.model_probability === undefined
+    ? "--"
+    : percent(1 - Number(decision.model_probability), 1);
   $("#market-probability").textContent = percent(decision?.market_probability, 1);
   $("#edge").textContent = points(decision?.edge);
   $("#ev").textContent = decision?.expected_value === null || decision?.expected_value === undefined ? "--" : money(decision.expected_value, 3);
@@ -849,11 +864,12 @@ function statCard(label, value, detail = "", className = "") {
 const calibrationGroups = [
   ["Decision Rules", [
     { id: "buy_edge", label: "Buy edge", unit: "%", min: 0, max: 50, step: .5, scale: 100, tip: "Minimum model advantage over the executable ask after fees and slippage. Default: 5%." },
+    { id: "minimum_buy_probability", label: "Minimum Buy win chance", unit: "%", min: 50, max: 99, step: 1, scale: 100, tip: "Minimum estimated chance of paying $1 required for a Buy signal. Lower-probability positive-edge contracts are marked Speculative. Default: 55%." },
     { id: "sell_edge", label: "Sell edge", unit: "%", min: 0, max: 50, step: .5, scale: 100, tip: "Minimum executable-bid advantage over model value after costs. Default: 3%." },
     { id: "hold_buffer", label: "Hold buffer", unit: "%", min: 0, max: 10, step: .1, scale: 100, tip: "Extra dead band added to Buy and Sell thresholds to reduce churn. Default: 0.5%." },
     { id: "slippage_cents", label: "Slippage allowance", unit: "cents", min: 0, max: 10, step: .1, tip: "Price movement assumed between signal and simulated execution. Default: 0.5 cents." },
-    { id: "confidence_moderate_edge", label: "Moderate-confidence edge", unit: "%", min: 0, max: 50, step: .5, scale: 100, tip: "Minimum net edge for Moderate confidence. Default: 8%." },
-    { id: "confidence_high_edge", label: "High-confidence edge", unit: "%", min: 0, max: 50, step: .5, scale: 100, tip: "Minimum net edge for High confidence. Default: 12%." },
+    { id: "confidence_moderate_edge", label: "Moderate edge strength", unit: "%", min: 0, max: 50, step: .5, scale: 100, tip: "Minimum net edge for a Moderate Edge label. Default: 8%." },
+    { id: "confidence_high_edge", label: "High edge strength", unit: "%", min: 0, max: 50, step: .5, scale: 100, tip: "Minimum net edge for a High Edge label. Default: 12%." },
     { id: "confidence_moderate_max_spread", label: "Moderate max spread", unit: "%", min: 0, max: 50, step: .5, scale: 100, tip: "Widest contract spread allowed for Moderate confidence. Default: 3%." },
     { id: "confidence_high_max_spread", label: "High max spread", unit: "%", min: 0, max: 50, step: .5, scale: 100, tip: "Widest contract spread allowed for High confidence. Default: 2%." },
     { id: "confidence_moderate_max_variant_spread", label: "Moderate model dispersion", unit: "%", min: 0, max: 100, step: 1, scale: 100, tip: "Maximum spread among model variants for Moderate confidence. Default: 7%." },
@@ -866,7 +882,7 @@ const calibrationGroups = [
     { id: "automatic_entry_window_minutes", label: "Entry window", unit: "minutes", min: .25, max: 15, step: .25, tip: "Automatic confirmation can arm only this close to market end. Default: final 5 minutes." },
     { id: "automatic_confirmation_seconds", label: "Confirmation period", unit: "seconds", min: 1, max: 120, step: 1, tip: "Rolling elapsed-time window used to confirm Buy signals. Default: 10 seconds." },
     { id: "automatic_buy_duration_pct", label: "Required Buy duration", unit: "%", min: 50, max: 100, step: 1, scale: 100, tip: "Share of the confirmation period that must be spent in Buy. Default: 70%." },
-    { id: "automatic_min_confidence", label: "Minimum confidence", type: "select", options: ["Low", "Moderate", "High"], tip: "Lowest confidence allowed for an automatic entry. Default: High." },
+    { id: "automatic_min_confidence", label: "Minimum edge strength", type: "select", options: ["Low", "Moderate", "High"], tip: "Lowest edge-strength label allowed for an automatic entry. Speculative signals never enter automatically. Default: High." },
   ]],
   ["Stops and Exits", [
     { id: "default_stop_loss_cents", label: "Default stop-loss", unit: "cents", min: 1, max: 99, step: 1, nullable: true, tip: "Optional absolute bid trigger prefilled on new Buy drafts. Blank by default; existing stops never change." },

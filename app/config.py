@@ -64,6 +64,7 @@ DEFAULT_SETTINGS: dict[str, object] = {
     "risk_controls_enabled": True,
     "selected_side": "YES",
     "buy_edge": 0.05,
+    "minimum_buy_probability": 0.55,
     "sell_edge": 0.03,
     "hold_buffer": 0.005,
     "min_edge": 0.05,

@@ -278,7 +278,10 @@ def calibration_metrics(observations: Iterable[tuple[float, int]]) -> dict[str, 
     if not rows:
         return {"sample_size": 0, "brier_score": None, "calibration_error": None, "buckets": []}
     brier = sum((p - y) ** 2 for p, y in rows) / len(rows)
-    boundaries = [(0.0, 0.5), (0.5, 0.6), (0.6, 0.7), (0.7, 0.8), (0.8, 0.9), (0.9, 1.000001)]
+    boundaries = [
+        (index / 10.0, (index + 1) / 10.0)
+        for index in range(10)
+    ]
     buckets: list[dict[str, object]] = []
     weighted_error = 0.0
     for low, high in boundaries:
