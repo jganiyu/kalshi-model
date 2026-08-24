@@ -64,67 +64,34 @@ KALSHI_PRIVATE_KEY_PATH=/absolute/path/to/your-private-key.pem
 
 ## How the model works
 
-Each market asks whether Bitcoin's official settlement value will finish above a fixed threshold; a correct Up or Down contract pays $1.
+Think of the model as answering two separate questions: **What is likely to happen?** and **Is the contract worth its price?**
 
-### 1. Estimate the settlement value
+### Outcome forecast
 
-The app starts with the median BTC price from Coinbase, Kraken, and Bitstamp, which reduces the effect of a bad quote from one exchange.
+The model combines live Bitcoin prices, distance from the threshold, time remaining, volatility, momentum, and past settlement behavior to estimate the chance of Up.
 
-It then measures the historical difference between its exchange proxy and Kalshi's BRTI settlement values, using that record to correct known bias and add a conservative uncertainty band.
+- **Likely Up:** 60% or higher.
+- **Uncertain:** Between 40% and 60%.
+- **Likely Down:** 40% or lower.
 
-During the final 60 seconds, the model blends the observed proxy average with the current price for the remaining seconds because Kalshi settles against an average, not a single last price.
+### Trade assessment
 
-### 2. Convert price distance into probability
+The app then compares that probability with the contract's available price after estimated fees and slippage.
 
-The baseline model compares the projected settlement value with the threshold and scales that distance by expected volatility and benchmark uncertainty.
+A likely outcome can still be overpriced, while an unlikely outcome can be underpriced; selecting Up or Down never changes the forecast.
 
-A small, time-decaying momentum adjustment is added before the resulting standardized distance is converted into an Up probability with a normal distribution; estimates are capped between 1% and 99%.
+### Safety and learning
 
-The model also records volatility, momentum, recent range, volume acceleration, exchange dispersion, order-book imbalance, market price, time remaining, closing-window progress, and benchmark uncertainty.
+Automatic paper entries require a valid price, enough win probability and edge, signal confirmation, liquidity, and risk approval.
 
-The forecast is Likely Up at 60% or more, Likely Down at 40% or less, and Uncertain between those levels.
-
-### 3. Let a trained model earn promotion
-
-The baseline remains active until enough settled markets exist to train a regularized logistic model on those recorded features.
-
-Every candidate is tested one market at a time with expanding-window forward validation, so a future result cannot influence an earlier prediction.
-
-A candidate replaces the active model only after meeting the sample and time requirements, improving Brier score by the required margin, and avoiding a material loss of calibration.
-
-### 4. Price the trade separately
-
-For Up, the model uses its Up probability; for Down, it uses `1 − Up probability`.
-
-- `Buy edge = selected probability − (ask + slippage) − estimated fee`
-- `Sell edge = (bid − slippage) − estimated fee − selected probability`
-
-Trade assessment compares the selected contract with its executable bid or ask; changing that selection never changes the Up forecast.
-
-Buy appears only when executable edge clears the configured threshold and estimated win chance is at least 55%; lower-probability positive-edge contracts remain Speculative trades even when the forecast is Likely Down.
-
-For example, a 65% Up estimate against a 55¢ ask becomes about 55.5¢ after default slippage and roughly 1.7¢ in fees, leaving about 7.8 percentage points of Buy edge before the remaining safety checks.
-
-### 5. Apply trade safeguards
-
-The model holds when feeds are stale, exchanges disagree, executable quotes are missing, the market is closing, final-minute coverage is sparse, or the projected value sits inside the learned BRTI uncertainty band.
-
-Edge strength rises only when edge is larger, spreads are tighter, probability estimates agree across volatility assumptions, and the calibration record is deep and accurate enough; it is not model confidence.
-
-Automatic entries also require minimum win probability, positive edge after fees and slippage, confirmation time, minimum edge strength, liquidity, and risk approval.
-
-Calibration measures the underlying Up probability in 10-point ranges, not the trade action.
-
-### 6. Size the position
-
-Suggested size uses fractional Kelly sizing, then applies stricter caps for bankroll share, trade risk, available liquidity, open positions, and session drawdown.
+Calibration tracks how often each probability range was correct, and a trained model replaces the baseline only after proving more accurate on settled markets.
 
 ### Using it well
 
 - Separate forecast from price: a likely outcome can be a bad trade, while an unlikely outcome can be underpriced.
 - Treat probability as uncertainty, not certainty; even a well-calibrated 70% forecast should lose about 3 times in 10.
-- Judge the model across many settled markets using calibration, Brier score, and paper profit rather than a short streak.
-- Paper trade new settings first and avoid repeatedly tuning rules to recent results, which can overfit noise.
+- Judge the model across many settled markets, not a short winning or losing streak.
+- Paper trade new settings before relying on them.
 
 ## Download
 
