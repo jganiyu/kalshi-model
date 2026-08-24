@@ -31,6 +31,36 @@ A local macOS research and paper-trading app for Kalshi's 15-minute Bitcoin Up o
 - **Hold:** Neither side clears its rule, or required market data is unsafe.
 - **Sell:** The selected contract's bid clears the sell rule; without holdings it stays informational.
 
+## Calibration
+
+![Calibration page](docs/screenshots/calibration.jpg)
+
+- Apply saves one auditable configuration snapshot; Discard and Restore are reversible.
+- Results show settled samples, Brier score, calibration error, buckets, snapshots, and permanent reports.
+- Automatic entries require a sustained Buy signal; each filled entry keeps its own optional stop-loss.
+
+## Kalshi credentials
+
+![Kalshi credentials setup](docs/screenshots/credentials-setup.jpg)
+
+- Public REST data works without credentials; a Key ID and RSA private key enable live WebSocket prices.
+- Add them in **Settings**; the private copy stays under `~/Library/Application Support/Kalshi Model/`.
+- Never commit `.env`, your Key ID, or your private key.
+
+<details>
+<summary>Developer <code>.env</code> setup</summary>
+
+```bash
+cp .env.example .env
+```
+
+```bash
+KALSHI_API_KEY_ID=your-key-id
+KALSHI_PRIVATE_KEY_PATH=/absolute/path/to/your-private-key.pem
+```
+
+</details>
+
 ## How the model works
 
 Each market asks whether Bitcoin's official settlement value will finish above a fixed threshold; a correct Up or Down contract pays $1.
@@ -86,36 +116,6 @@ Suggested size uses fractional Kelly sizing, then applies stricter caps for bank
 - Treat probability as uncertainty, not certainty; even a well-calibrated 70% forecast should lose about 3 times in 10.
 - Judge the model across many settled markets using calibration, Brier score, and paper profit rather than a short streak.
 - Paper trade new settings first and avoid repeatedly tuning rules to recent results, which can overfit noise.
-
-## Calibration
-
-![Calibration page](docs/screenshots/calibration.jpg)
-
-- Apply saves one auditable configuration snapshot; Discard and Restore are reversible.
-- Results show settled samples, Brier score, calibration error, buckets, snapshots, and permanent reports.
-- Automatic entries require a sustained Buy signal; each filled entry keeps its own optional stop-loss.
-
-## Kalshi credentials
-
-![Kalshi credentials setup](docs/screenshots/credentials-setup.jpg)
-
-- Public REST data works without credentials; a Key ID and RSA private key enable live WebSocket prices.
-- Add them in **Settings**; the private copy stays under `~/Library/Application Support/Kalshi Model/`.
-- Never commit `.env`, your Key ID, or your private key.
-
-<details>
-<summary>Developer <code>.env</code> setup</summary>
-
-```bash
-cp .env.example .env
-```
-
-```bash
-KALSHI_API_KEY_ID=your-key-id
-KALSHI_PRIVATE_KEY_PATH=/absolute/path/to/your-private-key.pem
-```
-
-</details>
 
 ## Download
 
