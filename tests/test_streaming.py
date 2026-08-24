@@ -149,7 +149,7 @@ def test_live_composite_is_not_pinned_by_rest_only_quote() -> None:
 
 def test_benchmark_band_and_sparse_settlement_window_block_automatic_trade() -> None:
     btc = {"exchange_count": 3, "dispersion_pct": 0.01}
-    market = {"yes_ask": 0.55, "no_ask": 0.46}
+    market = {"yes_bid": 0.54, "yes_ask": 0.55, "no_bid": 0.45, "no_ask": 0.46}
     settings = {"max_exchange_dispersion_pct": 0.4}
 
     inside_band = AnalysisEngine._data_quality(

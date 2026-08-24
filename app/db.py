@@ -273,6 +273,58 @@ MIGRATIONS: list[tuple[int, str]] = [
         );
         """,
     ),
+    (
+        5,
+        """
+        ALTER TABLE paper_orders ADD COLUMN stop_loss_price REAL;
+        ALTER TABLE paper_orders ADD COLUMN entry_id INTEGER;
+
+        CREATE TABLE paper_entries (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            trade_id INTEGER NOT NULL,
+            order_id INTEGER,
+            ticker TEXT NOT NULL,
+            side TEXT NOT NULL,
+            opened_at TEXT NOT NULL,
+            entry_price REAL NOT NULL,
+            initial_contracts INTEGER NOT NULL,
+            remaining_contracts INTEGER NOT NULL,
+            entry_cost REAL NOT NULL,
+            entry_fees REAL NOT NULL,
+            stop_loss_price REAL,
+            stop_status TEXT,
+            source TEXT NOT NULL,
+            status TEXT NOT NULL,
+            closed_at TEXT,
+            FOREIGN KEY(trade_id) REFERENCES paper_trades(id),
+            FOREIGN KEY(order_id) REFERENCES paper_orders(id),
+            FOREIGN KEY(ticker) REFERENCES markets(ticker)
+        );
+        CREATE INDEX idx_paper_entries_active_stop
+            ON paper_entries(ticker, status, stop_status);
+        CREATE UNIQUE INDEX idx_one_automatic_entry_per_outcome
+            ON paper_entries(ticker, side) WHERE source='automatic';
+
+        INSERT INTO paper_entries(
+            trade_id,ticker,side,opened_at,entry_price,initial_contracts,
+            remaining_contracts,entry_cost,entry_fees,source,status,closed_at
+        )
+        SELECT
+            id,ticker,side,opened_at,entry_price,contracts,
+            CASE WHEN status='open' THEN contracts ELSE 0 END,
+            entry_cost,fees,source,status,settled_at
+        FROM paper_trades;
+
+        CREATE TABLE configuration_snapshots (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT NOT NULL,
+            settings_json TEXT NOT NULL,
+            changed_json TEXT NOT NULL,
+            restored_from_id INTEGER,
+            FOREIGN KEY(restored_from_id) REFERENCES configuration_snapshots(id)
+        );
+        """,
+    ),
 ]
 
 
@@ -374,14 +426,26 @@ class Database:
 
     def settings(self) -> dict[str, Any]:
         rows = self.fetch_all("SELECT key, value_json FROM settings")
-        return {row["key"]: json.loads(row["value_json"]) for row in rows}
+        stored = {row["key"]: json.loads(row["value_json"]) for row in rows}
+        return {**DEFAULT_SETTINGS, **stored}
 
-    def update_settings(self, updates: dict[str, Any]) -> dict[str, Any]:
+    def update_settings(
+        self,
+        updates: dict[str, Any],
+        *,
+        record_snapshot: bool = True,
+        restored_from_id: int | None = None,
+    ) -> dict[str, Any]:
         allowed = set(DEFAULT_SETTINGS)
+        before = self.settings()
+        cleaned = {key: value for key, value in updates.items() if key in allowed}
+        changed = {
+            key: {"before": before.get(key), "after": value}
+            for key, value in cleaned.items()
+            if before.get(key) != value
+        }
         with self.transaction() as connection:
-            for key, value in updates.items():
-                if key not in allowed:
-                    continue
+            for key, value in cleaned.items():
                 connection.execute(
                     """
                     INSERT INTO settings(key, value_json, updated_at) VALUES (?, ?, ?)
@@ -390,4 +454,36 @@ class Database:
                     """,
                     (key, json.dumps(value), iso_now()),
                 )
+            if changed and record_snapshot:
+                snapshot = {**before, **cleaned}
+                connection.execute(
+                    """
+                    INSERT INTO configuration_snapshots(
+                        created_at,settings_json,changed_json,restored_from_id
+                    ) VALUES (?,?,?,?)
+                    """,
+                    (
+                        iso_now(), json.dumps(snapshot), json.dumps(changed),
+                        restored_from_id,
+                    ),
+                )
         return self.settings()
+
+    def configuration_snapshots(self, limit: int = 100) -> list[dict[str, Any]]:
+        rows = self.fetch_all(
+            "SELECT * FROM configuration_snapshots ORDER BY id DESC LIMIT ?", (limit,)
+        )
+        for row in rows:
+            row["settings"] = json.loads(row.pop("settings_json"))
+            row["changed"] = json.loads(row.pop("changed_json"))
+        return rows
+
+    def restore_configuration(self, snapshot_id: int) -> dict[str, Any]:
+        row = self.fetch_one(
+            "SELECT settings_json FROM configuration_snapshots WHERE id=?",
+            (snapshot_id,),
+        )
+        if not row:
+            raise ValueError("Configuration snapshot not found.")
+        values = json.loads(row["settings_json"])
+        return self.update_settings(values, restored_from_id=snapshot_id)

@@ -13,8 +13,12 @@ const state = {
   chartTicker: null,
   priceMovement: { direction: null, until: 0 },
   themePreference: localStorage.getItem("kalshi-theme-v2") || "light",
-  paperOrder: { side: "YES", action: "BUY", limit: false, submitting: false },
+  paperOrder: {
+    side: "YES", action: "BUY", limit: false, submitting: false,
+    stopInitialized: false, sideUpdating: false,
+  },
   paperReset: { confirming: false, resetting: false, timer: null },
+  calibration: { saved: null, defaults: null, dirty: false },
 };
 
 const $ = (selector) => document.querySelector(selector);
@@ -122,8 +126,8 @@ async function api(path, options = {}) {
 }
 
 function signalPosition(decision) {
-  if (decision?.signal === "TRADE YES") return "up";
-  if (decision?.signal === "TRADE NO") return "down";
+  if (decision?.signal === "BUY") return "buy";
+  if (decision?.signal === "SELL") return "sell";
   return "hold";
 }
 
@@ -202,9 +206,15 @@ function renderDashboard(data) {
   $("#header-model-version").textContent = data.model?.version || "baseline-1.0";
 
   const position = signalPosition(decision);
+  const selectedSide = current?.selected_side || data.paper?.selected_side || "YES";
+  if (!state.paperOrder.sideUpdating) state.paperOrder.side = selectedSide;
+  const selectedLabel = marketSideLabel(selectedSide);
   const pill = $("#signal-pill");
   pill.dataset.position = position;
-  pill.setAttribute("aria-label", `Current signal: ${position === "up" ? "Buy Up" : position === "down" ? "Buy Down" : "Hold"}`);
+  pill.querySelector('[data-signal-option="buy"]').textContent = `Buy ${selectedLabel}`;
+  pill.querySelector('[data-signal-option="sell"]').textContent = `Sell ${selectedLabel}`;
+  const signalLabel = position === "buy" ? `Buy ${selectedLabel}` : position === "sell" ? `Sell ${selectedLabel}` : "Hold";
+  pill.setAttribute("aria-label", `Current signal: ${signalLabel}`);
   pill.querySelectorAll("[data-signal-option]").forEach((option) => {
     option.classList.toggle("active", option.dataset.signalOption === position);
   });
@@ -216,10 +226,13 @@ function renderDashboard(data) {
   const paper = data.paper || {};
   const automaticTradingEnabled = Boolean(paper.automatic_trading_enabled);
   const paperBlocked = automaticTradingEnabled && paper.automatic_trade_allowed === false;
+  const confirmation = current?.automatic_entry || {};
   const automaticTradingStatus = paperBlocked
     ? `Automatic trading paused · ${paper.automatic_trade_block_reason || "Risk control active."}`
     : automaticTradingEnabled
-      ? "Automatic trading on"
+      ? confirmation.armed
+        ? `Automatic entry armed · ${Math.round(Number(confirmation.progress || 0) * 100)}% confirmed`
+        : "Automatic trading on · waiting for entry window"
       : "Automatic trading off";
   paperPermission.hidden = false;
   paperPermission.classList.toggle("on", automaticTradingEnabled && !paperBlocked);
@@ -264,7 +277,11 @@ function renderDashboard(data) {
   $("#volume").textContent = compact(current?.volume);
   const positions = (data.paper?.positions || []).filter((item) => item.ticker === current?.ticker);
   $("#position-size").textContent = positions.length
-    ? positions.map((item) => `${item.contracts} ${marketSideLabel(item.side)}`).join(" · ")
+    ? positions.map((item) => {
+      const stops = (item.entries || []).filter((entry) => entry.stop_status === "active")
+        .map((entry) => `${entry.contracts} @ ${cents(entry.stop_loss_price)}`);
+      return `${item.contracts} ${marketSideLabel(item.side)}${stops.length ? ` · stop ${stops.join(", ")}` : ""}`;
+    }).join(" · ")
     : "No position";
   const quality = current?.data_quality || { reliable: false, reason: "Waiting for market" };
   $("#quality-dot").className = `quality-dot ${quality.reliable ? "good" : "bad"}`;
@@ -317,6 +334,7 @@ function paperOrderDraft() {
   let referencePrice = bestPrice;
   let requestedValue = 0;
   let error = "";
+  const stopValue = $("#paper-stop-loss").value.trim();
 
   if (!current?.ticker) error = "Waiting for an active Kalshi contract.";
   else if (!current?.data_quality?.reliable) error = current?.data_quality?.reason || "Market data is not reliable.";
@@ -378,6 +396,12 @@ function paperOrderDraft() {
   if (!error && state.paperOrder.action === "SELL" && contracts > paperAvailableContracts()) {
     error = `Only ${paperAvailableContracts()} ${marketSideLabel(state.paperOrder.side)} contracts are available to sell.`;
   }
+  if (!error && state.paperOrder.action === "BUY" && stopValue !== "") {
+    const stopCents = Number(stopValue);
+    if (!Number.isFinite(stopCents) || stopCents < 1 || stopCents > 99) {
+      error = "Stop-loss must be between 1 and 99 cents.";
+    }
+  }
   return { available, bestPrice, contracts, orderValue, requestedValue, error };
 }
 
@@ -389,6 +413,7 @@ function renderOpenPaperOrders() {
   $("#open-order-list").innerHTML = orders.map((order) => `
     <div class="open-order-row">
       <span><strong>${order.action} ${marketSideLabel(order.side).toUpperCase()}</strong><small>${order.requested_contracts} at ${cents(order.limit_price)}</small></span>
+      ${order.stop_loss_price == null ? "" : `<small>Stop ${cents(order.stop_loss_price)}</small>`}
       <button type="button" data-cancel-paper-order="${order.id}" aria-label="Cancel ${marketSideLabel(order.side)} limit order">Cancel</button>
     </div>
   `).join("");
@@ -402,6 +427,14 @@ function renderPaperController() {
   $("#paper-limit-toggle").checked = state.paperOrder.limit;
   $("#paper-market-fields").hidden = state.paperOrder.limit;
   $("#paper-limit-fields").hidden = !state.paperOrder.limit;
+  const stopField = $("#paper-stop-field");
+  stopField.hidden = action !== "BUY";
+  $("#paper-stop-loss").disabled = action !== "BUY";
+  if (action === "BUY" && !state.paperOrder.stopInitialized) {
+    const globalStop = state.dashboard?.paper?.default_stop_loss_cents;
+    $("#paper-stop-loss").value = globalStop == null ? "" : globalStop;
+    state.paperOrder.stopInitialized = true;
+  }
   $("#paper-up-price").textContent = cents(paperQuote("YES", action));
   $("#paper-down-price").textContent = cents(paperQuote("NO", action));
   const draft = paperOrderDraft();
@@ -436,6 +469,9 @@ async function submitPaperOrder() {
     payload.contracts = Number($("#paper-contracts").value);
     payload.limit_price_cents = Number($("#paper-limit-price").value);
   } else payload.dollars = Number($("#paper-dollars").value);
+  if (state.paperOrder.action === "BUY" && $("#paper-stop-loss").value.trim() !== "") {
+    payload.stop_loss_cents = Number($("#paper-stop-loss").value);
+  }
   try {
     const result = await api("/api/paper/orders", { method: "POST", body: JSON.stringify(payload) });
     const status = result.order?.status === "filled" ? "filled" : "placed";
@@ -443,6 +479,7 @@ async function submitPaperOrder() {
     $("#paper-dollars").value = "";
     $("#paper-contracts").value = "";
     $("#paper-limit-price").value = "";
+    state.paperOrder.stopInitialized = false;
     await refreshDashboard();
     if (state.activePage === "paper") await loadPaper();
   } catch (error) {
@@ -460,6 +497,25 @@ async function cancelPaperOrder(orderId) {
     showToast("Limit order canceled", "Reserved paper bankroll or contracts are available again.");
     await refreshDashboard();
   } catch (error) { showToast("Unable to cancel order", error.message); }
+}
+
+async function updateSelectedSide(side) {
+  if (state.paperOrder.sideUpdating || side === state.paperOrder.side) return;
+  state.paperOrder.sideUpdating = true;
+  state.paperOrder.side = side;
+  renderPaperController();
+  try {
+    const dashboard = await api("/api/model-side", {
+      method: "PUT", body: JSON.stringify({ side }),
+    });
+    renderDashboard(dashboard);
+  } catch (error) {
+    showToast("Modeling side not changed", error.message);
+    await refreshDashboard();
+  } finally {
+    state.paperOrder.sideUpdating = false;
+    renderPaperController();
+  }
 }
 
 function updateCountdown() {
@@ -790,39 +846,198 @@ function statCard(label, value, detail = "", className = "") {
   return `<div class="stats-card"><span>${label}</span><strong class="${className}">${value}</strong>${detail ? `<small>${detail}</small>` : ""}</div>`;
 }
 
-async function loadCalibration() {
-  const data = await api("/api/calibration");
+const calibrationGroups = [
+  ["Decision Rules", [
+    { id: "buy_edge", label: "Buy edge", unit: "%", min: 0, max: 50, step: .5, scale: 100, tip: "Minimum model advantage over the executable ask after fees and slippage. Default: 5%." },
+    { id: "sell_edge", label: "Sell edge", unit: "%", min: 0, max: 50, step: .5, scale: 100, tip: "Minimum executable-bid advantage over model value after costs. Default: 3%." },
+    { id: "hold_buffer", label: "Hold buffer", unit: "%", min: 0, max: 10, step: .1, scale: 100, tip: "Extra dead band added to Buy and Sell thresholds to reduce churn. Default: 0.5%." },
+    { id: "slippage_cents", label: "Slippage allowance", unit: "cents", min: 0, max: 10, step: .1, tip: "Price movement assumed between signal and simulated execution. Default: 0.5 cents." },
+    { id: "confidence_moderate_edge", label: "Moderate-confidence edge", unit: "%", min: 0, max: 50, step: .5, scale: 100, tip: "Minimum net edge for Moderate confidence. Default: 8%." },
+    { id: "confidence_high_edge", label: "High-confidence edge", unit: "%", min: 0, max: 50, step: .5, scale: 100, tip: "Minimum net edge for High confidence. Default: 12%." },
+    { id: "confidence_moderate_max_spread", label: "Moderate max spread", unit: "%", min: 0, max: 50, step: .5, scale: 100, tip: "Widest contract spread allowed for Moderate confidence. Default: 3%." },
+    { id: "confidence_high_max_spread", label: "High max spread", unit: "%", min: 0, max: 50, step: .5, scale: 100, tip: "Widest contract spread allowed for High confidence. Default: 2%." },
+    { id: "confidence_moderate_max_variant_spread", label: "Moderate model dispersion", unit: "%", min: 0, max: 100, step: 1, scale: 100, tip: "Maximum spread among model variants for Moderate confidence. Default: 7%." },
+    { id: "confidence_high_max_variant_spread", label: "High model dispersion", unit: "%", min: 0, max: 100, step: 1, scale: 100, tip: "Maximum spread among model variants for High confidence. Default: 4%." },
+    { id: "confidence_high_min_samples", label: "High-confidence sample", unit: "samples", min: 1, max: 100000, step: 1, integer: true, tip: "Settled forecasts required before confidence may be High. Default: 150 samples." },
+    { id: "confidence_high_max_calibration_error", label: "High max calibration error", unit: "%", min: 0, max: 100, step: .5, scale: 100, tip: "Largest calibration error compatible with High confidence. Default: 7%." },
+  ]],
+  ["Automatic Entry", [
+    { id: "paper_trading_enabled", label: "Automatic paper trading", type: "toggle", tip: "Enables simulated entries only; no real Kalshi order is ever placed. Default: off." },
+    { id: "automatic_entry_window_minutes", label: "Entry window", unit: "minutes", min: .25, max: 15, step: .25, tip: "Automatic confirmation can arm only this close to market end. Default: final 5 minutes." },
+    { id: "automatic_confirmation_seconds", label: "Confirmation period", unit: "seconds", min: 1, max: 120, step: 1, tip: "Rolling elapsed-time window used to confirm Buy signals. Default: 10 seconds." },
+    { id: "automatic_buy_duration_pct", label: "Required Buy duration", unit: "%", min: 50, max: 100, step: 1, scale: 100, tip: "Share of the confirmation period that must be spent in Buy. Default: 70%." },
+    { id: "automatic_min_confidence", label: "Minimum confidence", type: "select", options: ["Low", "Moderate", "High"], tip: "Lowest confidence allowed for an automatic entry. Default: High." },
+  ]],
+  ["Stops and Exits", [
+    { id: "default_stop_loss_cents", label: "Default stop-loss", unit: "cents", min: 1, max: 99, step: 1, nullable: true, tip: "Optional absolute bid trigger prefilled on new Buy drafts. Blank by default; existing stops never change." },
+  ]],
+  ["Position Sizing and Risk", [
+    { id: "starting_bankroll", label: "Starting bankroll", unit: "dollars", min: 1, max: 100000000, step: 100, tip: "Paper capital used for sizing and performance. Default: $1,000." },
+    { id: "risk_controls_enabled", label: "Risk controls", type: "toggle", tip: "Enforces position, trade-risk, and drawdown limits. Default: on." },
+    { id: "fractional_kelly", label: "Kelly sizing", unit: "% Kelly", min: 0, max: 100, step: 5, scale: 100, tip: "Fraction of full Kelly used for suggested sizing. Default: 25%." },
+    { id: "max_position_pct", label: "Maximum position", unit: "% bankroll", min: 0, max: 100, step: 1, scale: 100, tip: "Maximum paper capital committed to one outcome. Default: 5% of bankroll." },
+    { id: "max_risk_per_trade_pct", label: "Maximum risk per trade", unit: "% bankroll", min: 0, max: 100, step: 1, scale: 100, tip: "Maximum paper capital allowed in a single entry. Default: 2% of bankroll." },
+    { id: "max_session_drawdown_pct", label: "Session drawdown", unit: "%", min: 0, max: 100, step: 1, scale: 100, tip: "Drawdown that pauses automatic execution without hiding signals. Default: 10%." },
+    { id: "minimum_liquidity_contracts", label: "Minimum liquidity", unit: "contracts", min: 1, max: 1000000, step: 1, integer: true, tip: "Minimum contracts available at the selected ask for a Buy. Default: 1 contract." },
+  ]],
+  ["Data Quality", [
+    { id: "max_data_age_seconds", label: "Maximum feed age", unit: "seconds", min: 1, max: 300, step: 1, tip: "Oldest BTC or Kalshi update considered safe. Default: 20 seconds." },
+    { id: "max_exchange_dispersion_pct", label: "Exchange dispersion", unit: "%", min: .01, max: 5, step: .05, tip: "Maximum disagreement across BTC exchanges. Default: 0.40%." },
+    { id: "minimum_exchange_feeds", label: "Minimum exchange feeds", unit: "feeds", min: 1, max: 3, step: 1, integer: true, tip: "Reliable BTC venues required for a signal. Default: 2 feeds." },
+    { id: "closing_guard_seconds", label: "Closing guard", unit: "seconds", min: 1, max: 60, step: 1, integer: true, tip: "Final seconds in which market data is considered unsafe to trade. Default: 10 seconds." },
+    { id: "settlement_min_coverage_pct", label: "Settlement coverage", unit: "%", min: 10, max: 100, step: 5, scale: 100, tip: "Required coverage of the observed final-minute proxy. Default: 50%." },
+  ]],
+  ["Training and Promotion", [
+    { id: "training_min_samples", label: "Training sample requirement", unit: "samples", min: 4, max: 100000, step: 1, integer: true, tip: "Settled samples required to train a candidate. Default: 12 samples." },
+    { id: "benchmark_calibration_min_samples", label: "Benchmark sample requirement", unit: "samples", min: 4, max: 100000, step: 1, integer: true, tip: "Final-minute proxy comparisons required to learn benchmark error. Default: 20 samples." },
+    { id: "training_history_days", label: "Training-history window", unit: "days", min: 1, max: 3650, step: 1, integer: true, tip: "Maximum age of evidence admitted to training. Default: 365 days." },
+    { id: "benchmark_history_samples", label: "Benchmark-history window", unit: "samples", min: 20, max: 100000, step: 1, integer: true, tip: "Maximum recent settled markets used to estimate proxy error. Default: 120 samples." },
+    { id: "benchmark_uncertainty_floor_pct", label: "Benchmark uncertainty floor", unit: "%", min: 0, max: 1, step: .005, scale: 100, tip: "Minimum uncertainty retained around the learned BRTI proxy. Default: 0.015%." },
+    { id: "training_max_samples", label: "Training sample cap", unit: "samples", min: 20, max: 1000000, step: 10, integer: true, tip: "Maximum recent observations in a training run. Default: 1,000 samples." },
+    { id: "promotion_min_samples", label: "Promotion sample requirement", unit: "samples", min: 10, max: 1000000, step: 1, integer: true, tip: "Settled forecasts required before a candidate can be promoted. Default: 120 samples." },
+    { id: "promotion_min_days", label: "Promotion history", unit: "days", min: 1, max: 3650, step: 1, integer: true, tip: "Distinct UTC days required for promotion. Default: 7 days." },
+    { id: "minimum_brier_improvement", label: "Brier improvement", unit: "%", min: 0, max: 25, step: .1, scale: 100, tip: "Minimum forward-test Brier improvement for promotion. Default: 0.5%." },
+    { id: "calibration_tolerance", label: "Calibration tolerance", unit: "%", min: 0, max: 50, step: .5, scale: 100, tip: "Maximum calibration-error regression allowed at promotion. Default: 1%." },
+    { id: "retraining_cadence_hours", label: "Retraining cadence", unit: "hours", min: 1, max: 720, step: 1, integer: true, tip: "Minimum interval between routine retraining checks. Default: 24 hours." },
+    { id: "initial_retrain_settlements", label: "Initial retraining phase", unit: "settlements", min: 0, max: 10000, step: 1, integer: true, tip: "Early settlements that trigger a retraining check each time. Default: first 20." },
+  ]],
+];
+
+const calibrationControlMap = new Map(calibrationGroups.flatMap(([, controls]) => controls.map((control) => [control.id, control])));
+
+function renderCalibrationControls() {
+  $("#calibration-controls").innerHTML = calibrationGroups.map(([group, controls]) => `
+    <section class="calibration-group"><h2>${group}</h2>
+      ${controls.map((control) => {
+        const tooltipId = `tip-${control.id}`;
+        let field;
+        if (control.type === "toggle") {
+          field = `<label class="calibration-toggle"><input id="${control.id}" type="checkbox"><i></i></label>`;
+        } else if (control.type === "select") {
+          field = `<div class="calibration-input"><select id="${control.id}">${control.options.map((option) => `<option>${option}</option>`).join("")}</select></div>`;
+        } else {
+          field = `<div class="calibration-input"><input id="${control.id}" type="number" min="${control.min}" max="${control.max}" step="${control.step}" ${control.nullable ? 'placeholder="Blank"' : ""}>${control.unit ? `<span>${control.unit}</span>` : ""}</div>`;
+        }
+        return `<div class="calibration-control">
+          <div class="calibration-control-label"><label for="${control.id}">${control.label}</label><button class="info-button" type="button" aria-label="About ${control.label}" aria-describedby="${tooltipId}">ⓘ</button><span class="control-tooltip" id="${tooltipId}" role="tooltip">${control.tip}</span></div>
+          ${field}
+        </div>`;
+      }).join("")}
+    </section>`).join("");
+}
+
+function setCalibrationValues(values) {
+  for (const [id, control] of calibrationControlMap) {
+    const input = document.getElementById(id);
+    const value = values?.[id];
+    if (control.type === "toggle") input.checked = Boolean(value);
+    else input.value = value == null ? "" : Number.isFinite(Number(value)) && control.type !== "select"
+      ? Number((Number(value) * Number(control.scale || 1)).toFixed(6))
+      : value;
+    input.closest(".calibration-input")?.classList.remove("invalid");
+  }
+  setCalibrationDirty(false);
+}
+
+function readCalibrationValues() {
+  const values = {};
+  let error = "";
+  for (const [id, control] of calibrationControlMap) {
+    const input = document.getElementById(id);
+    if (control.type === "toggle") values[id] = input.checked;
+    else if (control.type === "select") values[id] = input.value;
+    else if (control.nullable && input.value.trim() === "") values[id] = null;
+    else {
+      const displayValue = Number(input.value);
+      const invalid = !Number.isFinite(displayValue) || displayValue < control.min || displayValue > control.max || (control.integer && !Number.isInteger(displayValue));
+      input.closest(".calibration-input").classList.toggle("invalid", invalid);
+      if (invalid && !error) error = `${control.label} must be ${control.min}–${control.max}${control.integer ? " as a whole number" : ""}.`;
+      values[id] = displayValue / Number(control.scale || 1);
+    }
+  }
+  $("#calibration-validation").textContent = error;
+  return { values, error };
+}
+
+function setCalibrationDirty(dirty) {
+  state.calibration.dirty = dirty;
+  $("#calibration-save-state").textContent = dirty ? "Unsaved Changes" : "Saved";
+  $("#calibration-save-state").classList.toggle("unsaved", dirty);
+  $("#apply-calibration").disabled = !dirty;
+  $("#discard-calibration").disabled = !dirty;
+}
+
+function markCalibrationDirty() {
+  const { values, error } = readCalibrationValues();
+  const dirty = [...calibrationControlMap.keys()].some((key) => values[key] !== state.calibration.saved?.[key]);
+  setCalibrationDirty(dirty);
+  $("#apply-calibration").disabled = !dirty || Boolean(error);
+}
+
+function compactCalibrationStat(label, value, detail) {
+  return `<div class="compact-stat"><span>${label}</span><strong>${value}</strong><small>${detail}</small></div>`;
+}
+
+function renderCalibrationResults(data) {
   const summary = data.summary || {};
   $("#calibration-stats").innerHTML = [
-    statCard("Settled sample", summary.sample_size || 0, "Independent contracts"),
-    statCard("Brier score", summary.brier_score == null ? "--" : Number(summary.brier_score).toFixed(3), "Lower is better"),
-    statCard("Calibration error", percent(summary.calibration_error, 1), "Predicted vs actual"),
+    compactCalibrationStat("Settled", summary.sample_size || 0, "samples"),
+    compactCalibrationStat("Brier", summary.brier_score == null ? "--" : Number(summary.brier_score).toFixed(3), "lower is better"),
+    compactCalibrationStat("Cal. error", percent(summary.calibration_error, 1), "predicted vs actual"),
   ].join("");
   const buckets = summary.buckets || [];
   $("#calibration-bars").innerHTML = buckets.length ? buckets.map((bucket) => `
     <div class="bucket">
-      <div class="bucket-bars">
-        <i style="height:${Math.max(2, bucket.predicted * 100)}%" title="Predicted ${percent(bucket.predicted)}"></i>
-        <i class="actual" style="height:${Math.max(2, bucket.actual * 100)}%" title="Actual ${percent(bucket.actual)}"></i>
-      </div>
-      <label>${bucket.label}</label>
-      <small>n=${bucket.count}</small>
+      <div class="bucket-bars"><i style="height:${Math.max(2, bucket.predicted * 100)}%" title="Predicted ${percent(bucket.predicted)}"></i><i class="actual" style="height:${Math.max(2, bucket.actual * 100)}%" title="Actual ${percent(bucket.actual)}"></i></div>
+      <label>${bucket.label}</label><small>n=${bucket.count}</small>
     </div>`).join("") : '<p class="empty-state">Settled observations will populate this chart.</p>';
+  const snapshots = data.configuration_snapshots || [];
+  $("#configuration-snapshots").innerHTML = snapshots.length ? snapshots.map((snapshot) => {
+    const labels = Object.keys(snapshot.changed || {}).slice(0, 3).map((key) => calibrationControlMap.get(key)?.label || key);
+    const more = Math.max(0, Object.keys(snapshot.changed || {}).length - labels.length);
+    return `<div class="snapshot-row"><span><strong>${shortDate(snapshot.created_at)}</strong><small>${labels.join(", ")}${more ? ` +${more} more` : ""}${snapshot.restored_from_id ? ` · restored #${snapshot.restored_from_id}` : ""}</small></span><button type="button" data-restore-snapshot="${snapshot.id}">Restore</button></div>`;
+  }).join("") : '<p class="empty-state">Applied changes will appear here.</p>';
   const reports = data.reports || [];
   $("#report-list").innerHTML = reports.length ? reports.map((row) => {
     const report = row.report || {};
     const limitations = (report.limitations || []).map((item) => `<li>${item}</li>`).join("");
-    return `<details class="report-item">
-      <summary><time>${shortDate(row.created_at)}</time><strong>${row.tldr}</strong><span>${row.promoted ? "Promoted" : "Incumbent kept"}</span></summary>
-      <div class="report-body">
-        <h4>Validation</h4><p>${report.validation || "Calibration-only report."}</p>
-        <h4>Scores</h4><p>Brier: ${row.brier_before == null ? "--" : Number(row.brier_before).toFixed(3)} · Calibration error: ${percent(row.calibration_error, 1)} · Settled contracts: ${row.settled_contracts}</p>
-        <h4>Models</h4><p>Active: ${row.active_model_version}${row.candidate_model_version ? ` · Candidate: ${row.candidate_model_version}` : ""}</p>
-        ${limitations ? `<h4>Limitations</h4><ul>${limitations}</ul>` : ""}
-        <p>${(report.signal_snapshot_ids || []).length} underlying signal snapshots are preserved in SQLite.</p>
-      </div>
-    </details>`;
+    return `<details class="report-item"><summary><time>${shortDate(row.created_at)}</time><strong>${row.tldr}</strong><span>${row.promoted ? "Promoted" : "Incumbent kept"}</span></summary><div class="report-body"><h4>Validation</h4><p>${report.validation || "Calibration-only report."}</p><h4>Scores</h4><p>Brier: ${row.brier_before == null ? "--" : Number(row.brier_before).toFixed(3)} · Calibration error: ${percent(row.calibration_error, 1)} · Settled contracts: ${row.settled_contracts}</p>${limitations ? `<h4>Limitations</h4><ul>${limitations}</ul>` : ""}</div></details>`;
   }).join("") : '<p class="empty-state">No calibration reports yet.</p>';
+}
+
+async function loadCalibration() {
+  const [data, settings, defaults] = await Promise.all([
+    api("/api/calibration"), api("/api/settings"), api("/api/settings/defaults"),
+  ]);
+  renderCalibrationControls();
+  state.calibration.saved = settings;
+  state.calibration.defaults = defaults;
+  setCalibrationValues(settings);
+  renderCalibrationResults(data);
+}
+
+async function applyCalibration() {
+  const { values, error } = readCalibrationValues();
+  if (error) return;
+  const button = $("#apply-calibration");
+  button.disabled = true;
+  try {
+    const settings = await api("/api/settings", { method: "PUT", body: JSON.stringify(values) });
+    state.calibration.saved = settings;
+    setCalibrationValues(settings);
+    renderCalibrationResults(await api("/api/calibration"));
+    await refreshDashboard();
+    showToast("Calibration saved", "New decisions now use the applied configuration.");
+  } catch (errorValue) { showToast("Calibration not saved", errorValue.message); markCalibrationDirty(); }
+}
+
+async function restoreConfiguration(snapshotId) {
+  try {
+    await api(`/api/settings/restore/${snapshotId}`, { method: "POST" });
+    await loadCalibration();
+    await refreshDashboard();
+    showToast("Configuration restored", `Snapshot #${snapshotId} is active and was journaled.`);
+  } catch (error) { showToast("Configuration not restored", error.message); }
 }
 
 async function loadPaper() {
@@ -838,7 +1053,7 @@ async function loadPaper() {
   const trades = data.trades || [];
   $("#trade-table").innerHTML = trades.length ? trades.map((trade) => `
     <tr><td>${shortDate(trade.opened_at)}</td><td>${trade.ticker}</td><td>${marketSideLabel(trade.side)}</td>
-    <td>${percent(trade.entry_price, 1)}</td><td>${trade.contracts}</td><td>${(trade.source || "automatic").toUpperCase()}</td><td>${points(trade.edge)}</td>
+    <td>${percent(trade.entry_price, 1)}</td><td>${trade.contracts}</td><td>${(trade.source || "automatic").toUpperCase()}${(trade.entries || []).some((entry) => entry.stop_status === "active") ? " · STOP ACTIVE" : ""}</td><td>${points(trade.edge)}</td>
     <td><span class="status-pill ${trade.status}">${trade.status.toUpperCase()}</span></td>
     <td class="${Number(trade.realized_pnl) > 0 ? "positive" : Number(trade.realized_pnl) < 0 ? "negative" : ""}">${trade.realized_pnl == null ? "--" : money(trade.realized_pnl)}</td></tr>
   `).join("") : '<tr><td colspan="9" class="empty-state">No paper trades yet.</td></tr>';
@@ -889,15 +1104,9 @@ async function resetPaperRound() {
 const percentSettingIds = ["min_edge", "fractional_kelly", "max_position_pct", "max_risk_per_trade_pct", "max_session_drawdown_pct"];
 
 async function loadSettings() {
-  const [settings, database, credentials] = await Promise.all([
-    api("/api/settings"), api("/api/database"), api("/api/credentials"),
+  const [database, credentials] = await Promise.all([
+    api("/api/database"), api("/api/credentials"),
   ]);
-  for (const [key, value] of Object.entries(settings)) {
-    const input = document.getElementById(key);
-    if (!input) continue;
-    if (input.type === "checkbox") input.checked = Boolean(value);
-    else input.value = percentSettingIds.includes(key) ? Number(value) * 100 : value;
-  }
   $("#database-path").textContent = database.path;
   $("#database-counts").innerHTML = Object.entries(database.counts).map(([key, value]) => `<span>${key.replaceAll("_", " ")}: ${value}</span>`).join("");
   renderCredentialStatus(credentials);
@@ -1050,6 +1259,7 @@ async function switchPage(page) {
   state.activePage = page;
   $$("[data-page]").forEach((button) => button.classList.toggle("active", button.dataset.page === page));
   $$(".page").forEach((section) => section.classList.toggle("active", section.id === `page-${page}`));
+  window.scrollTo({ top: 0, behavior: "auto" });
   try {
     if (page === "calibration") await loadCalibration();
     if (page === "paper") await loadPaper();
@@ -1066,7 +1276,6 @@ function bindEvents() {
     const chart = await api(`/api/chart?minutes=${state.chartWindow}`);
     state.chartPoints = chart.points || []; drawChart();
   }));
-  $("#save-settings").addEventListener("click", saveSettings);
   $("#credential-form").addEventListener("submit", saveKalshiCredentials);
   $("#remove-credentials").addEventListener("click", removeKalshiCredentials);
   $("#kalshi-private-key").addEventListener("change", (event) => {
@@ -1084,8 +1293,7 @@ function bindEvents() {
     renderPaperController();
   }));
   $$('[data-paper-side]').forEach((button) => button.addEventListener("click", () => {
-    state.paperOrder.side = button.dataset.paperSide;
-    renderPaperController();
+    updateSelectedSide(button.dataset.paperSide);
   }));
   $("#paper-limit-toggle").addEventListener("change", (event) => {
     state.paperOrder.limit = event.target.checked;
@@ -1094,13 +1302,25 @@ function bindEvents() {
     $("#paper-limit-price").value = "";
     renderPaperController();
   });
-  ["#paper-dollars", "#paper-contracts", "#paper-limit-price"].forEach((selector) => {
+  ["#paper-dollars", "#paper-contracts", "#paper-limit-price", "#paper-stop-loss"].forEach((selector) => {
     $(selector).addEventListener("input", renderPaperController);
   });
   $("#paper-submit").addEventListener("click", submitPaperOrder);
   $("#open-order-list").addEventListener("click", (event) => {
     const button = event.target.closest("[data-cancel-paper-order]");
     if (button) cancelPaperOrder(Number(button.dataset.cancelPaperOrder));
+  });
+  $("#calibration-controls").addEventListener("input", markCalibrationDirty);
+  $("#calibration-controls").addEventListener("change", markCalibrationDirty);
+  $("#apply-calibration").addEventListener("click", applyCalibration);
+  $("#discard-calibration").addEventListener("click", () => setCalibrationValues(state.calibration.saved));
+  $("#restore-defaults").addEventListener("click", () => {
+    setCalibrationValues(state.calibration.defaults);
+    markCalibrationDirty();
+  });
+  $("#configuration-snapshots").addEventListener("click", (event) => {
+    const button = event.target.closest("[data-restore-snapshot]");
+    if (button) restoreConfiguration(Number(button.dataset.restoreSnapshot));
   });
   $$('[data-theme-choice]').forEach((button) => button.addEventListener("click", () => {
     applyTheme(button.dataset.themeChoice);

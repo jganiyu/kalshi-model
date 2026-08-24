@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import math
+import time
+from collections import deque
 from datetime import date
 from typing import Any
 
@@ -12,6 +14,11 @@ from app.services.decision import Decision
 class PaperTradingService:
     def __init__(self, db: Database):
         self.db = db
+        self._automatic_key: tuple[str, str] | None = None
+        self._automatic_started_at: float | None = None
+        self._automatic_last_at: float | None = None
+        self._automatic_last_buy = False
+        self._automatic_segments: deque[tuple[float, float, bool]] = deque()
 
     def portfolio(self) -> dict[str, Any]:
         settings = self.db.settings()
@@ -94,6 +101,13 @@ class PaperTradingService:
             sum(float(trade["edge"]) for trade in trades) / len(trades) if trades else 0.0
         )
         expected_total = sum(float(trade["expected_value"]) * int(trade["contracts"]) for trade in trades)
+        entries = self.db.fetch_all(
+            "SELECT * FROM paper_entries ORDER BY opened_at ASC, id ASC"
+        )
+        active_stops = [
+            entry for entry in entries
+            if entry["status"] == "open" and entry.get("stop_status") == "active"
+        ]
         return {
             "starting_bankroll": starting,
             "current_bankroll": current,
@@ -122,7 +136,16 @@ class PaperTradingService:
             "max_session_drawdown_pct": float(
                 settings.get("max_session_drawdown_pct", 0.10)
             ),
-            "trades": list(reversed(trades[-100:])),
+            "selected_side": settings.get("selected_side", "YES"),
+            "default_stop_loss_cents": settings.get("default_stop_loss_cents"),
+            "active_stop_losses": active_stops,
+            "trades": [
+                {
+                    **trade,
+                    "entries": [entry for entry in entries if entry["trade_id"] == trade["id"]],
+                }
+                for trade in reversed(trades[-100:])
+            ],
             "orders": list(reversed(orders[-100:])),
             "open_orders": list(reversed(open_orders)),
             "positions": [
@@ -133,6 +156,19 @@ class PaperTradingService:
                     "entry_price": float(trade["entry_price"]),
                     "committed_dollars": float(trade["entry_cost"] + trade["fees"]),
                     "source": trade.get("source", "automatic"),
+                    "entries": [
+                        {
+                            "id": entry["id"],
+                            "contracts": int(entry["remaining_contracts"]),
+                            "entry_price": float(entry["entry_price"]),
+                            "stop_loss_price": entry.get("stop_loss_price"),
+                            "stop_status": entry.get("stop_status"),
+                            "source": entry["source"],
+                        }
+                        for entry in entries
+                        if entry["trade_id"] == trade["id"]
+                        and entry["status"] == "open"
+                    ],
                 }
                 for trade in open_trades
             ],
@@ -178,6 +214,7 @@ class PaperTradingService:
         dollars: float | None = None,
         contracts: int | None = None,
         limit_price: float | None = None,
+        stop_loss_price: float | None = None,
     ) -> dict[str, Any]:
         side = str(side).upper()
         action = str(action).upper()
@@ -188,6 +225,15 @@ class PaperTradingService:
             raise ValueError("Choose Buy or Sell.")
         if order_type not in {"MARKET", "LIMIT"}:
             raise ValueError("Order type must be market or limit.")
+        if action == "SELL" and stop_loss_price is not None:
+            raise ValueError("Stop-losses can only be attached to Buy orders.")
+        if stop_loss_price is not None:
+            try:
+                stop_loss_price = float(stop_loss_price)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("Enter a valid stop-loss price.") from exc
+            if not 0.01 <= stop_loss_price <= 0.99:
+                raise ValueError("Stop-loss must be between 1 and 99 cents.")
 
         best_price = self.executable_price(market, side, action)
         requested_dollars = None
@@ -242,12 +288,13 @@ class PaperTradingService:
             """
             INSERT INTO paper_orders(
                 ticker,side,action,order_type,status,created_at,requested_dollars,
-                requested_contracts,limit_price,source
-            ) VALUES (?,?,?,?,?,?,?,?,?,?)
+                requested_contracts,limit_price,source,stop_loss_price
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 ticker, side, action, order_type, "open", iso_now(), requested_dollars,
                 contracts, order_price if order_type == "LIMIT" else None, "manual",
+                stop_loss_price,
             ),
         )
         order = self.db.fetch_one("SELECT * FROM paper_orders WHERE id=?", (order_id,))
@@ -318,7 +365,7 @@ class PaperTradingService:
                     total_contracts = int(position["contracts"]) + contracts
                     total_cost = float(position["entry_cost"]) + entry_cost
                     old_source = position["source"] or "automatic"
-                    source = "manual" if old_source == "manual" else "mixed"
+                    source = old_source if old_source == order["source"] else "mixed"
                     connection.execute(
                         """
                         UPDATE paper_trades SET contracts=?,entry_price=?,entry_cost=?,
@@ -329,6 +376,7 @@ class PaperTradingService:
                             float(position["fees"]) + fees, source, position["id"],
                         ),
                     )
+                    trade_id = int(position["id"])
                 else:
                     market_probability = market.get("market_probability")
                     if market_probability is None:
@@ -339,7 +387,7 @@ class PaperTradingService:
                             if yes_bid is not None and yes_ask is not None
                             else 0.5
                         )
-                    connection.execute(
+                    cursor = connection.execute(
                         """
                         INSERT INTO paper_trades(
                             ticker,side,opened_at,entry_price,contracts,entry_cost,fees,
@@ -351,16 +399,39 @@ class PaperTradingService:
                             order["ticker"], order["side"], filled_at, price, contracts,
                             entry_cost, fees, float(market.get("model_probability") or 0.5),
                             float(market_probability), 0.0, 0.0, "Manual", "manual",
-                            "open", "manual",
+                            "open", order["source"],
                         ),
                     )
+                    trade_id = int(cursor.lastrowid)
+                stop_loss = order.get("stop_loss_price")
+                connection.execute(
+                    """
+                    INSERT INTO paper_entries(
+                        trade_id,order_id,ticker,side,opened_at,entry_price,
+                        initial_contracts,remaining_contracts,entry_cost,entry_fees,
+                        stop_loss_price,stop_status,source,status
+                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    """,
+                    (
+                        trade_id, order["id"], order["ticker"], order["side"],
+                        filled_at, price, contracts, contracts, entry_cost, fees,
+                        stop_loss, "active" if stop_loss is not None else None,
+                        order["source"], "open",
+                    ),
+                )
             else:
                 if not position or int(position["contracts"]) < contracts:
                     raise ValueError("The paper position no longer has enough contracts to sell.")
                 held = int(position["contracts"])
-                fraction = contracts / held
-                allocated_cost = float(position["entry_cost"]) * fraction
-                allocated_entry_fees = float(position["fees"]) * fraction
+                allocated_cost, allocated_entry_fees = self._consume_entries(
+                    connection,
+                    ticker=str(order["ticker"]),
+                    side=str(order["side"]),
+                    contracts=contracts,
+                    closed_at=filled_at,
+                    target_entry_id=order.get("entry_id"),
+                    stop_triggered=order.get("source") == "stop_loss",
+                )
                 proceeds = price * contracts
                 realized_pnl = proceeds - fees - allocated_cost - allocated_entry_fees
                 previous_realized = float(position["realized_pnl"] or 0)
@@ -377,14 +448,17 @@ class PaperTradingService:
                         ),
                     )
                 else:
+                    remaining_cost = float(position["entry_cost"]) - allocated_cost
+                    remaining_contracts = held - contracts
                     connection.execute(
                         """
-                        UPDATE paper_trades SET contracts=?,entry_cost=?,fees=?,
+                        UPDATE paper_trades SET contracts=?,entry_price=?,entry_cost=?,fees=?,
                             realized_pnl=?,source=? WHERE id=?
                         """,
                         (
-                            held - contracts,
-                            float(position["entry_cost"]) - allocated_cost,
+                            remaining_contracts,
+                            remaining_cost / remaining_contracts,
+                            remaining_cost,
                             float(position["fees"]) - allocated_entry_fees,
                             previous_realized + realized_pnl,
                             "manual" if position["source"] == "manual" else "mixed",
@@ -398,6 +472,62 @@ class PaperTradingService:
                 """,
                 (price, contracts, fees, realized_pnl, filled_at, order["id"]),
             )
+
+    @staticmethod
+    def _consume_entries(
+        connection: Any,
+        *,
+        ticker: str,
+        side: str,
+        contracts: int,
+        closed_at: str,
+        target_entry_id: int | None = None,
+        stop_triggered: bool = False,
+    ) -> tuple[float, float]:
+        params: list[Any] = [ticker, side]
+        where = "ticker=? AND side=? AND status='open' AND remaining_contracts>0"
+        if target_entry_id is not None:
+            where += " AND id=?"
+            params.append(int(target_entry_id))
+        rows = connection.execute(
+            f"SELECT * FROM paper_entries WHERE {where} ORDER BY opened_at ASC,id ASC",
+            params,
+        ).fetchall()
+        available = sum(int(row["remaining_contracts"]) for row in rows)
+        if available < contracts:
+            raise ValueError("The paper entry no longer has enough contracts to sell.")
+        remaining_to_sell = contracts
+        allocated_cost = 0.0
+        allocated_fees = 0.0
+        for raw in rows:
+            if remaining_to_sell <= 0:
+                break
+            entry = dict(raw)
+            take = min(remaining_to_sell, int(entry["remaining_contracts"]))
+            fraction = take / int(entry["initial_contracts"])
+            allocated_cost += float(entry["entry_cost"]) * fraction
+            allocated_fees += float(entry["entry_fees"]) * fraction
+            left = int(entry["remaining_contracts"]) - take
+            if left == 0:
+                stop_status = (
+                    "triggered"
+                    if stop_triggered and target_entry_id == entry["id"]
+                    else "canceled" if entry.get("stop_status") == "active" else entry.get("stop_status")
+                )
+                connection.execute(
+                    """
+                    UPDATE paper_entries SET remaining_contracts=0,status='closed',
+                        closed_at=?,stop_status=? WHERE id=?
+                    """,
+                    (closed_at, stop_status, entry["id"]),
+                )
+            else:
+                connection.execute(
+                    "UPDATE paper_entries SET remaining_contracts=? WHERE id=?",
+                    (left, entry["id"]),
+                )
+            remaining_to_sell -= take
+        return allocated_cost, allocated_fees
 
     def process_open_orders(self, ticker: str, market: dict[str, Any]) -> int:
         orders = self.db.fetch_all(
@@ -427,7 +557,53 @@ class PaperTradingService:
                         """,
                         (iso_now(), str(exc), order["id"]),
                     )
-        return filled
+        return filled + self.process_stop_losses(ticker, market)
+
+    def process_stop_losses(self, ticker: str, market: dict[str, Any]) -> int:
+        entries = self.db.fetch_all(
+            """
+            SELECT * FROM paper_entries
+            WHERE ticker=? AND status='open' AND stop_status='active'
+              AND remaining_contracts>0
+            ORDER BY id ASC
+            """,
+            (ticker,),
+        )
+        triggered = 0
+        for entry in entries:
+            bid = self.executable_price(market, str(entry["side"]), "SELL")
+            stop = entry.get("stop_loss_price")
+            if bid is None or stop is None or bid > float(stop):
+                continue
+            order_id = self.db.execute(
+                """
+                INSERT INTO paper_orders(
+                    ticker,side,action,order_type,status,created_at,
+                    requested_contracts,source,entry_id
+                ) VALUES (?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    ticker, entry["side"], "SELL", "MARKET", "open", iso_now(),
+                    int(entry["remaining_contracts"]), "stop_loss", entry["id"],
+                ),
+            )
+            order = self.db.fetch_one(
+                "SELECT * FROM paper_orders WHERE id=?", (order_id,)
+            )
+            if not order:
+                continue
+            try:
+                self._fill_order(order, bid, market)
+                triggered += 1
+            except ValueError as exc:
+                self.db.execute(
+                    """
+                    UPDATE paper_orders SET status='canceled',canceled_at=?,error=?
+                    WHERE id=?
+                    """,
+                    (iso_now(), str(exc), order_id),
+                )
+        return triggered
 
     def cancel_order(self, order_id: int) -> bool:
         order = self.db.fetch_one(
@@ -445,8 +621,10 @@ class PaperTradingService:
         trades = self.db.fetch_one("SELECT COUNT(*) AS count FROM paper_trades")
         orders = self.db.fetch_one("SELECT COUNT(*) AS count FROM paper_orders")
         with self.db.transaction() as connection:
+            connection.execute("DELETE FROM paper_entries")
             connection.execute("DELETE FROM paper_orders")
             connection.execute("DELETE FROM paper_trades")
+        self.reset_automatic_confirmation()
         return {
             "cleared_trades": int(trades["count"] if trades else 0),
             "cleared_orders": int(orders["count"] if orders else 0),
@@ -455,13 +633,16 @@ class PaperTradingService:
     def open_from_decision(
         self, ticker: str, decision: Decision, model_version: str = "baseline-1.0"
     ) -> bool:
-        if not decision.signal.startswith("TRADE") or not decision.side:
+        if decision.signal != "BUY" or not decision.side:
             return False
         if decision.suggested_contracts < 1 or decision.executable_price is None:
             return False
         existing = self.db.fetch_one(
-            "SELECT id FROM paper_trades WHERE ticker = ?",
-            (ticker,),
+            """
+            SELECT id FROM paper_entries
+            WHERE ticker=? AND side=? AND source='automatic'
+            """,
+            (ticker, decision.side),
         )
         if existing:
             return False
@@ -470,35 +651,127 @@ class PaperTradingService:
             self._validate_buy(ticker, decision.side, decision.executable_price, contracts)
         except ValueError:
             return False
-        entry_cost = decision.executable_price * contracts
-        fees = kalshi_fee(decision.executable_price, contracts)
-        self.db.execute(
+        stop_cents = self.db.settings().get("default_stop_loss_cents")
+        stop_price = float(stop_cents) / 100 if stop_cents is not None else None
+        order_id = self.db.execute(
             """
-            INSERT INTO paper_trades(
-                ticker, side, opened_at, entry_price, contracts, entry_cost, fees,
-                model_probability, market_probability, edge, expected_value,
-                confidence, model_version, status, source
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO paper_orders(
+                ticker,side,action,order_type,status,created_at,requested_contracts,
+                source,stop_loss_price
+            ) VALUES (?,?,?,?,?,?,?,?,?)
             """,
             (
-                ticker,
-                decision.side,
-                iso_now(),
-                decision.executable_price,
-                contracts,
-                entry_cost,
-                fees,
-                decision.model_probability,
-                decision.market_probability,
-                decision.edge,
-                decision.expected_value,
-                decision.confidence,
-                model_version,
-                "open",
-                "automatic",
+                ticker, decision.side, "BUY", "MARKET", "open", iso_now(),
+                contracts, "automatic", stop_price,
             ),
         )
+        order = self.db.fetch_one("SELECT * FROM paper_orders WHERE id=?", (order_id,))
+        if not order:
+            return False
+        self._fill_order(
+            order,
+            decision.executable_price,
+            {
+                "model_probability": decision.model_probability,
+                "market_probability": decision.market_probability,
+            },
+        )
+        trade = self.db.fetch_one(
+            "SELECT id FROM paper_trades WHERE ticker=? AND side=? AND status='open'",
+            (ticker, decision.side),
+        )
+        if trade:
+            self.db.execute(
+                """
+                UPDATE paper_trades SET edge=?,expected_value=?,confidence=?,model_version=?
+                WHERE id=?
+                """,
+                (
+                    decision.edge, decision.expected_value, decision.confidence,
+                    model_version, trade["id"],
+                ),
+            )
         return True
+
+    def reset_automatic_confirmation(self) -> None:
+        self._automatic_key = None
+        self._automatic_started_at = None
+        self._automatic_last_at = None
+        self._automatic_last_buy = False
+        self._automatic_segments.clear()
+
+    def consider_automatic_entry(
+        self,
+        *,
+        ticker: str,
+        decision: Decision,
+        seconds_remaining: float,
+        model_version: str,
+        now: float | None = None,
+    ) -> dict[str, Any]:
+        settings = self.db.settings()
+        selected_side = str(settings.get("selected_side", "YES"))
+        key = (ticker, selected_side)
+        current_time = time.monotonic() if now is None else float(now)
+        window = float(settings.get("automatic_confirmation_seconds", 10))
+        entry_window = float(settings.get("automatic_entry_window_minutes", 5)) * 60
+        enabled = bool(settings.get("paper_trading_enabled", False))
+        inside_window = 0 < seconds_remaining <= entry_window
+        if not enabled or not inside_window or decision.side != selected_side:
+            self.reset_automatic_confirmation()
+            return {"armed": False, "progress": 0.0, "entered": False}
+        if self._automatic_key != key:
+            self.reset_automatic_confirmation()
+            self._automatic_key = key
+            self._automatic_started_at = current_time
+            self._automatic_last_at = current_time
+            self._automatic_last_buy = decision.signal == "BUY"
+            return {"armed": True, "progress": 0.0, "entered": False}
+        assert self._automatic_started_at is not None
+        assert self._automatic_last_at is not None
+        if current_time < self._automatic_last_at:
+            self.reset_automatic_confirmation()
+            return {"armed": False, "progress": 0.0, "entered": False}
+        if current_time > self._automatic_last_at:
+            self._automatic_segments.append(
+                (self._automatic_last_at, current_time, self._automatic_last_buy)
+            )
+        self._automatic_last_at = current_time
+        self._automatic_last_buy = decision.signal == "BUY"
+        cutoff = current_time - window
+        while self._automatic_segments and self._automatic_segments[0][1] <= cutoff:
+            self._automatic_segments.popleft()
+        observed = min(window, current_time - self._automatic_started_at)
+        buy_seconds = sum(
+            max(0.0, end - max(start, cutoff))
+            for start, end, is_buy in self._automatic_segments
+            if is_buy
+        )
+        ratio = buy_seconds / window if window > 0 else 0.0
+        confidence_rank = {"Low": 0, "Moderate": 1, "High": 2}
+        required_confidence = str(settings.get("automatic_min_confidence", "High"))
+        confidence_ok = confidence_rank.get(decision.confidence, 0) >= confidence_rank.get(
+            required_confidence, 2
+        )
+        complete = observed >= window
+        required_ratio = float(settings.get("automatic_buy_duration_pct", 0.70))
+        entered = False
+        if (
+            complete
+            and decision.signal == "BUY"
+            and ratio + 1e-9 >= required_ratio
+            and confidence_ok
+        ):
+            entered = self.open_from_decision(ticker, decision, model_version)
+            if entered:
+                self.reset_automatic_confirmation()
+        return {
+            "armed": True,
+            "progress": min(1.0, observed / window) if window > 0 else 1.0,
+            "buy_duration_pct": ratio,
+            "confidence_ok": confidence_ok,
+            "entered": entered,
+        }
 
     def settle(self, ticker: str, result: int, settled_at: str) -> int:
         self.db.execute(
@@ -510,6 +783,15 @@ class PaperTradingService:
         )
         trades = self.db.fetch_all(
             "SELECT * FROM paper_trades WHERE ticker = ? AND status = 'open'", (ticker,)
+        )
+        self.db.execute(
+            """
+            UPDATE paper_entries SET status='settled',remaining_contracts=0,
+                closed_at=?,stop_status=CASE
+                    WHEN stop_status='active' THEN 'settled' ELSE stop_status END
+            WHERE ticker=? AND status='open'
+            """,
+            (settled_at, ticker),
         )
         for trade in trades:
             wins = (trade["side"] == "YES" and result == 1) or (

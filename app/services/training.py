@@ -110,7 +110,11 @@ class ModelManager:
             return predict_logistic(model["parameters"], features), str(model["version"])
         return baseline_probability, str(model.get("version", "baseline-1.1"))
 
-    def benchmark_calibration(self, limit: int = 120) -> dict[str, Any]:
+    def benchmark_calibration(self, limit: int | None = None) -> dict[str, Any]:
+        settings = self.db.settings()
+        sample_limit = int(
+            limit if limit is not None else settings.get("benchmark_history_samples", 120)
+        )
         rows = self.db.fetch_all(
             """
             SELECT z.raw_json, m.close_time
@@ -120,7 +124,7 @@ class ModelManager:
             ORDER BY m.close_time DESC
             LIMIT ?
             """,
-            (limit,),
+            (sample_limit,),
         )
         observations: list[tuple[float, float]] = []
         coverage: list[float] = []
@@ -154,7 +158,15 @@ class ModelManager:
                 continue
             observations.append((float(proxy_average), official))
             coverage.append(min(1.0, sample_seconds / 60.0))
-        summary = benchmark_error_summary(observations)
+        summary = benchmark_error_summary(
+            observations,
+            uncertainty_floor_pct=float(
+                settings.get("benchmark_uncertainty_floor_pct", 0.00015)
+            ),
+            minimum_samples=int(
+                settings.get("benchmark_calibration_min_samples", 20)
+            ),
+        )
         summary["average_window_coverage"] = (
             sum(coverage) / len(coverage) if coverage else None
         )
@@ -183,11 +195,28 @@ class ModelManager:
 
     def evaluate_and_retrain(self, trigger: str) -> dict[str, Any]:
         observations = self.observations()
+        settings = self.db.settings()
         current_metrics = calibration_metrics(
             (row["model_probability"], row["result"]) for row in observations
         )
         n = len(observations)
-        training_observations = observations[-MAX_TRAINING_OBSERVATIONS:]
+        history_days = int(settings.get("training_history_days", 3650))
+        if observations:
+            latest_observed = parse_time(str(observations[-1]["observed_at"]))
+            if latest_observed:
+                cutoff = latest_observed - timedelta(days=history_days)
+                observations_in_window = [
+                    row for row in observations
+                    if (parse_time(str(row["observed_at"])) or latest_observed) >= cutoff
+                ]
+            else:
+                observations_in_window = observations
+        else:
+            observations_in_window = observations
+        maximum_observations = int(
+            settings.get("training_max_samples", MAX_TRAINING_OBSERVATIONS)
+        )
+        training_observations = observations_in_window[-maximum_observations:]
         training_n = len(training_observations)
         observed_days = len(
             {str(row["observed_at"])[:10] for row in training_observations}
@@ -199,7 +228,14 @@ class ModelManager:
         parameters: dict[str, Any] | None = None
         validation_predictions: list[tuple[float, int]] = []
 
-        if training_n >= MIN_CANDIDATE_OBSERVATIONS:
+        minimum_candidate = int(settings.get("training_min_samples", MIN_CANDIDATE_OBSERVATIONS))
+        minimum_promotion = int(settings.get("promotion_min_samples", MIN_PROMOTION_OBSERVATIONS))
+        minimum_days = int(settings.get("promotion_min_days", MIN_PROMOTION_DAYS))
+        minimum_brier = float(settings.get("minimum_brier_improvement", MIN_BRIER_IMPROVEMENT))
+        calibration_tolerance = float(
+            settings.get("calibration_tolerance", MAX_CALIBRATION_ERROR_REGRESSION)
+        )
+        if training_n >= minimum_candidate:
             x = np.asarray(
                 [feature_vector(row["features"]) for row in training_observations],
                 dtype=float,
@@ -229,18 +265,18 @@ class ModelManager:
             candidate_error = candidate_metrics.get("calibration_error")
             incumbent_error = incumbent_tail.get("calibration_error")
             promotion_data_eligible = bool(
-                training_n >= MIN_PROMOTION_OBSERVATIONS
-                and observed_days >= MIN_PROMOTION_DAYS
+                training_n >= minimum_promotion
+                and observed_days >= minimum_days
             )
             promoted = bool(
                 promotion_data_eligible
                 and candidate_brier is not None
                 and incumbent_brier is not None
-                and candidate_brier <= incumbent_brier - MIN_BRIER_IMPROVEMENT
+                and candidate_brier <= incumbent_brier - minimum_brier
                 and candidate_error is not None
                 and incumbent_error is not None
                 and candidate_error
-                <= incumbent_error + MAX_CALIBRATION_ERROR_REGRESSION
+                <= incumbent_error + calibration_tolerance
             )
             self.db.execute(
                 """
@@ -263,14 +299,15 @@ class ModelManager:
                             "training_window": {
                                 "observations": training_n,
                                 "distinct_utc_days": observed_days,
-                                "maximum_observations": MAX_TRAINING_OBSERVATIONS,
+                                "maximum_observations": maximum_observations,
+                                "maximum_days": history_days,
                             },
                             "promotion_requirements": {
-                                "minimum_observations": MIN_PROMOTION_OBSERVATIONS,
-                                "minimum_distinct_utc_days": MIN_PROMOTION_DAYS,
-                                "minimum_brier_improvement": MIN_BRIER_IMPROVEMENT,
+                                "minimum_observations": minimum_promotion,
+                                "minimum_distinct_utc_days": minimum_days,
+                                "minimum_brier_improvement": minimum_brier,
                                 "maximum_calibration_error_regression": (
-                                    MAX_CALIBRATION_ERROR_REGRESSION
+                                    calibration_tolerance
                                 ),
                             },
                         }
@@ -298,7 +335,7 @@ class ModelManager:
             tldr = (
                 f"Candidate validation updated with {training_n} recent contracts across "
                 f"{observed_days} UTC days. Promotion requires at least "
-                f"{MIN_PROMOTION_OBSERVATIONS} contracts across {MIN_PROMOTION_DAYS} days."
+                f"{minimum_promotion} contracts across {minimum_days} days."
             )
         elif promoted:
             tldr = (
@@ -314,7 +351,8 @@ class ModelManager:
             "sample_size": n,
             "training_sample_size": training_n,
             "training_distinct_utc_days": observed_days,
-            "training_window_limit": MAX_TRAINING_OBSERVATIONS,
+            "training_window_limit": maximum_observations,
+            "training_history_days": history_days,
             "current": current_metrics,
             "candidate": candidate_metrics,
             "promoted": promoted,
@@ -328,11 +366,11 @@ class ModelManager:
                 "training fold."
             ),
             "promotion_requirements": {
-                "minimum_observations": MIN_PROMOTION_OBSERVATIONS,
-                "minimum_distinct_utc_days": MIN_PROMOTION_DAYS,
-                "minimum_brier_improvement": MIN_BRIER_IMPROVEMENT,
+                "minimum_observations": minimum_promotion,
+                "minimum_distinct_utc_days": minimum_days,
+                "minimum_brier_improvement": minimum_brier,
                 "maximum_calibration_error_regression": (
-                    MAX_CALIBRATION_ERROR_REGRESSION
+                    calibration_tolerance
                 ),
             },
             "limitations": [

@@ -469,6 +469,7 @@ class AnalysisEngine:
         state.update(
             {
                 "ticker": market["ticker"],
+                "observed_at": iso_now(),
                 "yes_bid": yes_bid,
                 "yes_ask": yes_ask,
                 "no_bid": 1.0 - float(yes_ask) if yes_ask is not None else None,
@@ -484,6 +485,7 @@ class AnalysisEngine:
                 "yes_bid_size": as_float(market.get("yes_bid_size_fp")) or state.get("yes_bid_size"),
                 "yes_ask_size": as_float(market.get("yes_ask_size_fp")) or state.get("yes_ask_size"),
                 "no_ask_size": as_float(market.get("yes_bid_size_fp")) or state.get("no_ask_size"),
+                "no_bid_size": as_float(market.get("yes_ask_size_fp")) or state.get("no_bid_size"),
                 "rapid_repricing": (
                     new_mid - old_mid
                     if new_mid is not None and old_mid is not None
@@ -716,6 +718,7 @@ class AnalysisEngine:
             rapid = ((yes_bid + yes_ask) - (previous_bid + previous_ask)) / 2
         state = {
             "ticker": market["ticker"],
+            "observed_at": observed_at,
             "yes_bid": yes_bid,
             "yes_ask": yes_ask,
             "no_bid": no_bid,
@@ -727,6 +730,7 @@ class AnalysisEngine:
             "yes_bid_size": metrics["yes_bids"][0][1] if metrics["yes_bids"] else as_float(market.get("yes_bid_size_fp")),
             "yes_ask_size": metrics["yes_asks"][0][1] if metrics["yes_asks"] else as_float(market.get("yes_ask_size_fp")),
             "no_ask_size": metrics["no_asks"][0][1] if metrics["no_asks"] else None,
+            "no_bid_size": metrics["no_bids"][0][1] if metrics["no_bids"] else None,
             "imbalance": metrics["imbalance"],
             "rapid_repricing": rapid,
             "orderbook": metrics,
@@ -818,6 +822,13 @@ class AnalysisEngine:
         variant_spread = max(variants) - min(variants) if len(variants) > 1 else 0.0
         calibration = self.calibration_summary()
         portfolio = self.paper.portfolio()
+        selected_side = str(settings.get("selected_side", "YES"))
+        held_contracts = sum(
+            int(position["contracts"])
+            for position in portfolio.get("positions", [])
+            if position["ticker"] == market["ticker"]
+            and position["side"] == selected_side
+        )
         quality = self._data_quality(
             btc,
             market_state,
@@ -836,32 +847,50 @@ class AnalysisEngine:
             data_quality=quality,
             calibration=calibration,
             model_variant_spread=variant_spread,
+            selected_side=selected_side,
+            held_contracts=held_contracts,
         )
         previous = self.db.fetch_one(
             "SELECT * FROM signal_snapshots WHERE ticker=? ORDER BY id DESC LIMIT 1",
             (market["ticker"],),
         )
-        reason = material_change(previous, decision, float(settings["min_edge"]))
+        previous_side = None
+        if previous:
+            try:
+                previous_side = json.loads(previous["input_json"]).get("selected_side")
+            except (TypeError, json.JSONDecodeError):
+                previous_side = None
+        reason = (
+            "selected side changed"
+            if previous and previous_side != selected_side
+            else material_change(previous, decision, float(settings.get("buy_edge", 0.05)))
+        )
         notification = None
         if reason:
             signal_id = self._save_signal(
                 market["ticker"], decision, model_version, features, btc,
-                market_state, reason, observed_at,
+                market_state, reason, observed_at, probability, selected_side,
             )
-            if settings.get("paper_trading_enabled", False):
-                self.paper.open_from_decision(market["ticker"], decision, model_version)
             if previous and previous.get("signal") != decision.signal:
                 notification = {
                     "title": f"Signal changed: {previous.get('signal')} -> {decision.signal}",
                     "detail": f"Edge is {decision.edge * 100:+.1f} points." if decision.edge is not None else decision.explanation,
                     "signal_id": signal_id,
                 }
+        automatic_entry = self.paper.consider_automatic_entry(
+            ticker=str(market["ticker"]),
+            decision=decision,
+            seconds_remaining=seconds_remaining,
+            model_version=model_version,
+        )
         summary = self._market_summary(market)
         summary.update(
             {
                 **market_state,
                 "time_remaining_seconds": seconds_remaining,
-                "model_probability": probability,
+                "model_probability": decision.model_probability,
+                "up_probability": probability,
+                "selected_side": selected_side,
                 "model_version": model_version,
                 "z_distance": baseline.z_distance,
                 "annualized_volatility": baseline.annualized_volatility,
@@ -874,6 +903,7 @@ class AnalysisEngine:
                 "model_variant_spread": variant_spread,
                 "data_quality": quality,
                 "decision": decision.as_dict(),
+                "automatic_entry": automatic_entry,
             }
         )
         return summary, notification
@@ -890,17 +920,30 @@ class AnalysisEngine:
         benchmark_uncertainty_pct: float,
         settlement_window: dict[str, float | int | None],
     ) -> dict[str, Any]:
-        if int(btc.get("exchange_count") or 0) < 2:
+        if int(btc.get("exchange_count") or 0) < int(
+            settings.get("minimum_exchange_feeds", 2)
+        ):
             return {"reliable": False, "reason": "fewer than two exchange feeds responded"}
+        now = datetime.now(UTC)
+        maximum_age = float(settings.get("max_data_age_seconds", 20))
+        for label, timestamp in (
+            ("BTC", btc.get("observed_at")),
+            ("Kalshi", market.get("observed_at")),
+        ):
+            parsed = parse_time(timestamp)
+            if parsed is not None and (now - parsed).total_seconds() > maximum_age:
+                return {"reliable": False, "reason": f"the {label} feed is stale"}
         if float(btc.get("dispersion_pct") or 0) > float(settings["max_exchange_dispersion_pct"]):
             return {"reliable": False, "reason": "cross-exchange prices disagree beyond the configured limit"}
-        if seconds_remaining <= 10:
+        if seconds_remaining <= float(settings.get("closing_guard_seconds", 10)):
             return {"reliable": False, "reason": "the contract is closing or transitioning"}
-        if market.get("yes_ask") is None or market.get("no_ask") is None:
-            return {"reliable": False, "reason": "an executable Kalshi ask is missing"}
+        if any(market.get(key) is None for key in ("yes_bid", "yes_ask", "no_bid", "no_ask")):
+            return {"reliable": False, "reason": "an executable Kalshi bid or ask is missing"}
         elapsed = float(settlement_window.get("elapsed_seconds") or 0.0)
         coverage = float(settlement_window.get("coverage") or 0.0)
-        if elapsed >= 5.0 and coverage < 0.5:
+        if elapsed >= 5.0 and coverage < float(
+            settings.get("settlement_min_coverage_pct", 0.50)
+        ):
             return {
                 "reliable": True,
                 "trade_allowed": False,
@@ -937,6 +980,8 @@ class AnalysisEngine:
         market: dict[str, Any],
         reason: str,
         observed_at: str,
+        model_up_probability: float,
+        selected_side: str,
     ) -> int:
         return self.db.execute(
             """
@@ -949,11 +994,12 @@ class AnalysisEngine:
             """,
             (
                 observed_at, ticker, decision.signal, decision.reason_code,
-                decision.confidence, decision.explanation, decision.model_probability,
+                decision.confidence, decision.explanation, model_up_probability,
                 decision.market_probability, decision.edge, decision.expected_value,
                 decision.suggested_fraction, decision.suggested_dollars,
                 decision.suggested_contracts, model_version,
-                json.dumps({"features": features}), json.dumps(btc), json.dumps(market), reason,
+                json.dumps({"features": features, "selected_side": selected_side}),
+                json.dumps(btc), json.dumps(market), reason,
             ),
         )
 
@@ -989,19 +1035,28 @@ class AnalysisEngine:
             if inserted:
                 self._benchmark_calibration = self.models.benchmark_calibration()
                 count = self.db.fetch_one("SELECT COUNT(*) AS count FROM settlements")["count"]
+                settings = self.db.settings()
                 latest = self.db.fetch_one(
                     "SELECT created_at FROM calibration_reports ORDER BY created_at DESC LIMIT 1"
                 )
-                needs_daily = not latest or str(latest["created_at"])[:10] != datetime.now(UTC).date().isoformat()
-                if count <= 20 or needs_daily:
+                latest_time = parse_time(latest["created_at"]) if latest else None
+                cadence_hours = float(settings.get("retraining_cadence_hours", 24))
+                cadence_due = (
+                    latest_time is None
+                    or (datetime.now(UTC) - latest_time).total_seconds()
+                    >= cadence_hours * 3600
+                )
+                if count <= int(settings.get("initial_retrain_settlements", 20)) or cadence_due:
                     self.models.evaluate_and_retrain(f"settlement: {ticker}")
 
     def _unreliable_current(self, market: dict[str, Any], reason: str) -> dict[str, Any]:
         summary = self._market_summary(market)
+        side = str(self.db.settings().get("selected_side", "YES"))
         summary["decision"] = Decision(
-            "NO TRADE", "DATA_UNRELIABLE", "Low", f"Data unreliable: {reason}",
-            None, None, None, None, None, None, 0, 0, 0, None,
+            "HOLD", "DATA_UNRELIABLE", "Low", f"Hold: {reason}",
+            None, None, None, None, None, None, 0, 0, 0, side,
         ).as_dict()
+        summary["selected_side"] = side
         summary["data_quality"] = {"reliable": False, "reason": reason}
         return summary
 
@@ -1052,6 +1107,13 @@ class AnalysisEngine:
                     limit_price = float(payload.get("limit_price_cents")) / 100
                 except (TypeError, ValueError) as exc:
                     raise ValueError("Enter a valid limit price in cents.") from exc
+            stop_loss_price = None
+            raw_stop = payload.get("stop_loss_cents")
+            if raw_stop not in (None, ""):
+                try:
+                    stop_loss_price = float(raw_stop) / 100
+                except (TypeError, ValueError) as exc:
+                    raise ValueError("Enter a valid stop-loss price in cents.") from exc
             order = self.paper.place_order(
                 ticker=str(current["ticker"]),
                 side=str(payload.get("side", "")),
@@ -1061,10 +1123,38 @@ class AnalysisEngine:
                 dollars=payload.get("dollars"),
                 contracts=payload.get("contracts"),
                 limit_price=limit_price,
+                stop_loss_price=stop_loss_price,
             )
             self.dashboard["paper"] = self._portfolio_summary()
             self._schedule_publish()
             return {"order": order, "portfolio": self.paper.portfolio()}
+
+    async def apply_settings(
+        self,
+        updates: dict[str, Any],
+        *,
+        restored_from_id: int | None = None,
+    ) -> dict[str, Any]:
+        async with self._update_lock:
+            previous_side = self.db.settings().get("selected_side")
+            settings = self.db.update_settings(
+                updates, restored_from_id=restored_from_id
+            )
+            if settings.get("selected_side") != previous_side:
+                self.paper.reset_automatic_confirmation()
+            self._refresh_cached_dashboard(iso_now())
+            return settings
+
+    async def restore_settings(self, snapshot_id: int) -> dict[str, Any]:
+        snapshot = self.db.fetch_one(
+            "SELECT settings_json FROM configuration_snapshots WHERE id=?",
+            (snapshot_id,),
+        )
+        if not snapshot:
+            raise ValueError("Configuration snapshot not found.")
+        return await self.apply_settings(
+            json.loads(snapshot["settings_json"]), restored_from_id=snapshot_id
+        )
 
     async def cancel_manual_paper_order(self, order_id: int) -> dict[str, Any]:
         async with self._update_lock:
@@ -1109,10 +1199,10 @@ class AnalysisEngine:
         if current:
             current = dict(current)
             current["decision"] = Decision(
-                "NO TRADE", "DATA_UNRELIABLE", "Low",
-                "Data unreliable: the most recent refresh failed.",
+                "HOLD", "DATA_UNRELIABLE", "Low",
+                "Hold: the most recent refresh failed.",
                 current.get("model_probability"), None, None, None, None, None,
-                0, 0, 0, None,
+                0, 0, 0, current.get("selected_side"),
             ).as_dict()
         self.dashboard = {
             **self.dashboard,
