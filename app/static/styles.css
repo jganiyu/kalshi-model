@@ -250,7 +250,8 @@ nav { display: grid; gap: 2px; }
 .chart-price-stat small { display: block; min-height: 15px; margin-top: 6px; overflow: hidden; color: var(--muted); font-family: var(--number-font); font-size: 10px; font-variant-numeric: tabular-nums; text-overflow: ellipsis; white-space: nowrap; }
 .chart-market-timer { display: flex; flex: 0 0 auto; align-items: center; gap: 5px; margin-top: 25px; color: var(--chart-line); font-family: var(--number-font); font-variant-numeric: tabular-nums; font-feature-settings: "case" 1, "ss04" 1, "tnum" 1, "lnum" 1; }
 .chart-market-timer strong { font-size: 16px; font-weight: 550; line-height: 1; }
-.chart-market-timer span { font-family: "Apple Symbols", "Arial Unicode MS", sans-serif; font-size: 16px; line-height: 1; }
+.chart-timer-icon { width: 15px; height: 15px; flex: 0 0 15px; overflow: visible; fill: none; stroke: currentColor; stroke-linecap: round; stroke-linejoin: round; stroke-width: 1.25; }
+.chart-timer-icon .chart-timer-sand { fill: currentColor; stroke: none; }
 .chart-tools { display: flex; min-width: 188px; align-items: flex-end; flex-direction: column; gap: 5px; }
 .chart-tools p, .chart-tools > span { max-width: 260px; margin: 0; overflow: hidden; color: var(--muted); font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
 .chart-tools > span { color: var(--faint); }
