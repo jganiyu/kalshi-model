@@ -13,10 +13,11 @@ fi
 ICON_SOURCE="app/static/icon-1024.png"
 ICON_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/kalshi-model-icon.XXXXXX")"
 SIGN_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/kalshi-model-sign.XXXXXX")"
+VERIFY_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/kalshi-model-verify.XXXXXX")"
 ICONSET="$ICON_ROOT/KalshiModel.iconset"
 ICON_FILE="build/KalshiModel.icns"
 mkdir -p "$ICONSET" build dist
-trap 'rm -rf "$ICON_ROOT" "$SIGN_ROOT"' EXIT
+trap 'rm -rf "$ICON_ROOT" "$SIGN_ROOT" "$VERIFY_ROOT"' EXIT
 
 sips -z 16 16 "$ICON_SOURCE" --out "$ICONSET/icon_16x16.png" >/dev/null
 sips -z 32 32 "$ICON_SOURCE" --out "$ICONSET/icon_16x16@2x.png" >/dev/null
@@ -52,13 +53,11 @@ codesign --force --deep --sign - "$SIGNED_BUNDLE"
 codesign --verify --deep --strict "$SIGNED_BUNDLE"
 
 mv "$APP_BUNDLE" "$SIGN_ROOT/unsigned.app"
-ditto --norsrc "$SIGNED_BUNDLE" "$APP_BUNDLE"
-xattr -cr "$APP_BUNDLE"
-codesign --verify --deep --strict "$APP_BUNDLE"
 
 ARCHIVE="dist/Kalshi-Model-macOS-$(uname -m).zip"
 rm -f "$ARCHIVE"
 ditto -c -k --sequesterRsrc --keepParent "$SIGNED_BUNDLE" "$ARCHIVE"
+ditto -x -k "$ARCHIVE" "$VERIFY_ROOT"
+codesign --verify --deep --strict "$VERIFY_ROOT/Kalshi Model.app"
 
-echo "Built: $PROJECT_DIR/dist/Kalshi Model.app"
-echo "Archive: $PROJECT_DIR/$ARCHIVE"
+echo "Signed archive: $PROJECT_DIR/$ARCHIVE"

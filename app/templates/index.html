@@ -15,7 +15,7 @@
       document.documentElement.dataset.themePreference = preference;
     })();
   </script>
-  <link rel="stylesheet" href="/static/styles.css?v=0.4.0">
+  <link rel="stylesheet" href="/static/styles.css?v=0.4.1">
 </head>
 <body>
   <div class="app-shell">
@@ -201,8 +201,8 @@
             </div>
             <div class="orderbook-table-wrap">
               <table class="orderbook-table recent-trades-table">
-                <thead><tr><th>Opened</th><th>Side</th><th>Price</th><th>Qty</th><th>Strategy</th><th>Result</th></tr></thead>
-                <tbody id="recent-paper-trades"><tr><td class="book-empty" colspan="6">No paper trades yet</td></tr></tbody>
+                <thead><tr><th>Opened</th><th>Side</th><th>Price</th><th>Qty</th><th>Strategy</th><th>Result</th><th>Available after</th></tr></thead>
+                <tbody id="recent-paper-trades"><tr><td class="book-empty" colspan="7">No paper trades yet</td></tr></tbody>
               </table>
             </div>
           </section>
@@ -257,7 +257,7 @@
         <section class="table-section">
           <div class="section-heading"><div><h3>Trade ledger</h3><p>Executable asks, fees, and settlement results</p></div><button class="secondary-button" id="run-backtest">Run backtest</button></div>
           <div id="backtest-result" class="inline-result" hidden></div>
-          <div class="table-wrap"><table><thead><tr><th>Opened</th><th>Contract</th><th>Side</th><th>Price</th><th>Contracts</th><th>Source</th><th>Edge</th><th>Status</th><th>P&amp;L</th></tr></thead><tbody id="trade-table"><tr><td colspan="9" class="empty-state">No paper trades yet.</td></tr></tbody></table></div>
+          <div class="table-wrap"><table><thead><tr><th>Opened</th><th>Contract</th><th>Side</th><th>Price</th><th>Contracts</th><th>Source</th><th>Edge</th><th>Status</th><th>P&amp;L</th><th>Available after</th></tr></thead><tbody id="trade-table"><tr><td colspan="10" class="empty-state">No paper trades yet.</td></tr></tbody></table></div>
         </section>
       </section>
 
@@ -318,6 +318,6 @@
     </main>
   </div>
   <div class="toast" id="toast" role="status" aria-live="polite" hidden><strong id="toast-title"></strong><span id="toast-detail"></span></div>
-  <script src="/static/app.js?v=0.4.0" defer></script>
+  <script src="/static/app.js?v=0.4.1" defer></script>
 </body>
 </html>

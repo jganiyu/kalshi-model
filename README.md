@@ -6,8 +6,8 @@ A local macOS research and paper-trading app for Kalshi's 15-minute Bitcoin Up o
 
 <table>
   <tr>
-    <td width="50%"><img src="docs/screenshots/dashboard-strategies-light-20260824.jpg" alt="Kalshi Model dashboard in light mode"></td>
-    <td width="50%"><img src="docs/screenshots/dashboard-strategies-dark-20260824.jpg" alt="Kalshi Model dashboard in dark mode"></td>
+    <td width="50%"><img src="docs/screenshots/dashboard-available-after-light-20260825.jpg" alt="Kalshi Model dashboard in light mode"></td>
+    <td width="50%"><img src="docs/screenshots/dashboard-available-after-dark-20260825.jpg" alt="Kalshi Model dashboard in dark mode"></td>
   </tr>
   <tr>
     <td align="center"><strong>Light</strong></td>
@@ -19,7 +19,7 @@ A local macOS research and paper-trading app for Kalshi's 15-minute Bitcoin Up o
 
 - **Dashboard:** Live BTC proxy, outcome forecast, side-specific order book, recent paper trades, and manual controls.
 - **BTC proxy:** Median Coinbase, Kraken, and Bitstamp price with learned BRTI uncertainty.
-- **Paper trading:** Manual orders plus standard-edge, early-threshold, and late-conviction strategies.
+- **Paper trading:** Manual and automatic strategies with available funds recorded after each transaction.
 - **Calibration:** Tune each strategy and review its results separately.
 - **Local data:** Settings, evidence, trades, snapshots, reports, and backups stay in SQLite on your Mac.
 
@@ -118,4 +118,4 @@ Requires macOS and Python 3.11 or newer; the app opens at [http://127.0.0.1:8765
 ./scripts/build_macos_app.sh
 ```
 
-The signed local app and ZIP are written to `dist/`.
+The signed ZIP is written to `dist/`.

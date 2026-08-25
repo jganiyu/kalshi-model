@@ -230,6 +230,46 @@ class PaperTradingService:
     def _order_commitment(price: float, contracts: int) -> float:
         return price * contracts + kalshi_fee(price, contracts)
 
+    def _available_cash_in_transaction(
+        self, connection: Any, starting_bankroll: float
+    ) -> float:
+        settled_row = connection.execute(
+            """
+            SELECT COALESCE(SUM(realized_pnl), 0) AS realized
+            FROM paper_trades WHERE status='settled'
+            """
+        ).fetchone()
+        sales_row = connection.execute(
+            """
+            SELECT COALESCE(SUM(realized_pnl), 0) AS realized
+            FROM paper_orders WHERE status='filled' AND action='SELL'
+            """
+        ).fetchone()
+        capital_row = connection.execute(
+            """
+            SELECT COALESCE(SUM(entry_cost + fees), 0) AS committed
+            FROM paper_trades WHERE status='open'
+            """
+        ).fetchone()
+        open_buys = connection.execute(
+            """
+            SELECT limit_price,requested_contracts FROM paper_orders
+            WHERE status='open' AND action='BUY'
+            """
+        ).fetchall()
+        reserved = sum(
+            self._order_commitment(float(row["limit_price"]), int(row["requested_contracts"]))
+            for row in open_buys
+            if row["limit_price"] is not None
+        )
+        return (
+            float(starting_bankroll)
+            + float(settled_row["realized"] or 0)
+            + float(sales_row["realized"] or 0)
+            - float(capital_row["committed"] or 0)
+            - reserved
+        )
+
     @staticmethod
     def executable_price(market: dict[str, Any], side: str, action: str) -> float | None:
         key = f"{side.lower()}_{'ask' if action == 'BUY' else 'bid'}"
@@ -407,13 +447,16 @@ class PaperTradingService:
         contracts = int(order["requested_contracts"])
         fees = kalshi_fee(price, contracts)
         filled_at = iso_now()
+        starting_bankroll = float(self.db.settings()["starting_bankroll"])
         with self.db.transaction() as connection:
             position_row = connection.execute(
                 "SELECT * FROM paper_trades WHERE ticker=? AND side=? AND status='open'",
                 (order["ticker"], order["side"]),
             ).fetchone()
             position = dict(position_row) if position_row else None
+            trade_id: int | None = int(position["id"]) if position else None
             realized_pnl = None
+            affected_entry_ids: list[int] = []
             if order["action"] == "BUY":
                 entry_cost = price * contracts
                 if position:
@@ -467,7 +510,7 @@ class PaperTradingService:
                     )
                     trade_id = int(cursor.lastrowid)
                 stop_loss = order.get("stop_loss_price")
-                connection.execute(
+                entry_cursor = connection.execute(
                     """
                     INSERT INTO paper_entries(
                         trade_id,order_id,ticker,side,opened_at,entry_price,
@@ -485,11 +528,12 @@ class PaperTradingService:
                         market.get("entry_reason"),
                     ),
                 )
+                affected_entry_ids.append(int(entry_cursor.lastrowid))
             else:
                 if not position or int(position["contracts"]) < contracts:
                     raise ValueError("The paper position no longer has enough contracts to sell.")
                 held = int(position["contracts"])
-                allocated_cost, allocated_entry_fees = self._consume_entries(
+                allocated_cost, allocated_entry_fees, affected_entry_ids = self._consume_entries(
                     connection,
                     ticker=str(order["ticker"]),
                     side=str(order["side"]),
@@ -538,6 +582,24 @@ class PaperTradingService:
                 """,
                 (price, contracts, fees, realized_pnl, filled_at, order["id"]),
             )
+            available_cash_after = self._available_cash_in_transaction(
+                connection, starting_bankroll
+            )
+            connection.execute(
+                "UPDATE paper_orders SET available_cash_after=? WHERE id=?",
+                (available_cash_after, order["id"]),
+            )
+            assert trade_id is not None
+            connection.execute(
+                "UPDATE paper_trades SET available_cash_after=? WHERE id=?",
+                (available_cash_after, trade_id),
+            )
+            if affected_entry_ids:
+                placeholders = ",".join("?" for _ in affected_entry_ids)
+                connection.execute(
+                    f"UPDATE paper_entries SET available_cash_after=? WHERE id IN ({placeholders})",
+                    (available_cash_after, *affected_entry_ids),
+                )
 
     @staticmethod
     def _consume_entries(
@@ -549,7 +611,7 @@ class PaperTradingService:
         closed_at: str,
         target_entry_id: int | None = None,
         stop_triggered: bool = False,
-    ) -> tuple[float, float]:
+    ) -> tuple[float, float, list[int]]:
         params: list[Any] = [ticker, side]
         where = "ticker=? AND side=? AND status='open' AND remaining_contracts>0"
         if target_entry_id is not None:
@@ -565,10 +627,12 @@ class PaperTradingService:
         remaining_to_sell = contracts
         allocated_cost = 0.0
         allocated_fees = 0.0
+        affected_entry_ids: list[int] = []
         for raw in rows:
             if remaining_to_sell <= 0:
                 break
             entry = dict(raw)
+            affected_entry_ids.append(int(entry["id"]))
             take = min(remaining_to_sell, int(entry["remaining_contracts"]))
             fraction = take / int(entry["initial_contracts"])
             allocated_cost += float(entry["entry_cost"]) * fraction
@@ -593,7 +657,7 @@ class PaperTradingService:
                     (left, entry["id"]),
                 )
             remaining_to_sell -= take
-        return allocated_cost, allocated_fees
+        return allocated_cost, allocated_fees, affected_entry_ids
 
     def process_open_orders(self, ticker: str, market: dict[str, Any]) -> int:
         orders = self.db.fetch_all(
@@ -1247,36 +1311,54 @@ class PaperTradingService:
         return result
 
     def settle(self, ticker: str, result: int, settled_at: str) -> int:
-        self.db.execute(
-            """
-            UPDATE paper_orders SET status='canceled',canceled_at=?,error='Market settled'
-            WHERE ticker=? AND status='open'
-            """,
-            (settled_at, ticker),
-        )
-        trades = self.db.fetch_all(
-            "SELECT * FROM paper_trades WHERE ticker = ? AND status = 'open'", (ticker,)
-        )
-        self.db.execute(
-            """
-            UPDATE paper_entries SET status='settled',remaining_contracts=0,
-                closed_at=?,stop_status=CASE
-                    WHEN stop_status='active' THEN 'settled' ELSE stop_status END
-            WHERE ticker=? AND status='open'
-            """,
-            (settled_at, ticker),
-        )
-        for trade in trades:
-            wins = (trade["side"] == "YES" and result == 1) or (
-                trade["side"] == "NO" and result == 0
-            )
-            payout = float(trade["contracts"]) if wins else 0.0
-            pnl = payout - float(trade["entry_cost"]) - float(trade["fees"])
-            self.db.execute(
+        starting_bankroll = float(self.db.settings()["starting_bankroll"])
+        with self.db.transaction() as connection:
+            connection.execute(
                 """
-                UPDATE paper_trades SET status='settled', settled_at=?, outcome=?,
-                    payout=?, realized_pnl=? WHERE id=?
+                UPDATE paper_orders SET status='canceled',canceled_at=?,error='Market settled'
+                WHERE ticker=? AND status='open'
                 """,
-                (settled_at, int(wins), payout, pnl, trade["id"]),
+                (settled_at, ticker),
             )
+            trade_rows = connection.execute(
+                "SELECT * FROM paper_trades WHERE ticker=? AND status='open'",
+                (ticker,),
+            ).fetchall()
+            trades = [dict(row) for row in trade_rows]
+            connection.execute(
+                """
+                UPDATE paper_entries SET status='settled',remaining_contracts=0,
+                    closed_at=?,stop_status=CASE
+                        WHEN stop_status='active' THEN 'settled' ELSE stop_status END
+                WHERE ticker=? AND status='open'
+                """,
+                (settled_at, ticker),
+            )
+            for trade in trades:
+                wins = (trade["side"] == "YES" and result == 1) or (
+                    trade["side"] == "NO" and result == 0
+                )
+                payout = float(trade["contracts"]) if wins else 0.0
+                pnl = payout - float(trade["entry_cost"]) - float(trade["fees"])
+                connection.execute(
+                    """
+                    UPDATE paper_trades SET status='settled',settled_at=?,outcome=?,
+                        payout=?,realized_pnl=? WHERE id=?
+                    """,
+                    (settled_at, int(wins), payout, pnl, trade["id"]),
+                )
+            if trades:
+                available_cash_after = self._available_cash_in_transaction(
+                    connection, starting_bankroll
+                )
+                trade_ids = [int(trade["id"]) for trade in trades]
+                placeholders = ",".join("?" for _ in trade_ids)
+                connection.execute(
+                    f"UPDATE paper_trades SET available_cash_after=? WHERE id IN ({placeholders})",
+                    (available_cash_after, *trade_ids),
+                )
+                connection.execute(
+                    f"UPDATE paper_entries SET available_cash_after=? WHERE trade_id IN ({placeholders})",
+                    (available_cash_after, *trade_ids),
+                )
         return len(trades)

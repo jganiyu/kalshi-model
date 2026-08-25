@@ -194,8 +194,9 @@ function renderRecentPaperTrades(trades) {
     <tr><td>${shortDate(trade.opened_at)}</td><td>${marketSideLabel(trade.side)}</td>
     <td>${cents(trade.entry_price)}</td><td>${trade.contracts}</td>
     <td>${String(trade.strategy || trade.source || "manual").replaceAll("_", " ")}</td>
-    <td class="${Number(trade.realized_pnl) > 0 ? "positive" : Number(trade.realized_pnl) < 0 ? "negative" : ""}">${String(trade.status || "open")}${trade.realized_pnl == null ? "" : ` · ${money(trade.realized_pnl)}`}</td></tr>
-  `).join("") : '<tr><td class="book-empty" colspan="6">No paper trades yet</td></tr>';
+    <td class="${Number(trade.realized_pnl) > 0 ? "positive" : Number(trade.realized_pnl) < 0 ? "negative" : ""}">${String(trade.status || "open")}${trade.realized_pnl == null ? "" : ` · ${money(trade.realized_pnl)}`}</td>
+    <td>${trade.available_cash_after == null ? "—" : money(trade.available_cash_after)}</td></tr>
+  `).join("") : '<tr><td class="book-empty" colspan="7">No paper trades yet</td></tr>';
 }
 
 function renderTradeAssessment() {
@@ -1117,8 +1118,9 @@ async function loadPaper() {
     <tr><td>${shortDate(trade.opened_at)}</td><td>${trade.ticker}</td><td>${marketSideLabel(trade.side)}</td>
     <td>${percent(trade.entry_price, 1)}</td><td>${trade.contracts}</td><td>${String(trade.strategy || trade.source || "automatic").replaceAll("_", " ").toUpperCase()}${(trade.entries || []).some((entry) => entry.stop_status === "active") ? " · STOP ACTIVE" : ""}</td><td>${points(trade.edge)}</td>
     <td><span class="status-pill ${trade.status}">${trade.status.toUpperCase()}</span></td>
-    <td class="${Number(trade.realized_pnl) > 0 ? "positive" : Number(trade.realized_pnl) < 0 ? "negative" : ""}">${trade.realized_pnl == null ? "--" : money(trade.realized_pnl)}</td></tr>
-  `).join("") : '<tr><td colspan="9" class="empty-state">No paper trades yet.</td></tr>';
+    <td class="${Number(trade.realized_pnl) > 0 ? "positive" : Number(trade.realized_pnl) < 0 ? "negative" : ""}">${trade.realized_pnl == null ? "--" : money(trade.realized_pnl)}</td>
+    <td>${trade.available_cash_after == null ? "—" : money(trade.available_cash_after)}</td></tr>
+  `).join("") : '<tr><td colspan="10" class="empty-state">No paper trades yet.</td></tr>';
 }
 
 function setPaperResetState({ confirming = false, resetting = false } = {}) {

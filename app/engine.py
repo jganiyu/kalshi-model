@@ -1318,6 +1318,7 @@ class AnalysisEngine:
                 "source": trade.get("source"),
                 "status": trade.get("status"),
                 "realized_pnl": trade.get("realized_pnl"),
+                "available_cash_after": trade.get("available_cash_after"),
             }
             for trade in portfolio.get("trades", [])[:8]
         ]

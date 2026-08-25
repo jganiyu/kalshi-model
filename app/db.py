@@ -365,6 +365,14 @@ MIGRATIONS: list[tuple[int, str]] = [
           );
         """,
     ),
+    (
+        8,
+        """
+        ALTER TABLE paper_orders ADD COLUMN available_cash_after REAL;
+        ALTER TABLE paper_entries ADD COLUMN available_cash_after REAL;
+        ALTER TABLE paper_trades ADD COLUMN available_cash_after REAL;
+        """,
+    ),
 ]
 
 
