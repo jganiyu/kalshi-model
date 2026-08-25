@@ -138,6 +138,7 @@ async def signal(signal_id: int) -> dict[str, Any]:
 async def calibration() -> dict[str, Any]:
     return {
         "summary": engine.calibration_summary(),
+        "strategy_results": engine.paper.strategy_results(),
         "reports": report_rows(db),
         "configuration_snapshots": db.configuration_snapshots(),
     }
@@ -224,6 +225,23 @@ def clean_settings_payload(payload: dict[str, Any]) -> dict[str, Any]:
         "automatic_entry_window_minutes": (0.25, 15.0),
         "automatic_confirmation_seconds": (1.0, 120.0),
         "automatic_buy_duration_pct": (0.50, 1.0),
+        "early_bankroll_pct": (0.0, 1.0),
+        "early_min_probability": (0.50, 0.99),
+        "early_min_net_ev": (0.0, 0.50),
+        "early_entry_window_seconds": (1.0, 300.0),
+        "early_threshold_stability_seconds": (0.0, 120.0),
+        "early_confirmation_seconds": (0.0, 120.0),
+        "early_max_spread": (0.0, 0.50),
+        "early_min_liquidity_contracts": (1, 1_000_000),
+        "late_bankroll_pct": (0.0, 1.0),
+        "late_max_seconds_remaining": (1.0, 900.0),
+        "late_min_probability": (0.50, 0.99),
+        "late_min_net_ev": (0.0, 0.50),
+        "late_confirmation_seconds": (0.0, 120.0),
+        "late_min_settlement_coverage": (0.0, 1.0),
+        "late_min_z_distance": (0.0, 20.0),
+        "late_max_spread": (0.0, 0.50),
+        "late_min_liquidity_contracts": (1, 1_000_000),
         "minimum_liquidity_contracts": (1, 1_000_000),
         "max_data_age_seconds": (1.0, 300.0),
         "max_exchange_dispersion_pct": (0.01, 5.0),
@@ -253,7 +271,8 @@ def clean_settings_payload(payload: dict[str, Any]) -> dict[str, Any]:
         "chart_window_minutes": (5, 360),
     }
     integer_settings = {
-        "minimum_liquidity_contracts", "minimum_exchange_feeds",
+        "minimum_liquidity_contracts", "early_min_liquidity_contracts",
+        "late_min_liquidity_contracts", "minimum_exchange_feeds",
         "closing_guard_seconds", "confidence_high_min_samples",
         "training_min_samples", "benchmark_calibration_min_samples",
         "training_history_days", "benchmark_history_samples", "training_max_samples",
@@ -285,7 +304,10 @@ def clean_settings_payload(payload: dict[str, Any]) -> dict[str, Any]:
             if key in integer_settings and not number.is_integer():
                 raise HTTPException(status_code=422, detail=f"{key} must be a whole number")
             cleaned[key] = int(number) if key in integer_settings else number
-        elif key in {"paper_trading_enabled", "risk_controls_enabled"}:
+        elif key in {
+            "paper_trading_enabled", "risk_controls_enabled",
+            "early_threshold_enabled", "late_conviction_enabled",
+        }:
             if not isinstance(value, bool):
                 raise HTTPException(status_code=422, detail=f"{key} must be true or false")
             cleaned[key] = value
@@ -346,7 +368,7 @@ async def database_info() -> dict[str, Any]:
     for table in (
         "btc_ticks", "markets", "signal_snapshots", "settlements", "paper_trades",
         "paper_orders",
-        "paper_entries", "configuration_snapshots",
+        "paper_entries", "threshold_observations", "configuration_snapshots",
         "calibration_reports", "model_versions",
     ):
         counts[table] = db.fetch_one(f"SELECT COUNT(*) AS count FROM {table}")["count"]

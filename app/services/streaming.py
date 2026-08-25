@@ -287,6 +287,15 @@ class KalshiWebSocketFeed:
                     }
                 )
             )
+            await websocket.send(
+                json.dumps(
+                    {
+                        "id": 2,
+                        "cmd": "subscribe",
+                        "params": {"channels": ["market_lifecycle_v2"]},
+                    }
+                )
+            )
             await self.on_status("Kalshi", True, None)
             book = KalshiOrderBook()
             last_sequence: int | None = None
@@ -314,4 +323,6 @@ class KalshiWebSocketFeed:
                         await self.on_message(message, book.metrics())
                         last_book_emit = now
                 elif message_type == "ticker":
+                    await self.on_message(message, None)
+                elif message_type in {"market_lifecycle", "market_lifecycle_v2"}:
                     await self.on_message(message, None)

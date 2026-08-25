@@ -332,6 +332,39 @@ MIGRATIONS: list[tuple[int, str]] = [
         ALTER TABLE signal_snapshots ADD COLUMN forecast_explanation TEXT;
         """,
     ),
+    (
+        7,
+        """
+        ALTER TABLE paper_orders ADD COLUMN strategy TEXT;
+        ALTER TABLE paper_entries ADD COLUMN strategy TEXT;
+        ALTER TABLE paper_entries ADD COLUMN model_probability REAL;
+        ALTER TABLE paper_entries ADD COLUMN expected_value REAL;
+        ALTER TABLE paper_entries ADD COLUMN entry_reason TEXT;
+        ALTER TABLE paper_trades ADD COLUMN strategy TEXT;
+
+        CREATE TABLE threshold_observations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ticker TEXT NOT NULL,
+            threshold REAL NOT NULL,
+            observed_at TEXT NOT NULL,
+            market_status TEXT,
+            open_time TEXT,
+            source TEXT NOT NULL,
+            event_type TEXT NOT NULL,
+            revision INTEGER NOT NULL,
+            changed INTEGER NOT NULL
+        );
+        CREATE INDEX idx_threshold_observations_ticker_time
+            ON threshold_observations(ticker, observed_at);
+
+        UPDATE settings SET value_json='0.03', updated_at=strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+        WHERE key='max_risk_per_trade_pct' AND value_json='0.02'
+          AND NOT EXISTS (
+              SELECT 1 FROM configuration_snapshots
+              WHERE changed_json LIKE '%"max_risk_per_trade_pct"%'
+          );
+        """,
+    ),
 ]
 
 

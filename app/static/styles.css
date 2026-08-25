@@ -252,7 +252,7 @@ nav { display: grid; gap: 2px; }
 .chart-price-stat small { display: block; min-height: 15px; margin-top: 6px; overflow: hidden; color: var(--muted); font-family: var(--number-font); font-size: 10px; font-variant-numeric: tabular-nums; text-overflow: ellipsis; white-space: nowrap; }
 .chart-market-timer { display: flex; flex: 0 0 auto; align-items: center; gap: 5px; margin-top: 25px; color: var(--chart-line); font-family: var(--number-font); font-variant-numeric: tabular-nums; font-feature-settings: "case" 1, "ss04" 1, "tnum" 1, "lnum" 1; }
 .chart-market-timer strong { font-size: 16px; font-weight: 550; line-height: 1; }
-.chart-timer-icon { width: 15px; height: 15px; flex: 0 0 15px; overflow: visible; fill: none; stroke: currentColor; stroke-linecap: round; stroke-linejoin: round; stroke-width: 1.25; }
+.chart-timer-icon { width: 15px; height: 15px; flex: 0 0 15px; overflow: visible; transform: translateY(-1px); fill: none; stroke: currentColor; stroke-linecap: round; stroke-linejoin: round; stroke-width: 1.25; }
 .chart-timer-icon .chart-timer-sand { fill: currentColor; stroke: none; }
 .chart-tools { display: flex; min-width: 188px; align-items: flex-end; flex-direction: column; gap: 5px; }
 .chart-tools p, .chart-tools > span { max-width: 260px; margin: 0; overflow: hidden; color: var(--muted); font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
@@ -289,6 +289,15 @@ nav { display: grid; gap: 2px; }
 .orderbook-table th:last-child { width: 30%; }
 .orderbook-table td { height: 29px; padding: 0 11px; border-top: 1px solid color-mix(in srgb, var(--line) 74%, transparent); text-align: right; }
 .orderbook-table td:first-child { text-align: left; }
+.recent-trades-table { font-size: 9px; }
+.recent-trades-table th, .recent-trades-table td { padding-right: 8px; padding-left: 8px; }
+.recent-trades-table th:first-child { width: 25%; }
+.recent-trades-table th:nth-child(2) { width: 10%; }
+.recent-trades-table th:nth-child(3) { width: 12%; }
+.recent-trades-table th:nth-child(4) { width: 9%; }
+.recent-trades-table th:nth-child(5) { width: 25%; }
+.recent-trades-table th:last-child { width: 19%; }
+.recent-trades-table td { text-transform: capitalize; }
 .book-row { background: linear-gradient(to left, color-mix(in srgb, var(--book-color) 9%, transparent) 0 var(--depth), transparent var(--depth) 100%); }
 .book-row.book-ask { --book-color: var(--red); }
 .book-row.book-bid { --book-color: var(--green); }
@@ -313,9 +322,10 @@ nav { display: grid; gap: 2px; }
 .trade-assessment-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 8px; }
 .trade-assessment-heading strong { font-size: 10px; font-weight: 720; }
 .trade-assessment-heading span { color: var(--muted); font-size: 8px; }
-.trade-assessment-grid { display: grid; grid-template-columns: 1.3fr .9fr .75fr 1fr 1.25fr; }
+.trade-assessment-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); row-gap: 8px; }
 .trade-assessment-grid div { min-width: 0; padding: 0 6px; border-left: 1px solid var(--line); }
 .trade-assessment-grid div:first-child { padding-left: 0; border-left: 0; }
+.trade-assessment-grid div:nth-child(5) { padding-left: 0; border-left: 0; }
 .trade-assessment-grid span, .trade-assessment-grid strong { display: block; overflow: hidden; text-overflow: ellipsis; }
 .trade-assessment-grid span { min-height: 16px; margin-bottom: 4px; color: var(--muted); font-size: 7px; line-height: 1.15; text-transform: uppercase; }
 .trade-assessment-grid strong { white-space: nowrap; }
@@ -450,6 +460,13 @@ nav { display: grid; gap: 2px; }
 .calibration-results .report-item { border: 0; border-top: 1px solid var(--line); border-radius: 0; background: transparent; }
 .calibration-results .report-item summary { display: grid; grid-template-columns: 1fr; gap: 4px; padding: 10px 0; }
 .calibration-results .report-body { padding: 0 0 12px; }
+.strategy-results { display: grid; gap: 3px; margin-top: 12px; }
+.strategy-result-row { display: grid; grid-template-columns: minmax(0, 1fr) repeat(2, auto); align-items: center; gap: 12px; padding: 9px 0; border-top: 1px solid var(--line); }
+.strategy-result-row:first-child { border-top: 0; }
+.strategy-result-row strong, .strategy-result-row small { display: block; }
+.strategy-result-row strong { font-size: 10px; }
+.strategy-result-row small { margin-top: 2px; color: var(--muted); font-size: 8px; }
+.strategy-result-row > span:not(:first-child) { color: var(--muted); font-family: var(--number-font); font-size: 9px; text-align: right; }
 
 .read-only-badge { padding: 6px 8px; border: 1px solid color-mix(in srgb, var(--green) 35%, var(--line)); border-radius: 5px; color: var(--green); background: var(--green-soft); font-size: 9px; font-weight: 750; }
 .paper-page-actions { display: flex; align-items: center; gap: 8px; }

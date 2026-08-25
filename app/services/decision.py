@@ -32,6 +32,84 @@ class Decision:
         return asdict(self)
 
 
+def make_trade_assessment(
+    *,
+    up_probability: float | None,
+    market: dict[str, Any],
+    settings: dict[str, Any],
+    side: str,
+    data_quality: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Return action-specific economics without choosing a trading action."""
+    normalized_side = "NO" if str(side).upper() == "NO" else "YES"
+    probability = (
+        None
+        if up_probability is None
+        else float(up_probability)
+        if normalized_side == "YES"
+        else 1.0 - float(up_probability)
+    )
+    bid = market.get(f"{normalized_side.lower()}_bid")
+    ask = market.get(f"{normalized_side.lower()}_ask")
+    bid_value = float(bid) if bid is not None else None
+    ask_value = float(ask) if ask is not None else None
+    implied = market_probability(bid_value, ask_value)
+    slippage = float(settings.get("slippage_cents", 0.5)) / 100
+
+    def action_values(action: str) -> dict[str, Any]:
+        raw_price = ask_value if action == "BUY" else bid_value
+        if raw_price is None or probability is None:
+            return {
+                "action": action,
+                "executable_price": None,
+                "raw_price": raw_price,
+                "fee_per_contract": None,
+                "slippage": slippage,
+                "net_edge": None,
+                "expected_value": None,
+            }
+        executable = (
+            min(0.999, raw_price + slippage)
+            if action == "BUY"
+            else max(0.001, raw_price - slippage)
+        )
+        fee = kalshi_fee(executable)
+        net = (
+            probability - executable - fee
+            if action == "BUY"
+            else executable - fee - probability
+        )
+        return {
+            "action": action,
+            "executable_price": executable,
+            "raw_price": raw_price,
+            "fee_per_contract": fee,
+            "slippage": slippage,
+            "net_edge": net,
+            "expected_value": net,
+        }
+
+    quality = data_quality or {}
+    return {
+        "side": normalized_side,
+        "model_probability": probability,
+        "market_probability": implied,
+        "spread": (
+            max(0.0, ask_value - bid_value)
+            if ask_value is not None and bid_value is not None
+            else None
+        ),
+        "ask_size": market.get(f"{normalized_side.lower()}_ask_size"),
+        "data_reliable": bool(quality.get("reliable", False)),
+        "trade_allowed": bool(
+            quality.get("reliable", False) and quality.get("trade_allowed", True)
+        ),
+        "quality_reason": quality.get("reason"),
+        "buy": action_values("BUY"),
+        "sell": action_values("SELL"),
+    }
+
+
 def make_decision(
     *,
     model_probability: float | None,
@@ -178,7 +256,7 @@ def make_decision(
         price=buy_price,
         fractional_kelly=float(settings.get("fractional_kelly", 0.25)),
         max_position_pct=float(settings.get("max_position_pct", 0.05)),
-        max_risk_pct=float(settings.get("max_risk_per_trade_pct", 0.02)),
+        max_risk_pct=float(settings.get("max_risk_per_trade_pct", 0.03)),
         available_contracts=available,
     )
     if sizing.contracts < 1:

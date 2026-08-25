@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import inspect
 
 import pytest
 from cryptography.hazmat.primitives import hashes, serialization
@@ -8,7 +9,19 @@ from cryptography.hazmat.primitives.asymmetric import padding, rsa
 
 from app.engine import AnalysisEngine
 from app.services.market_data import ExchangeQuote, live_composite_quote
-from app.services.streaming import KalshiOrderBook, kalshi_websocket_headers
+from app.services.streaming import (
+    BitcoinWebSocketFeeds,
+    KalshiOrderBook,
+    KalshiWebSocketFeed,
+    kalshi_websocket_headers,
+)
+
+
+def test_lifecycle_subscription_is_on_kalshi_not_bitcoin_stream() -> None:
+    assert "market_lifecycle_v2" in inspect.getsource(KalshiWebSocketFeed._connection)
+    assert "market_lifecycle_v2" not in inspect.getsource(
+        BitcoinWebSocketFeeds._coinbase_connection
+    )
 
 
 def test_kalshi_websocket_headers_sign_expected_message(tmp_path) -> None:

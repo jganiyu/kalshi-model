@@ -6,8 +6,8 @@ A local macOS research and paper-trading app for Kalshi's 15-minute Bitcoin Up o
 
 <table>
   <tr>
-    <td width="50%"><img src="docs/screenshots/dashboard-forecast-light.jpg" alt="Kalshi Model dashboard in light mode"></td>
-    <td width="50%"><img src="docs/screenshots/dashboard-forecast-dark.jpg" alt="Kalshi Model dashboard in dark mode"></td>
+    <td width="50%"><img src="docs/screenshots/dashboard-strategies-light-20260824.jpg" alt="Kalshi Model dashboard in light mode"></td>
+    <td width="50%"><img src="docs/screenshots/dashboard-strategies-dark-20260824.jpg" alt="Kalshi Model dashboard in dark mode"></td>
   </tr>
   <tr>
     <td align="center"><strong>Light</strong></td>
@@ -17,10 +17,10 @@ A local macOS research and paper-trading app for Kalshi's 15-minute Bitcoin Up o
 
 ## Features
 
-- **Dashboard:** Live BTC proxy, outcome forecast, Kalshi contract, chart, order books, and paper controls.
+- **Dashboard:** Live BTC proxy, outcome forecast, side-specific order book, recent paper trades, and manual controls.
 - **BTC proxy:** Median Coinbase, Kraken, and Bitstamp price with learned BRTI uncertainty.
-- **Paper trading:** Manual, limit, and confirmed automatic entries with per-entry stop-losses.
-- **Calibration:** Tune decision, automation, risk, data-quality, and promotion rules in one place.
+- **Paper trading:** Manual orders plus standard-edge, early-threshold, and late-conviction strategies.
+- **Calibration:** Tune each strategy and review its results separately.
 - **Local data:** Settings, evidence, trades, snapshots, reports, and backups stay in SQLite on your Mac.
 
 ## Outcome forecast
@@ -34,11 +34,11 @@ A local macOS research and paper-trading app for Kalshi's 15-minute Bitcoin Up o
 
 ## Calibration
 
-![Calibration page](docs/screenshots/calibration.jpg)
+![Calibration page](docs/screenshots/calibration-strategies-20260824.jpg)
 
 - Apply saves one auditable configuration snapshot; Discard and Restore are reversible.
 - Results show settled samples, Brier score, and calibration in 10-point probability ranges.
-- Automatic entries require a valid sustained trade decision; the outcome forecast never opens a position by itself.
+- Automatic entries still require a valid price, positive Buy EV, confirmation, liquidity, and risk approval.
 
 ## Kalshi credentials
 
@@ -64,11 +64,11 @@ KALSHI_PRIVATE_KEY_PATH=/absolute/path/to/your-private-key.pem
 
 ## How the model works
 
-Think of the model as answering two separate questions: **What is likely to happen?** and **Is the contract worth its price?**
+The app answers two separate questions: **What is likely to happen?** and **Is the contract worth its price?**
 
 ### Outcome forecast
 
-The model combines live Bitcoin prices, distance from the threshold, time remaining, volatility, momentum, and past settlement behavior to estimate the chance of Up.
+It combines live Bitcoin prices, threshold distance, time, volatility, momentum, and settlement history to estimate the chance of Up.
 
 - **Likely Up:** 60% or higher.
 - **Uncertain:** Between 40% and 60%.
@@ -76,22 +76,21 @@ The model combines live Bitcoin prices, distance from the threshold, time remain
 
 ### Trade assessment
 
-The app then compares that probability with the contract's available price after estimated fees and slippage.
+It then compares that probability with the selected Buy or Sell price after fees and slippage; a likely outcome can still be overpriced.
 
-A likely outcome can still be overpriced, while an unlikely outcome can be underpriced; selecting Up or Down never changes the forecast.
+### Paper strategies
 
-### Safety and learning
+- **Standard edge:** Waits for a strong, sustained pricing advantage.
+- **Early threshold:** Uses a threshold seen before opening, but enters only if the opening ask still offers positive EV.
+- **Late conviction:** Buys a highly likely outcome near settlement only when Buy EV remains positive.
 
-Automatic paper entries require a valid price, enough win probability and edge, signal confirmation, liquidity, and risk approval.
+Only one automatic strategy may enter each market, and early threshold takes priority over standard edge and late conviction.
 
-Calibration tracks how often each probability range was correct, and a trained model replaces the baseline only after proving more accurate on settled markets.
+### Risk and learning
 
-### Using it well
+Every entry remains simulated and must pass cash, liquidity, exposure, drawdown, and confirmation checks.
 
-- Separate forecast from price: a likely outcome can be a bad trade, while an unlikely outcome can be underpriced.
-- Treat probability as uncertainty, not certainty; even a well-calibrated 70% forecast should lose about 3 times in 10.
-- Judge the model across many settled markets, not a short winning or losing streak.
-- Paper trade new settings before relying on them.
+Calibration compares predicted probabilities with settled outcomes and reports each strategy separately; judge results across many markets, not a short streak.
 
 ## Download
 

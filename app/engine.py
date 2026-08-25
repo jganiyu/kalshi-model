@@ -26,7 +26,12 @@ from app.domain import (
     settlement_probability,
 )
 from app.services.bootstrap import HistoricalBootstrapService
-from app.services.decision import Decision, make_decision, material_change
+from app.services.decision import (
+    Decision,
+    make_decision,
+    make_trade_assessment,
+    material_change,
+)
 from app.services.forecast import Forecast, forecast_label, make_forecast
 from app.services.kalshi import (
     KalshiPublicClient,
@@ -250,6 +255,9 @@ class AnalysisEngine:
         if current_market and btc_state.get("price") and market_strike(current_market):
             ticker = str(current_market["ticker"])
             self._save_market(current_market, observed_at)
+            self._record_threshold_observation(
+                current_market, observed_at, source="REST", event_type="poll"
+            )
             orderbook_payload = await self.kalshi.orderbook(ticker)
             market_state = self._save_kalshi_snapshot(
                 current_market, orderbook_payload, observed_at
@@ -265,6 +273,9 @@ class AnalysisEngine:
         elif current_market:
             self._market_state = None
             self._save_market(current_market, observed_at)
+            self._record_threshold_observation(
+                current_market, observed_at, source="REST", event_type="poll"
+            )
             reason = (
                 "The contract threshold is missing from the Kalshi response."
                 if not market_strike(current_market)
@@ -280,6 +291,9 @@ class AnalysisEngine:
 
         if next_market:
             self._save_market(next_market, observed_at)
+            self._record_threshold_observation(
+                next_market, observed_at, source="REST", event_type="poll"
+            )
         if time.monotonic() - self._last_settlement_check >= 30:
             await self._check_pending_settlements()
             self._last_settlement_check = time.monotonic()
@@ -409,6 +423,10 @@ class AnalysisEngine:
     async def _handle_kalshi_message(
         self, message: dict[str, Any], book_metrics: dict[str, Any] | None
     ) -> None:
+        message_type = str(message.get("type") or "")
+        if message_type in {"market_lifecycle", "market_lifecycle_v2"}:
+            await self._handle_market_lifecycle(message)
+            return
         if not self._current_market:
             return
         payload = message.get("msg") or {}
@@ -446,6 +464,81 @@ class AnalysisEngine:
                 self._market_state = self._ticker_market_state(
                     self._current_market, self._market_state
                 )
+        self._schedule_live_refresh()
+
+    async def _handle_market_lifecycle(self, message: dict[str, Any]) -> None:
+        payload = message.get("msg") or {}
+        ticker = str(payload.get("market_ticker") or payload.get("ticker") or "")
+        if not ticker:
+            return
+        observed_at = iso_now()
+        async with self._update_lock:
+            market = None
+            for candidate in (self._current_market, self._next_market):
+                if candidate and str(candidate.get("ticker")) == ticker:
+                    market = candidate
+                    break
+            additional = payload.get("additional_metadata") or {}
+            floor_strike = payload.get("floor_strike", additional.get("floor_strike"))
+            if (
+                market is None
+                and ticker.startswith(self.config.kalshi_series)
+                and floor_strike is not None
+            ):
+                def timestamp(value: Any) -> str | None:
+                    try:
+                        return datetime.fromtimestamp(float(value), UTC).isoformat()
+                    except (TypeError, ValueError, OSError):
+                        return None
+
+                market = {
+                    "ticker": ticker,
+                    "event_ticker": additional.get("event_ticker"),
+                    "status": "initialized",
+                    "title": additional.get("title") or additional.get("name"),
+                    "floor_strike": floor_strike,
+                    "open_time": timestamp(payload.get("open_ts")),
+                    "close_time": timestamp(payload.get("close_ts")),
+                    "expected_expiration_time": timestamp(
+                        additional.get("expected_expiration_ts")
+                    ),
+                    "rules_primary": additional.get("rules_primary"),
+                    "rules_secondary": additional.get("rules_secondary"),
+                }
+                new_open = parse_time(market.get("open_time"))
+                existing_open = parse_time(
+                    self._next_market.get("open_time") if self._next_market else None
+                )
+                if self._next_market is None or (
+                    new_open is not None
+                    and (existing_open is None or new_open < existing_open)
+                ):
+                    self._next_market = market
+            if market is None:
+                return
+            if floor_strike is not None:
+                market["floor_strike"] = floor_strike
+            if payload.get("status") is not None:
+                market["status"] = payload["status"]
+            else:
+                lifecycle_status = {
+                    "created": "initialized",
+                    "activated": "active",
+                    "deactivated": "inactive",
+                    "determined": "determined",
+                    "settled": "finalized",
+                }.get(str(payload.get("event_type") or ""))
+                if lifecycle_status:
+                    market["status"] = lifecycle_status
+            self._save_market(market, observed_at)
+            self._record_threshold_observation(
+                market,
+                observed_at,
+                source="WEBSOCKET",
+                event_type=str(payload.get("event_type") or "lifecycle"),
+            )
+            if self._next_market is market:
+                self.dashboard["next"] = self._market_summary(market)
         self._schedule_live_refresh()
 
     @staticmethod
@@ -692,6 +785,76 @@ class AnalysisEngine:
             ),
         )
 
+    def _record_threshold_observation(
+        self,
+        market: dict[str, Any],
+        observed_at: str,
+        *,
+        source: str,
+        event_type: str,
+    ) -> dict[str, Any] | None:
+        threshold = market_strike(market)
+        ticker = market.get("ticker")
+        if threshold is None or not ticker:
+            return None
+        latest = self.db.fetch_one(
+            """
+            SELECT * FROM threshold_observations
+            WHERE ticker=? ORDER BY revision DESC,id DESC LIMIT 1
+            """,
+            (str(ticker),),
+        )
+        changed = bool(
+            latest is not None
+            and not math.isclose(
+                float(latest["threshold"]), float(threshold), rel_tol=0.0, abs_tol=1e-9
+            )
+        )
+        if latest is None or changed:
+            self.db.execute(
+                """
+                INSERT INTO threshold_observations(
+                    ticker,threshold,observed_at,market_status,open_time,
+                    source,event_type,revision,changed
+                ) VALUES (?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    str(ticker), float(threshold), observed_at, market.get("status"),
+                    market.get("open_time"), source, event_type,
+                    int(latest["revision"]) + 1 if latest else 1,
+                    int(changed),
+                ),
+            )
+        return self._threshold_state(str(ticker))
+
+    def _threshold_state(self, ticker: str) -> dict[str, Any] | None:
+        first = self.db.fetch_one(
+            """
+            SELECT * FROM threshold_observations
+            WHERE ticker=? ORDER BY revision ASC,id ASC LIMIT 1
+            """,
+            (ticker,),
+        )
+        latest = self.db.fetch_one(
+            """
+            SELECT * FROM threshold_observations
+            WHERE ticker=? ORDER BY revision DESC,id DESC LIMIT 1
+            """,
+            (ticker,),
+        )
+        if not first or not latest:
+            return None
+        return {
+            "ticker": ticker,
+            "threshold": float(latest["threshold"]),
+            "first_observed_at": first["observed_at"],
+            "latest_observed_at": latest["observed_at"],
+            "revision": int(latest["revision"]),
+            "changed": bool(latest["changed"]),
+            "source": latest["source"],
+            "event_type": latest["event_type"],
+        }
+
     def _save_kalshi_snapshot(
         self,
         market: dict[str, Any],
@@ -825,12 +988,15 @@ class AnalysisEngine:
         calibration = self.calibration_summary()
         portfolio = self.paper.portfolio()
         selected_side = str(settings.get("selected_side", "YES"))
-        held_contracts = sum(
-            int(position["contracts"])
-            for position in portfolio.get("positions", [])
-            if position["ticker"] == market["ticker"]
-            and position["side"] == selected_side
-        )
+        held_by_side = {
+            side: sum(
+                int(position["contracts"])
+                for position in portfolio.get("positions", [])
+                if position["ticker"] == market["ticker"]
+                and position["side"] == side
+            )
+            for side in ("YES", "NO")
+        }
         quality = self._data_quality(
             btc,
             market_state,
@@ -841,17 +1007,31 @@ class AnalysisEngine:
             benchmark_uncertainty_pct=benchmark_uncertainty,
             settlement_window=settlement_window,
         )
-        decision = make_decision(
-            model_probability=probability,
-            market=market_state,
-            settings=settings,
-            bankroll=portfolio["available_cash"],
-            data_quality=quality,
-            calibration=calibration,
-            model_variant_spread=variant_spread,
-            selected_side=selected_side,
-            held_contracts=held_contracts,
-        )
+        decisions = {
+            side: make_decision(
+                model_probability=probability,
+                market=market_state,
+                settings=settings,
+                bankroll=portfolio["available_cash"],
+                data_quality=quality,
+                calibration=calibration,
+                model_variant_spread=variant_spread,
+                selected_side=side,
+                held_contracts=held_by_side[side],
+            )
+            for side in ("YES", "NO")
+        }
+        assessments = {
+            side: make_trade_assessment(
+                up_probability=probability,
+                market=market_state,
+                settings=settings,
+                side=side,
+                data_quality=quality,
+            )
+            for side in ("YES", "NO")
+        }
+        decision = decisions.get(selected_side, decisions["YES"])
         previous = self.db.fetch_one(
             "SELECT * FROM signal_snapshots WHERE ticker=? ORDER BY id DESC LIMIT 1",
             (market["ticker"],),
@@ -893,10 +1073,18 @@ class AnalysisEngine:
                     "detail": forecast.explanation,
                     "signal_id": signal_id,
                 }
-        automatic_entry = self.paper.consider_automatic_entry(
+        threshold_state = self._threshold_state(str(market["ticker"]))
+        automatic_entry = self.paper.consider_strategies(
             ticker=str(market["ticker"]),
-            decision=decision,
+            assessments=assessments,
+            standard_decisions=decisions,
             seconds_remaining=seconds_remaining,
+            market_status=market.get("status"),
+            market_open_time=market.get("open_time"),
+            market_observed_at=market_state.get("observed_at"),
+            threshold_state=threshold_state,
+            settlement_window=settlement_window,
+            z_distance=baseline.z_distance,
             model_version=model_version,
         )
         summary = self._market_summary(market)
@@ -921,6 +1109,11 @@ class AnalysisEngine:
                 "forecast": forecast.as_dict(),
                 "trade_decision": decision.as_dict(),
                 "decision": decision.as_dict(),
+                "trade_decisions": {
+                    side: value.as_dict() for side, value in decisions.items()
+                },
+                "trade_assessments": assessments,
+                "threshold_state": threshold_state,
                 "automatic_entry": automatic_entry,
             }
         )
@@ -1108,11 +1301,27 @@ class AnalysisEngine:
 
     def _portfolio_summary(self) -> dict[str, Any]:
         portfolio = self.paper.portfolio()
-        return {
+        summary = {
             key: value
             for key, value in portfolio.items()
             if key not in {"trades", "orders"}
         }
+        summary["recent_paper_trades"] = [
+            {
+                "id": trade.get("id"),
+                "opened_at": trade.get("opened_at"),
+                "ticker": trade.get("ticker"),
+                "side": trade.get("side"),
+                "entry_price": trade.get("entry_price"),
+                "contracts": trade.get("contracts"),
+                "strategy": trade.get("strategy") or trade.get("source"),
+                "source": trade.get("source"),
+                "status": trade.get("status"),
+                "realized_pnl": trade.get("realized_pnl"),
+            }
+            for trade in portfolio.get("trades", [])[:8]
+        ]
+        return summary
 
     async def place_manual_paper_order(self, payload: dict[str, Any]) -> dict[str, Any]:
         async with self._update_lock:
@@ -1160,12 +1369,9 @@ class AnalysisEngine:
         restored_from_id: int | None = None,
     ) -> dict[str, Any]:
         async with self._update_lock:
-            previous_side = self.db.settings().get("selected_side")
             settings = self.db.update_settings(
                 updates, restored_from_id=restored_from_id
             )
-            if settings.get("selected_side") != previous_side:
-                self.paper.reset_automatic_confirmation()
             self._refresh_cached_dashboard(iso_now())
             return settings
 

@@ -7,7 +7,7 @@ from datetime import date
 from typing import Any
 
 from app.db import Database
-from app.domain import iso_now, kalshi_fee
+from app.domain import iso_now, kalshi_fee, parse_time
 from app.services.decision import Decision
 
 
@@ -19,6 +19,7 @@ class PaperTradingService:
         self._automatic_last_at: float | None = None
         self._automatic_last_buy = False
         self._automatic_segments: deque[tuple[float, float, bool]] = deque()
+        self._strategy_states: dict[str, dict[str, Any]] = {}
 
     def portfolio(self) -> dict[str, Any]:
         settings = self.db.settings()
@@ -131,7 +132,7 @@ class PaperTradingService:
             "risk_controls_enabled": bool(settings.get("risk_controls_enabled", True)),
             "max_position_pct": float(settings.get("max_position_pct", 0.05)),
             "max_risk_per_trade_pct": float(
-                settings.get("max_risk_per_trade_pct", 0.02)
+                settings.get("max_risk_per_trade_pct", 0.03)
             ),
             "max_session_drawdown_pct": float(
                 settings.get("max_session_drawdown_pct", 0.10)
@@ -139,6 +140,7 @@ class PaperTradingService:
             "selected_side": settings.get("selected_side", "YES"),
             "default_stop_loss_cents": settings.get("default_stop_loss_cents"),
             "active_stop_losses": active_stops,
+            "strategy_results": self.strategy_results(),
             "trades": [
                 {
                     **trade,
@@ -173,6 +175,56 @@ class PaperTradingService:
                 for trade in open_trades
             ],
         }
+
+    def strategy_results(self) -> dict[str, dict[str, Any]]:
+        rows = self.db.fetch_all(
+            """
+            SELECT e.*,t.outcome,t.status AS trade_status
+            FROM paper_entries e
+            JOIN paper_trades t ON t.id=e.trade_id
+            WHERE e.strategy IN ('STANDARD_EDGE','EARLY_THRESHOLD','LATE_CONVICTION')
+            ORDER BY e.id ASC
+            """
+        )
+        results: dict[str, dict[str, Any]] = {}
+        for strategy in ("STANDARD_EDGE", "EARLY_THRESHOLD", "LATE_CONVICTION"):
+            entries = [row for row in rows if row.get("strategy") == strategy]
+            settled = [row for row in entries if row.get("status") == "settled"]
+            wins = sum(
+                1
+                for row in settled
+                if (row.get("side") == "YES") == (int(row.get("outcome") or 0) == 1)
+            )
+            realized = 0.0
+            for row in settled:
+                won = (row.get("side") == "YES") == (int(row.get("outcome") or 0) == 1)
+                payout = float(row.get("initial_contracts") or 0) if won else 0.0
+                realized += payout - float(row.get("entry_cost") or 0) - float(
+                    row.get("entry_fees") or 0
+                )
+            closed_ids = [int(row["id"]) for row in entries if row.get("status") == "closed"]
+            if closed_ids:
+                placeholders = ",".join("?" for _ in closed_ids)
+                exits = self.db.fetch_all(
+                    f"SELECT realized_pnl FROM paper_orders WHERE entry_id IN ({placeholders}) AND status='filled'",
+                    closed_ids,
+                )
+                realized += sum(float(exit_row.get("realized_pnl") or 0) for exit_row in exits)
+
+            def average(key: str) -> float | None:
+                values = [float(row[key]) for row in entries if row.get(key) is not None]
+                return sum(values) / len(values) if values else None
+
+            results[strategy] = {
+                "entries": len(entries),
+                "settled_trades": len(settled),
+                "win_rate": wins / len(settled) if settled else None,
+                "realized_pnl": realized,
+                "average_entry_probability": average("model_probability"),
+                "average_entry_price": average("entry_price"),
+                "average_entry_ev": average("expected_value"),
+            }
+        return results
 
     @staticmethod
     def _order_commitment(price: float, contracts: int) -> float:
@@ -286,15 +338,15 @@ class PaperTradingService:
 
         order_id = self.db.execute(
             """
-            INSERT INTO paper_orders(
-                ticker,side,action,order_type,status,created_at,requested_dollars,
-                requested_contracts,limit_price,source,stop_loss_price
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                INSERT INTO paper_orders(
+                    ticker,side,action,order_type,status,created_at,requested_dollars,
+                    requested_contracts,limit_price,source,stop_loss_price,strategy
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 ticker, side, action, order_type, "open", iso_now(), requested_dollars,
                 contracts, order_price if order_type == "LIMIT" else None, "manual",
-                stop_loss_price,
+                stop_loss_price, "MANUAL",
             ),
         )
         order = self.db.fetch_one("SELECT * FROM paper_orders WHERE id=?", (order_id,))
@@ -323,20 +375,23 @@ class PaperTradingService:
         ):
             raise ValueError("The session drawdown limit is active.")
         bankroll = max(0.0, float(portfolio["current_bankroll"]))
-        max_trade = bankroll * float(settings.get("max_risk_per_trade_pct", 0.02))
+        max_trade = bankroll * float(settings.get("max_risk_per_trade_pct", 0.03))
         if commitment > max_trade + 1e-9:
             raise ValueError("This order exceeds the maximum risk per trade.")
         position = self.db.fetch_one(
-            "SELECT entry_cost,fees FROM paper_trades WHERE ticker=? AND side=? AND status='open'",
-            (ticker, side),
+            """
+            SELECT COALESCE(SUM(entry_cost + fees), 0) AS committed
+            FROM paper_trades WHERE ticker=? AND status='open'
+            """,
+            (ticker,),
         )
-        existing = float(position["entry_cost"] + position["fees"]) if position else 0.0
+        existing = float(position["committed"] or 0) if position else 0.0
         pending = self.db.fetch_all(
             """
             SELECT limit_price,requested_contracts FROM paper_orders
-            WHERE ticker=? AND side=? AND action='BUY' AND status='open'
+            WHERE ticker=? AND action='BUY' AND status='open'
             """,
-            (ticker, side),
+            (ticker,),
         )
         existing += sum(
             self._order_commitment(float(order["limit_price"]), int(order["requested_contracts"]))
@@ -366,14 +421,22 @@ class PaperTradingService:
                     total_cost = float(position["entry_cost"]) + entry_cost
                     old_source = position["source"] or "automatic"
                     source = old_source if old_source == order["source"] else "mixed"
+                    order_strategy = order.get("strategy") or (
+                        "MANUAL" if order["source"] == "manual" else "STANDARD_EDGE"
+                    )
+                    old_strategy = position.get("strategy") or order_strategy
+                    strategy = (
+                        old_strategy if old_strategy == order_strategy else "MIXED"
+                    )
                     connection.execute(
                         """
                         UPDATE paper_trades SET contracts=?,entry_price=?,entry_cost=?,
-                            fees=?,source=? WHERE id=?
+                            fees=?,source=?,strategy=? WHERE id=?
                         """,
                         (
                             total_contracts, total_cost / total_contracts, total_cost,
-                            float(position["fees"]) + fees, source, position["id"],
+                            float(position["fees"]) + fees, source, strategy,
+                            position["id"],
                         ),
                     )
                     trade_id = int(position["id"])
@@ -392,14 +455,14 @@ class PaperTradingService:
                         INSERT INTO paper_trades(
                             ticker,side,opened_at,entry_price,contracts,entry_cost,fees,
                             model_probability,market_probability,edge,expected_value,
-                            confidence,model_version,status,source
-                        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                            confidence,model_version,status,source,strategy
+                        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                         """,
                         (
                             order["ticker"], order["side"], filled_at, price, contracts,
                             entry_cost, fees, float(market.get("model_probability") or 0.5),
                             float(market_probability), 0.0, 0.0, "Manual", "manual",
-                            "open", order["source"],
+                            "open", order["source"], order.get("strategy") or "MANUAL",
                         ),
                     )
                     trade_id = int(cursor.lastrowid)
@@ -409,14 +472,17 @@ class PaperTradingService:
                     INSERT INTO paper_entries(
                         trade_id,order_id,ticker,side,opened_at,entry_price,
                         initial_contracts,remaining_contracts,entry_cost,entry_fees,
-                        stop_loss_price,stop_status,source,status
-                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                        stop_loss_price,stop_status,source,status,strategy,
+                        model_probability,expected_value,entry_reason
+                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                     """,
                     (
                         trade_id, order["id"], order["ticker"], order["side"],
                         filled_at, price, contracts, contracts, entry_cost, fees,
                         stop_loss, "active" if stop_loss is not None else None,
-                        order["source"], "open",
+                        order["source"], "open", order.get("strategy") or "MANUAL",
+                        market.get("model_probability"), market.get("expected_value"),
+                        market.get("entry_reason"),
                     ),
                 )
             else:
@@ -579,12 +645,13 @@ class PaperTradingService:
                 """
                 INSERT INTO paper_orders(
                     ticker,side,action,order_type,status,created_at,
-                    requested_contracts,source,entry_id
-                ) VALUES (?,?,?,?,?,?,?,?,?)
+                    requested_contracts,source,entry_id,strategy
+                ) VALUES (?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     ticker, entry["side"], "SELL", "MARKET", "open", iso_now(),
                     int(entry["remaining_contracts"]), "stop_loss", entry["id"],
+                    entry.get("strategy") or "STOP_LOSS",
                 ),
             )
             order = self.db.fetch_one(
@@ -640,9 +707,9 @@ class PaperTradingService:
         existing = self.db.fetch_one(
             """
             SELECT id FROM paper_entries
-            WHERE ticker=? AND side=? AND source='automatic'
+            WHERE ticker=? AND source='automatic'
             """,
-            (ticker, decision.side),
+            (ticker,),
         )
         if existing:
             return False
@@ -657,12 +724,12 @@ class PaperTradingService:
             """
             INSERT INTO paper_orders(
                 ticker,side,action,order_type,status,created_at,requested_contracts,
-                source,stop_loss_price
-            ) VALUES (?,?,?,?,?,?,?,?,?)
+                source,stop_loss_price,strategy
+            ) VALUES (?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 ticker, decision.side, "BUY", "MARKET", "open", iso_now(),
-                contracts, "automatic", stop_price,
+                contracts, "automatic", stop_price, "STANDARD_EDGE",
             ),
         )
         order = self.db.fetch_one("SELECT * FROM paper_orders WHERE id=?", (order_id,))
@@ -674,6 +741,8 @@ class PaperTradingService:
             {
                 "model_probability": decision.model_probability,
                 "market_probability": decision.market_probability,
+                "expected_value": decision.expected_value,
+                "entry_reason": decision.explanation,
             },
         )
         trade = self.db.fetch_one(
@@ -693,12 +762,16 @@ class PaperTradingService:
             )
         return True
 
-    def reset_automatic_confirmation(self) -> None:
+    def _reset_standard_confirmation(self) -> None:
         self._automatic_key = None
         self._automatic_started_at = None
         self._automatic_last_at = None
         self._automatic_last_buy = False
         self._automatic_segments.clear()
+
+    def reset_automatic_confirmation(self) -> None:
+        self._reset_standard_confirmation()
+        self._strategy_states.clear()
 
     def consider_automatic_entry(
         self,
@@ -710,14 +783,13 @@ class PaperTradingService:
         now: float | None = None,
     ) -> dict[str, Any]:
         settings = self.db.settings()
-        selected_side = str(settings.get("selected_side", "YES"))
-        key = (ticker, selected_side)
+        key = (ticker, str(decision.side or ""))
         current_time = time.monotonic() if now is None else float(now)
         window = float(settings.get("automatic_confirmation_seconds", 10))
         entry_window = float(settings.get("automatic_entry_window_minutes", 5)) * 60
         enabled = bool(settings.get("paper_trading_enabled", False))
         inside_window = 0 < seconds_remaining <= entry_window
-        if not enabled or not inside_window or decision.side != selected_side:
+        if not enabled or not inside_window or not decision.side:
             self.reset_automatic_confirmation()
             return {"armed": False, "progress": 0.0, "entered": False}
         if self._automatic_key != key:
@@ -772,6 +844,407 @@ class PaperTradingService:
             "confidence_ok": confidence_ok,
             "entered": entered,
         }
+
+    def _automatic_entry_exists(self, ticker: str) -> bool:
+        return self.db.fetch_one(
+            "SELECT id FROM paper_entries WHERE ticker=? AND source='automatic' LIMIT 1",
+            (ticker,),
+        ) is not None
+
+    def _fixed_strategy_size(
+        self,
+        *,
+        ticker: str,
+        price: float,
+        requested_fraction: float,
+        available_contracts: float | None,
+    ) -> tuple[int, float]:
+        settings = self.db.settings()
+        portfolio = self.portfolio()
+        effective_fraction = self._effective_strategy_fraction(settings, requested_fraction)
+        bankroll = max(0.0, float(portfolio.get("current_bankroll") or 0.0))
+        cash = max(0.0, float(portfolio.get("available_cash") or 0.0))
+        existing = self.db.fetch_one(
+            """
+            SELECT COALESCE(SUM(entry_cost + fees), 0) AS committed
+            FROM paper_trades WHERE ticker=? AND status='open'
+            """,
+            (ticker,),
+        )
+        pending = self.db.fetch_all(
+            """
+            SELECT limit_price,requested_contracts FROM paper_orders
+            WHERE ticker=? AND action='BUY' AND status='open'
+            """,
+            (ticker,),
+        )
+        existing_commitment = float(existing["committed"] or 0) if existing else 0.0
+        existing_commitment += sum(
+            self._order_commitment(
+                float(order["limit_price"]), int(order["requested_contracts"])
+            )
+            for order in pending
+        )
+        position_capacity = (
+            max(
+                0.0,
+                bankroll * float(settings.get("max_position_pct", 0.05))
+                - existing_commitment,
+            )
+            if settings.get("risk_controls_enabled", True)
+            else cash
+        )
+        target = min(cash, bankroll * effective_fraction, position_capacity)
+        unit_cost = price + kalshi_fee(price)
+        contracts = math.floor(target / unit_cost) if unit_cost > 0 else 0
+        if available_contracts is not None:
+            contracts = min(contracts, math.floor(max(0.0, float(available_contracts))))
+        return max(0, contracts), effective_fraction
+
+    @staticmethod
+    def _effective_strategy_fraction(
+        settings: dict[str, Any], requested_fraction: float
+    ) -> float:
+        effective = max(0.0, float(requested_fraction))
+        if settings.get("risk_controls_enabled", True):
+            effective = min(
+                effective,
+                float(settings.get("max_risk_per_trade_pct", 0.03)),
+                float(settings.get("max_position_pct", 0.05)),
+            )
+        return effective
+
+    def open_fixed_strategy(
+        self,
+        *,
+        ticker: str,
+        strategy: str,
+        assessment: dict[str, Any],
+        bankroll_fraction: float,
+        model_version: str,
+        reason: str,
+    ) -> tuple[bool, float]:
+        side = str(assessment.get("side") or "")
+        buy = assessment.get("buy") or {}
+        price = buy.get("executable_price")
+        probability = assessment.get("model_probability")
+        expected_value = buy.get("expected_value")
+        if (
+            side not in {"YES", "NO"}
+            or price is None
+            or probability is None
+            or expected_value is None
+            or self._automatic_entry_exists(ticker)
+        ):
+            return False, 0.0
+        contracts, effective_fraction = self._fixed_strategy_size(
+            ticker=ticker,
+            price=float(price),
+            requested_fraction=bankroll_fraction,
+            available_contracts=assessment.get("ask_size"),
+        )
+        if contracts < 1:
+            return False, effective_fraction
+        try:
+            self._validate_buy(ticker, side, float(price), contracts)
+        except ValueError:
+            return False, effective_fraction
+        stop_cents = self.db.settings().get("default_stop_loss_cents")
+        stop_price = float(stop_cents) / 100 if stop_cents is not None else None
+        order_id = self.db.execute(
+            """
+            INSERT INTO paper_orders(
+                ticker,side,action,order_type,status,created_at,requested_contracts,
+                source,stop_loss_price,strategy
+            ) VALUES (?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                ticker, side, "BUY", "MARKET", "open", iso_now(), contracts,
+                "automatic", stop_price, strategy,
+            ),
+        )
+        order = self.db.fetch_one("SELECT * FROM paper_orders WHERE id=?", (order_id,))
+        if not order:
+            return False, effective_fraction
+        self._fill_order(
+            order,
+            float(price),
+            {
+                "model_probability": probability,
+                "market_probability": assessment.get("market_probability"),
+                "expected_value": expected_value,
+                "entry_reason": reason,
+            },
+        )
+        trade = self.db.fetch_one(
+            "SELECT id FROM paper_trades WHERE ticker=? AND side=? AND status='open'",
+            (ticker, side),
+        )
+        if trade:
+            self.db.execute(
+                """
+                UPDATE paper_trades SET edge=?,expected_value=?,confidence=?,model_version=?
+                WHERE id=?
+                """,
+                (
+                    buy.get("net_edge"), expected_value, strategy.replace("_", " ").title(),
+                    model_version, trade["id"],
+                ),
+            )
+        return True, effective_fraction
+
+    @staticmethod
+    def _best_buy_assessment(
+        assessments: dict[str, dict[str, Any]],
+        *,
+        minimum_probability: float,
+        minimum_ev: float,
+        maximum_spread: float,
+        minimum_liquidity: int,
+    ) -> dict[str, Any] | None:
+        candidates = []
+        for assessment in assessments.values():
+            buy = assessment.get("buy") or {}
+            probability = assessment.get("model_probability")
+            expected_value = buy.get("expected_value")
+            spread = assessment.get("spread")
+            liquidity = assessment.get("ask_size")
+            if (
+                assessment.get("trade_allowed")
+                and probability is not None
+                and float(probability) >= minimum_probability
+                and expected_value is not None
+                and float(expected_value) + 1e-12 >= minimum_ev
+                and spread is not None
+                and float(spread) <= maximum_spread
+                and liquidity is not None
+                and float(liquidity) >= minimum_liquidity
+                and buy.get("executable_price") is not None
+            ):
+                candidates.append(assessment)
+        return max(
+            candidates,
+            key=lambda item: (
+                float((item.get("buy") or {}).get("expected_value") or 0.0),
+                float(item.get("model_probability") or 0.0),
+            ),
+            default=None,
+        )
+
+    def _confirm_strategy(
+        self,
+        *,
+        strategy: str,
+        ticker: str,
+        side: str,
+        duration: float,
+        quote_marker: str | None,
+        require_next_quote: bool,
+        now: float,
+    ) -> dict[str, Any]:
+        key = (ticker, side)
+        state = self._strategy_states.get(strategy)
+        if not state or state.get("key") != key:
+            state = {
+                "key": key,
+                "started_at": now,
+                "initial_quote": quote_marker,
+                "next_quote_seen": False,
+            }
+            self._strategy_states[strategy] = state
+        elif quote_marker and quote_marker != state.get("initial_quote"):
+            state["next_quote_seen"] = True
+        elapsed = max(0.0, now - float(state["started_at"]))
+        ready = elapsed + 1e-9 >= duration and (
+            not require_next_quote or bool(state.get("next_quote_seen"))
+        )
+        return {
+            "armed": True,
+            "progress": 1.0 if duration <= 0 else min(1.0, elapsed / duration),
+            "next_quote_seen": bool(state.get("next_quote_seen")),
+            "ready": ready,
+        }
+
+    def consider_strategies(
+        self,
+        *,
+        ticker: str,
+        assessments: dict[str, dict[str, Any]],
+        standard_decisions: dict[str, Decision],
+        seconds_remaining: float,
+        market_status: str | None,
+        market_open_time: str | None,
+        market_observed_at: str | None,
+        threshold_state: dict[str, Any] | None,
+        settlement_window: dict[str, Any],
+        z_distance: float,
+        model_version: str,
+        now: float | None = None,
+    ) -> dict[str, Any]:
+        settings = self.db.settings()
+        current_time = time.monotonic() if now is None else float(now)
+        empty = {"armed": False, "progress": 0.0, "entered": False}
+        result: dict[str, Any] = {
+            "active_strategy": None,
+            "entered": False,
+            "effective_bankroll_allocation": 0.0,
+            "early_threshold": dict(empty),
+            "standard_edge": dict(empty),
+            "late_conviction": dict(empty),
+        }
+        if not bool(settings.get("paper_trading_enabled", False)):
+            self.reset_automatic_confirmation()
+            return result
+        if self._automatic_entry_exists(ticker):
+            self.reset_automatic_confirmation()
+            result["blocked_reason"] = "An automatic entry already exists for this market."
+            return result
+
+        observed = parse_time(market_observed_at)
+        opened = parse_time(market_open_time)
+        status_open = str(market_status or "").lower() in {"active", "open"}
+        if not status_open:
+            self.reset_automatic_confirmation()
+            result["blocked_reason"] = "The market is not active."
+            return result
+        opening_elapsed = (
+            (observed - opened).total_seconds()
+            if observed is not None and opened is not None
+            else None
+        )
+        early_candidate = None
+        threshold_ready = False
+        if threshold_state and observed is not None and opened is not None:
+            first_seen = parse_time(threshold_state.get("first_observed_at"))
+            latest_seen = parse_time(threshold_state.get("latest_observed_at"))
+            threshold_ready = bool(
+                first_seen
+                and latest_seen
+                and first_seen < opened
+                and (observed - latest_seen).total_seconds()
+                >= float(settings.get("early_threshold_stability_seconds", 1))
+            )
+        if (
+            settings.get("early_threshold_enabled", True)
+            and status_open
+            and opening_elapsed is not None
+            and 0 <= opening_elapsed <= float(settings.get("early_entry_window_seconds", 30))
+            and threshold_ready
+        ):
+            early_candidate = self._best_buy_assessment(
+                assessments,
+                minimum_probability=float(settings.get("early_min_probability", 0.65)),
+                minimum_ev=float(settings.get("early_min_net_ev", 0.005)),
+                maximum_spread=float(settings.get("early_max_spread", 0.05)),
+                minimum_liquidity=int(settings.get("early_min_liquidity_contracts", 1)),
+            )
+        if early_candidate:
+            effective = self._effective_strategy_fraction(
+                settings, float(settings.get("early_bankroll_pct", 0.03))
+            )
+            confirmation = self._confirm_strategy(
+                strategy="EARLY_THRESHOLD", ticker=ticker,
+                side=str(early_candidate["side"]),
+                duration=float(settings.get("early_confirmation_seconds", 2)),
+                quote_marker=market_observed_at, require_next_quote=True,
+                now=current_time,
+            )
+            result["active_strategy"] = "EARLY_THRESHOLD"
+            result["effective_bankroll_allocation"] = effective
+            result["early_threshold"] = {**confirmation, "entered": False}
+            self._reset_standard_confirmation()
+            self._strategy_states.pop("LATE_CONVICTION", None)
+            if confirmation["ready"]:
+                entered, effective = self.open_fixed_strategy(
+                    ticker=ticker, strategy="EARLY_THRESHOLD",
+                    assessment=early_candidate,
+                    bankroll_fraction=float(settings.get("early_bankroll_pct", 0.03)),
+                    model_version=model_version,
+                    reason="Stable pre-open threshold remained underpriced after activation.",
+                )
+                result["entered"] = entered
+                result["effective_bankroll_allocation"] = effective
+                result["early_threshold"]["entered"] = entered
+                if entered:
+                    self.reset_automatic_confirmation()
+            return result
+        self._strategy_states.pop("EARLY_THRESHOLD", None)
+
+        confidence_rank = {"Low": 0, "Moderate": 1, "High": 2}
+        required_confidence = str(settings.get("automatic_min_confidence", "High"))
+        standard_candidates = [
+            decision
+            for decision in standard_decisions.values()
+            if decision.signal == "BUY"
+            and decision.side in {"YES", "NO"}
+            and confidence_rank.get(decision.confidence, 0)
+            >= confidence_rank.get(required_confidence, 2)
+        ]
+        standard = max(
+            standard_candidates,
+            key=lambda item: float(item.expected_value or float("-inf")),
+            default=None,
+        )
+        if standard is not None:
+            standard_result = self.consider_automatic_entry(
+                ticker=ticker, decision=standard, seconds_remaining=seconds_remaining,
+                model_version=model_version, now=current_time,
+            )
+            result["active_strategy"] = "STANDARD_EDGE"
+            result["standard_edge"] = standard_result
+            result["entered"] = bool(standard_result.get("entered"))
+            result["effective_bankroll_allocation"] = float(
+                standard.suggested_fraction or 0.0
+            )
+            self._strategy_states.pop("LATE_CONVICTION", None)
+            return result
+        self._reset_standard_confirmation()
+
+        late_candidate = None
+        if (
+            settings.get("late_conviction_enabled", True)
+            and 0 < seconds_remaining <= float(settings.get("late_max_seconds_remaining", 90))
+            and abs(float(z_distance)) >= float(settings.get("late_min_z_distance", 2.0))
+            and float(settlement_window.get("coverage") or 0.0)
+            >= float(settings.get("late_min_settlement_coverage", 0.80))
+        ):
+            late_candidate = self._best_buy_assessment(
+                assessments,
+                minimum_probability=float(settings.get("late_min_probability", 0.85)),
+                minimum_ev=float(settings.get("late_min_net_ev", 0.005)),
+                maximum_spread=float(settings.get("late_max_spread", 0.03)),
+                minimum_liquidity=int(settings.get("late_min_liquidity_contracts", 1)),
+            )
+        if late_candidate:
+            effective = self._effective_strategy_fraction(
+                settings, float(settings.get("late_bankroll_pct", 0.03))
+            )
+            confirmation = self._confirm_strategy(
+                strategy="LATE_CONVICTION", ticker=ticker,
+                side=str(late_candidate["side"]),
+                duration=float(settings.get("late_confirmation_seconds", 3)),
+                quote_marker=market_observed_at, require_next_quote=False,
+                now=current_time,
+            )
+            result["active_strategy"] = "LATE_CONVICTION"
+            result["effective_bankroll_allocation"] = effective
+            result["late_conviction"] = {**confirmation, "entered": False}
+            if confirmation["ready"]:
+                entered, effective = self.open_fixed_strategy(
+                    ticker=ticker, strategy="LATE_CONVICTION",
+                    assessment=late_candidate,
+                    bankroll_fraction=float(settings.get("late_bankroll_pct", 0.03)),
+                    model_version=model_version,
+                    reason="High-probability late outcome retained positive Buy EV.",
+                )
+                result["entered"] = entered
+                result["effective_bankroll_allocation"] = effective
+                result["late_conviction"]["entered"] = entered
+                if entered:
+                    self.reset_automatic_confirmation()
+            return result
+        self._strategy_states.pop("LATE_CONVICTION", None)
+        return result
 
     def settle(self, ticker: str, result: int, settled_at: str) -> int:
         self.db.execute(

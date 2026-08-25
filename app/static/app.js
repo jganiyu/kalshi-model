@@ -14,7 +14,8 @@ const state = {
   priceMovement: { direction: null, until: 0 },
   themePreference: localStorage.getItem("kalshi-theme-v2") || "light",
   paperOrder: {
-    side: "YES", action: "BUY", limit: false, submitting: false,
+    side: localStorage.getItem("kalshi-display-side-v1") === "NO" ? "NO" : "YES",
+    action: "BUY", limit: false, submitting: false,
     stopInitialized: false, sideUpdating: false,
   },
   paperReset: { confirming: false, resetting: false, timer: null },
@@ -163,8 +164,9 @@ function orderBookRows(levels, type, maxQuantity, reverse = false) {
 
 function renderOrderBook(outcome, orderbook) {
   const prefix = outcome === "YES" ? "yes" : "no";
-  const target = $(`#${outcome === "YES" ? "up" : "down"}-orderbook-rows`);
+  const target = $("#orderbook-rows");
   if (!target) return;
+  $("#orderbook-title").textContent = `${marketSideLabel(outcome)} order book`;
   const bids = normalizeBookLevels(orderbook?.[`${prefix}_bids`]);
   const asks = normalizeBookLevels(orderbook?.[`${prefix}_asks`]);
   if (!bids.length && !asks.length) {
@@ -185,9 +187,40 @@ function renderOrderBook(outcome, orderbook) {
   ].join("");
 }
 
-function renderOrderBooks(orderbook) {
-  renderOrderBook("YES", orderbook);
-  renderOrderBook("NO", orderbook);
+function renderRecentPaperTrades(trades) {
+  const target = $("#recent-paper-trades");
+  if (!target) return;
+  target.innerHTML = trades?.length ? trades.map((trade) => `
+    <tr><td>${shortDate(trade.opened_at)}</td><td>${marketSideLabel(trade.side)}</td>
+    <td>${cents(trade.entry_price)}</td><td>${trade.contracts}</td>
+    <td>${String(trade.strategy || trade.source || "manual").replaceAll("_", " ")}</td>
+    <td class="${Number(trade.realized_pnl) > 0 ? "positive" : Number(trade.realized_pnl) < 0 ? "negative" : ""}">${String(trade.status || "open")}${trade.realized_pnl == null ? "" : ` · ${money(trade.realized_pnl)}`}</td></tr>
+  `).join("") : '<tr><td class="book-empty" colspan="6">No paper trades yet</td></tr>';
+}
+
+function renderTradeAssessment() {
+  const current = state.dashboard?.current;
+  const side = state.paperOrder.side;
+  const action = state.paperOrder.action.toLowerCase();
+  const decision = current?.trade_decisions?.[side]
+    || (current?.trade_decision?.side === side ? current.trade_decision : null);
+  const assessment = current?.trade_assessments?.[side];
+  const economics = assessment?.[action];
+  $("#trade-assessment-side").textContent = `Selected: ${marketSideLabel(side)}`;
+  $("#trade-action").textContent = tradeActionLabel(decision);
+  $("#trade-price").textContent = cents(economics?.executable_price);
+  $("#trade-model-probability").textContent = percent(assessment?.model_probability, 1);
+  $("#trade-market-probability").textContent = percent(assessment?.market_probability, 1);
+  $("#trade-fee").textContent = economics?.fee_per_contract == null ? "--" : money(economics.fee_per_contract, 4);
+  $("#trade-slippage").textContent = cents(economics?.slippage);
+  $("#trade-edge").textContent = points(economics?.net_edge);
+  $("#trade-ev").textContent = economics?.expected_value == null ? "--" : money(economics.expected_value, 3);
+  const verb = state.paperOrder.action === "BUY" ? "buying" : "selling";
+  $("#trade-explanation").textContent = economics?.expected_value == null
+    ? formatMarketLanguage(decision?.explanation || "Waiting for an executable quote.")
+    : `${marketSideLabel(side)} ${verb} value after the displayed fee and slippage allowance.`;
+  $("#trade-edge").className = Number(economics?.net_edge) > 0 ? "positive" : Number(economics?.net_edge) < 0 ? "negative" : "";
+  $("#trade-ev").className = Number(economics?.expected_value) > 0 ? "positive" : Number(economics?.expected_value) < 0 ? "negative" : "";
 }
 
 function renderDashboard(data) {
@@ -196,7 +229,6 @@ function renderDashboard(data) {
   const current = data.current;
   const btc = data.btc || {};
   const forecast = current?.forecast;
-  const decision = current?.trade_decision || current?.decision;
   const streams = system.streams || {};
   if (current?.ticker && current.ticker !== state.chartTicker) {
     state.chartTicker = current.ticker;
@@ -211,9 +243,6 @@ function renderDashboard(data) {
   $("#header-model-version").textContent = data.model?.version || "baseline-1.0";
 
   const position = forecastPosition(forecast);
-  const selectedSide = current?.selected_side || data.paper?.selected_side || "YES";
-  if (!state.paperOrder.sideUpdating) state.paperOrder.side = selectedSide;
-  const selectedLabel = marketSideLabel(selectedSide);
   const pill = $("#signal-pill");
   pill.dataset.position = position;
   const forecastLabel = position === "up" ? "Likely Up" : position === "down" ? "Likely Down" : "Uncertain";
@@ -225,12 +254,20 @@ function renderDashboard(data) {
   const paper = data.paper || {};
   const automaticTradingEnabled = Boolean(paper.automatic_trading_enabled);
   const paperBlocked = automaticTradingEnabled && paper.automatic_trade_allowed === false;
-  const confirmation = current?.automatic_entry || {};
+  const automaticEntry = current?.automatic_entry || {};
+  const activeStrategy = automaticEntry.active_strategy;
+  const confirmation = activeStrategy
+    ? automaticEntry[activeStrategy.toLowerCase()] || {}
+    : {};
+  const automaticAllocation = Number(automaticEntry.effective_bankroll_allocation || 0);
+  const allocationLabel = automaticAllocation > 0
+    ? ` · ${percent(automaticAllocation, 1)} bankroll`
+    : "";
   const automaticTradingStatus = paperBlocked
     ? `Automatic trading paused · ${paper.automatic_trade_block_reason || "Risk control active."}`
     : automaticTradingEnabled
       ? confirmation.armed
-        ? `Automatic entry armed · ${Math.round(Number(confirmation.progress || 0) * 100)}% confirmed`
+        ? `${String(activeStrategy).replaceAll("_", " ")} armed · ${Math.round(Number(confirmation.progress || 0) * 100)}% confirmed${allocationLabel}`
         : "Automatic trading on · waiting for entry window"
       : "Automatic trading off";
   paperPermission.hidden = false;
@@ -242,15 +279,6 @@ function renderDashboard(data) {
   $("#signal-explanation").textContent = forecast?.explanation || system.message || "Connecting to public feeds.";
   $("#up-probability").textContent = percent(forecast?.up_probability, 1);
   $("#down-probability").textContent = percent(forecast?.down_probability, 1);
-  $("#trade-assessment-side").textContent = `Selected: ${selectedLabel}`;
-  $("#trade-action").textContent = tradeActionLabel(decision);
-  $("#trade-price").textContent = cents(decision?.executable_price);
-  $("#trade-edge").textContent = points(decision?.edge);
-  $("#trade-ev").textContent = decision?.expected_value === null || decision?.expected_value === undefined ? "--" : money(decision.expected_value, 3);
-  $("#trade-strength").textContent = decision?.confidence || "--";
-  $("#trade-explanation").textContent = formatMarketLanguage(decision?.explanation || "Waiting for an executable quote.");
-  $("#trade-edge").className = Number(decision?.edge) > 0 ? "positive" : Number(decision?.edge) < 0 ? "negative" : "";
-  $("#trade-ev").className = Number(decision?.expected_value) > 0 ? "positive" : Number(decision?.expected_value) < 0 ? "negative" : "";
 
   const referencePrice = numberOrNull(btc.price);
   const threshold = numberOrNull(current?.strike);
@@ -302,7 +330,9 @@ function renderDashboard(data) {
     btcConnection.textContent = sources.length ? `${sources.join(" + ")} live` : "REST fallback";
   }
 
-  renderOrderBooks(current?.orderbook || {});
+  renderTradeAssessment();
+  renderOrderBook(state.paperOrder.side, current?.orderbook || {});
+  renderRecentPaperTrades(data.paper?.recent_paper_trades || []);
   renderPaperController();
   drawChart();
   if (data.notification?.signal_id && data.notification.signal_id !== state.lastNotification) {
@@ -503,23 +533,13 @@ async function cancelPaperOrder(orderId) {
   } catch (error) { showToast("Unable to cancel order", error.message); }
 }
 
-async function updateSelectedSide(side) {
-  if (state.paperOrder.sideUpdating || side === state.paperOrder.side) return;
-  state.paperOrder.sideUpdating = true;
+function updateSelectedSide(side) {
+  if (side === state.paperOrder.side) return;
   state.paperOrder.side = side;
+  localStorage.setItem("kalshi-display-side-v1", side);
   renderPaperController();
-  try {
-    const dashboard = await api("/api/model-side", {
-      method: "PUT", body: JSON.stringify({ side }),
-    });
-    renderDashboard(dashboard);
-  } catch (error) {
-    showToast("Modeling side not changed", error.message);
-    await refreshDashboard();
-  } finally {
-    state.paperOrder.sideUpdating = false;
-    renderPaperController();
-  }
+  renderTradeAssessment();
+  renderOrderBook(side, state.dashboard?.current?.orderbook || {});
 }
 
 function updateCountdown() {
@@ -873,6 +893,29 @@ const calibrationGroups = [
     { id: "automatic_buy_duration_pct", label: "Required Buy duration", unit: "%", min: 50, max: 100, step: 1, scale: 100, tip: "Share of the confirmation period that must be spent in Buy. Default: 70%." },
     { id: "automatic_min_confidence", label: "Minimum edge strength", type: "select", options: ["Low", "Moderate", "High"], tip: "Lowest edge-strength label allowed for an automatic entry. Speculative trade assessments never enter automatically. Default: High." },
   ]],
+  ["Early Threshold", [
+    { id: "early_threshold_enabled", label: "Early threshold strategy", type: "toggle", tip: "Allows a small paper entry when the next threshold arrived before the market opened and remains favorable after activation. Default: on." },
+    { id: "early_bankroll_pct", label: "Bankroll allocation", unit: "% bankroll", min: 0, max: 100, step: 1, scale: 100, tip: "Target allocation before the global trade and position caps are applied. Default: 3%." },
+    { id: "early_min_probability", label: "Minimum win chance", unit: "%", min: 50, max: 99, step: 1, scale: 100, tip: "Minimum estimated chance for the side being bought. Default: 65%." },
+    { id: "early_min_net_ev", label: "Minimum Buy EV", unit: "cents", min: 0, max: 25, step: .1, scale: 100, tip: "Minimum value per contract after the executable ask, fee, and slippage. Default: 0.5 cents." },
+    { id: "early_entry_window_seconds", label: "Opening window", unit: "seconds", min: 1, max: 300, step: 1, tip: "Time after activation in which the early strategy may enter. Default: 30 seconds." },
+    { id: "early_threshold_stability_seconds", label: "Threshold stability", unit: "seconds", min: 0, max: 120, step: .5, tip: "How long the pre-open threshold must remain unchanged. Default: 1 second." },
+    { id: "early_confirmation_seconds", label: "Quote confirmation", unit: "seconds", min: 0, max: 120, step: .5, tip: "Minimum time and one fresh quote required before entry. Default: 2 seconds." },
+    { id: "early_max_spread", label: "Maximum spread", unit: "%", min: 0, max: 50, step: .5, scale: 100, tip: "Widest accepted spread for an early entry. Default: 5%." },
+    { id: "early_min_liquidity_contracts", label: "Minimum liquidity", unit: "contracts", min: 1, max: 1000000, step: 1, integer: true, tip: "Minimum contracts available at the selected ask. Default: 1 contract." },
+  ]],
+  ["Late Conviction", [
+    { id: "late_conviction_enabled", label: "Late conviction strategy", type: "toggle", tip: "Allows a small paper entry near expiration when one outcome is highly likely and Buy EV remains positive. Default: on." },
+    { id: "late_bankroll_pct", label: "Bankroll allocation", unit: "% bankroll", min: 0, max: 100, step: 1, scale: 100, tip: "Target allocation before the global trade and position caps are applied. Default: 3%." },
+    { id: "late_max_seconds_remaining", label: "Maximum time remaining", unit: "seconds", min: 1, max: 900, step: 1, tip: "Latest phase in which the strategy may begin evaluating an entry. Default: 90 seconds." },
+    { id: "late_min_probability", label: "Minimum win chance", unit: "%", min: 50, max: 99, step: 1, scale: 100, tip: "Minimum estimated chance for the side being bought. Default: 85%." },
+    { id: "late_min_net_ev", label: "Minimum Buy EV", unit: "cents", min: 0, max: 25, step: .1, scale: 100, tip: "Minimum value per contract after the executable ask, fee, and slippage. Default: 0.5 cents." },
+    { id: "late_confirmation_seconds", label: "Confirmation period", unit: "seconds", min: 0, max: 120, step: .5, tip: "How long the late conditions must remain valid. Default: 3 seconds." },
+    { id: "late_min_settlement_coverage", label: "Settlement coverage", unit: "%", min: 0, max: 100, step: 5, scale: 100, tip: "Minimum share of the final settlement window already observed. Default: 80%." },
+    { id: "late_min_z_distance", label: "Minimum threshold distance", unit: "z-score", min: 0, max: 20, step: .25, tip: "Minimum absolute volatility-adjusted distance from the threshold. Default: 2.0." },
+    { id: "late_max_spread", label: "Maximum spread", unit: "%", min: 0, max: 50, step: .5, scale: 100, tip: "Widest accepted spread for a late entry. Default: 3%." },
+    { id: "late_min_liquidity_contracts", label: "Minimum liquidity", unit: "contracts", min: 1, max: 1000000, step: 1, integer: true, tip: "Minimum contracts available at the selected ask. Default: 1 contract." },
+  ]],
   ["Stops and Exits", [
     { id: "default_stop_loss_cents", label: "Default stop-loss", unit: "cents", min: 1, max: 99, step: 1, nullable: true, tip: "Optional absolute bid trigger prefilled on new Buy drafts. Blank by default; existing stops never change." },
   ]],
@@ -881,7 +924,7 @@ const calibrationGroups = [
     { id: "risk_controls_enabled", label: "Risk controls", type: "toggle", tip: "Enforces position, trade-risk, and drawdown limits. Default: on." },
     { id: "fractional_kelly", label: "Kelly sizing", unit: "% Kelly", min: 0, max: 100, step: 5, scale: 100, tip: "Fraction of full Kelly used for suggested sizing. Default: 25%." },
     { id: "max_position_pct", label: "Maximum position", unit: "% bankroll", min: 0, max: 100, step: 1, scale: 100, tip: "Maximum paper capital committed to one outcome. Default: 5% of bankroll." },
-    { id: "max_risk_per_trade_pct", label: "Maximum risk per trade", unit: "% bankroll", min: 0, max: 100, step: 1, scale: 100, tip: "Maximum paper capital allowed in a single entry. Default: 2% of bankroll." },
+    { id: "max_risk_per_trade_pct", label: "Maximum risk per trade", unit: "% bankroll", min: 0, max: 100, step: 1, scale: 100, tip: "Maximum paper capital allowed in a single entry. Default: 3% of bankroll." },
     { id: "max_session_drawdown_pct", label: "Session drawdown", unit: "%", min: 0, max: 100, step: 1, scale: 100, tip: "Drawdown that pauses automatic execution without hiding signals. Default: 10%." },
     { id: "minimum_liquidity_contracts", label: "Minimum liquidity", unit: "contracts", min: 1, max: 1000000, step: 1, integer: true, tip: "Minimum contracts available at the selected ask for a Buy. Default: 1 contract." },
   ]],
@@ -990,6 +1033,20 @@ function renderCalibrationResults(data) {
     compactCalibrationStat("Brier", summary.brier_score == null ? "--" : Number(summary.brier_score).toFixed(3), "lower is better"),
     compactCalibrationStat("Cal. error", percent(summary.calibration_error, 1), "predicted vs actual"),
   ].join("");
+  const strategyResults = data.strategy_results || {};
+  const strategyLabels = {
+    EARLY_THRESHOLD: "Early threshold",
+    STANDARD_EDGE: "Standard edge",
+    LATE_CONVICTION: "Late conviction",
+  };
+  $("#strategy-results").innerHTML = Object.entries(strategyLabels).map(([key, label]) => {
+    const result = strategyResults[key] || {};
+    return `<div class="strategy-result-row">
+      <span><strong>${label}</strong><small>${result.entries || 0} entries · ${result.settled_trades || 0} settled · avg ${percent(result.average_entry_probability, 1)} at ${cents(result.average_entry_price)} · EV ${result.average_entry_ev == null ? "--" : money(result.average_entry_ev, 3)}</small></span>
+      <span title="Win rate">${percent(result.win_rate, 1)} wins</span>
+      <span class="${Number(result.realized_pnl) > 0 ? "positive" : Number(result.realized_pnl) < 0 ? "negative" : ""}" title="Realized profit and loss">${money(result.realized_pnl || 0)}</span>
+    </div>`;
+  }).join("");
   const buckets = summary.buckets || [];
   $("#calibration-bars").innerHTML = buckets.length ? buckets.map((bucket) => `
     <div class="bucket">
@@ -1058,7 +1115,7 @@ async function loadPaper() {
   const trades = data.trades || [];
   $("#trade-table").innerHTML = trades.length ? trades.map((trade) => `
     <tr><td>${shortDate(trade.opened_at)}</td><td>${trade.ticker}</td><td>${marketSideLabel(trade.side)}</td>
-    <td>${percent(trade.entry_price, 1)}</td><td>${trade.contracts}</td><td>${(trade.source || "automatic").toUpperCase()}${(trade.entries || []).some((entry) => entry.stop_status === "active") ? " · STOP ACTIVE" : ""}</td><td>${points(trade.edge)}</td>
+    <td>${percent(trade.entry_price, 1)}</td><td>${trade.contracts}</td><td>${String(trade.strategy || trade.source || "automatic").replaceAll("_", " ").toUpperCase()}${(trade.entries || []).some((entry) => entry.stop_status === "active") ? " · STOP ACTIVE" : ""}</td><td>${points(trade.edge)}</td>
     <td><span class="status-pill ${trade.status}">${trade.status.toUpperCase()}</span></td>
     <td class="${Number(trade.realized_pnl) > 0 ? "positive" : Number(trade.realized_pnl) < 0 ? "negative" : ""}">${trade.realized_pnl == null ? "--" : money(trade.realized_pnl)}</td></tr>
   `).join("") : '<tr><td colspan="9" class="empty-state">No paper trades yet.</td></tr>';
@@ -1296,6 +1353,7 @@ function bindEvents() {
   $$('[data-paper-action]').forEach((button) => button.addEventListener("click", () => {
     state.paperOrder.action = button.dataset.paperAction;
     renderPaperController();
+    renderTradeAssessment();
   }));
   $$('[data-paper-side]').forEach((button) => button.addEventListener("click", () => {
     updateSelectedSide(button.dataset.paperSide);

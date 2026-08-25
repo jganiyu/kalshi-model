@@ -40,7 +40,7 @@ def test_database_migrations_and_settings_persist(tmp_path: Path) -> None:
     reopened.initialize()
     assert reopened.settings()["starting_bankroll"] == 2_500.0
     assert "unknown" not in reopened.settings()
-    assert reopened.fetch_one("SELECT MAX(version) version FROM schema_migrations")["version"] == 6
+    assert reopened.fetch_one("SELECT MAX(version) version FROM schema_migrations")["version"] == 7
     assert ModelManager(reopened).active()["version"] == "baseline-1.1"
 
 
@@ -73,11 +73,11 @@ def test_paper_trade_settlement_uses_actual_binary_outcome(tmp_path: Path) -> No
         "BUY", "BUY_EDGE", "Moderate", "test", 0.75, 0.40, 0.15,
         0.12, 0.41, 0.01, 0.02, 10.0, 16, "NO",
     )
-    assert service.open_from_decision("TEST-YES", opposite)
+    assert not service.open_from_decision("TEST-YES", opposite)
     open_portfolio = service.portfolio()
     assert open_portfolio["available_cash"] < open_portfolio["current_bankroll"]
     assert open_portfolio["current_bankroll"] < open_portfolio["starting_bankroll"]
-    assert service.settle("TEST-YES", 1, iso_now()) == 2
+    assert service.settle("TEST-YES", 1, iso_now()) == 1
     trade = db.fetch_one("SELECT * FROM paper_trades WHERE ticker='TEST-YES' AND side='YES'")
     assert trade["status"] == "settled"
     assert trade["payout"] == 16

@@ -15,7 +15,7 @@
       document.documentElement.dataset.themePreference = preference;
     })();
   </script>
-  <link rel="stylesheet" href="/static/styles.css?v=0.3.0">
+  <link rel="stylesheet" href="/static/styles.css?v=0.4.0">
 </head>
 <body>
   <div class="app-shell">
@@ -131,9 +131,12 @@
               <div class="trade-assessment-grid">
                 <div><span>Recommendation</span><strong id="trade-action">--</strong></div>
                 <div><span>Executable</span><strong id="trade-price">--</strong></div>
+                <div><span>Model chance</span><strong id="trade-model-probability">--</strong></div>
+                <div><span>Market chance</span><strong id="trade-market-probability">--</strong></div>
+                <div><span>Fee</span><strong id="trade-fee">--</strong></div>
+                <div><span>Slippage</span><strong id="trade-slippage">--</strong></div>
                 <div><span>Edge</span><strong id="trade-edge">--</strong></div>
                 <div><span>EV / contract</span><strong id="trade-ev">--</strong></div>
-                <div><span>Edge strength</span><strong id="trade-strength">--</strong></div>
               </div>
               <p id="trade-explanation">Waiting for an executable quote.</p>
             </section>
@@ -178,28 +181,28 @@
           </section>
         </div>
 
-        <div class="orderbook-grid" aria-label="Live Kalshi order books">
+        <div class="orderbook-grid">
           <section class="orderbook-panel">
             <div class="section-heading orderbook-heading">
-              <div><p class="eyebrow">KALSHI DEPTH</p><h3>Up order book</h3></div>
+              <div><p class="eyebrow">KALSHI DEPTH</p><h3 id="orderbook-title">Up order book</h3></div>
               <span class="book-live"><i></i>Live</span>
             </div>
             <div class="orderbook-table-wrap">
               <table class="orderbook-table">
                 <thead><tr><th>Price</th><th>Contracts</th><th>Total</th></tr></thead>
-                <tbody id="up-orderbook-rows"><tr><td class="book-empty" colspan="3">Waiting for live depth</td></tr></tbody>
+                <tbody id="orderbook-rows"><tr><td class="book-empty" colspan="3">Waiting for live depth</td></tr></tbody>
               </table>
             </div>
           </section>
           <section class="orderbook-panel">
             <div class="section-heading orderbook-heading">
-              <div><p class="eyebrow">KALSHI DEPTH</p><h3>Down order book</h3></div>
-              <span class="book-live"><i></i>Live</span>
+              <div><p class="eyebrow">PAPER TRADING</p><h3>Recent trades</h3></div>
+              <span class="simulated-label">SIMULATED</span>
             </div>
             <div class="orderbook-table-wrap">
-              <table class="orderbook-table">
-                <thead><tr><th>Price</th><th>Contracts</th><th>Total</th></tr></thead>
-                <tbody id="down-orderbook-rows"><tr><td class="book-empty" colspan="3">Waiting for live depth</td></tr></tbody>
+              <table class="orderbook-table recent-trades-table">
+                <thead><tr><th>Opened</th><th>Side</th><th>Price</th><th>Qty</th><th>Strategy</th><th>Result</th></tr></thead>
+                <tbody id="recent-paper-trades"><tr><td class="book-empty" colspan="6">No paper trades yet</td></tr></tbody>
               </table>
             </div>
           </section>
@@ -222,6 +225,10 @@
           </div>
           <aside class="calibration-results" aria-label="Calibration results">
             <div class="compact-stats" id="calibration-stats"></div>
+            <section class="compact-result-section">
+              <div class="section-heading"><div><h3>Strategy results</h3><p>Forward paper performance</p></div></div>
+              <div id="strategy-results" class="strategy-results"><p class="empty-state">No strategy entries yet.</p></div>
+            </section>
             <section class="compact-result-section">
               <div class="section-heading"><div><h3>Predicted vs actual</h3><p>Settlement frequency</p></div></div>
               <div id="calibration-bars" class="calibration-bars"></div>
@@ -311,6 +318,6 @@
     </main>
   </div>
   <div class="toast" id="toast" role="status" aria-live="polite" hidden><strong id="toast-title"></strong><span id="toast-detail"></span></div>
-  <script src="/static/app.js?v=0.3.0" defer></script>
+  <script src="/static/app.js?v=0.4.0" defer></script>
 </body>
 </html>
