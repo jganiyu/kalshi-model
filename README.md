@@ -6,8 +6,8 @@ A local macOS research and paper-trading app for Kalshi's 15-minute Bitcoin Up o
 
 <table>
   <tr>
-    <td width="50%"><img src="docs/screenshots/dashboard-hud-light-20260826.jpg" alt="Kalshi Model dashboard and Standard Edge HUD in light mode"></td>
-    <td width="50%"><img src="docs/screenshots/dashboard-hud-dark-20260826.jpg" alt="Kalshi Model dashboard and Standard Edge HUD in dark mode"></td>
+    <td width="50%"><img src="docs/screenshots/dashboard-wide-hud-light-20260826.jpg" alt="Kalshi Model dashboard and Standard Edge HUD in light mode"></td>
+    <td width="50%"><img src="docs/screenshots/dashboard-wide-hud-dark-20260826.jpg" alt="Kalshi Model dashboard and Standard Edge HUD in dark mode"></td>
   </tr>
   <tr>
     <td align="center"><strong>Light</strong></td>
