@@ -46,6 +46,7 @@
   --red-soft: #ffe8eb;
   --amber: #9b671d;
   --amber-soft: #fcf1dc;
+  --hud-warning: #e39a00;
   --blue: #3476c5;
   --sidebar: #efefec;
   --sidebar-ink: #242421;
@@ -85,6 +86,7 @@
   --red-soft: #54242d;
   --amber: #e7b35e;
   --amber-soft: #40331f;
+  --hud-warning: #f2b632;
   --blue: #79aee8;
   --sidebar: #111110;
   --sidebar-ink: #eeeeea;
@@ -293,7 +295,7 @@ nav { display: grid; gap: 2px; }
 .standard-edge-hud-metric strong { font-family: var(--number-font); font-size: 10px; font-weight: 560; font-variant-numeric: tabular-nums; white-space: nowrap; }
 .standard-edge-hud-track { --progress: 0%; position: relative; height: 5px; overflow: hidden; background: var(--surface-hover); }
 .standard-edge-hud-track::after { position: absolute; top: -2px; right: 0; width: 1px; height: 9px; background: var(--ink); content: ""; opacity: 0.72; }
-.standard-edge-hud-track i { display: block; width: var(--progress); height: 100%; background: var(--amber); transition: width 180ms ease, background-color 180ms ease; }
+.standard-edge-hud-track i { display: block; width: var(--progress); height: 100%; background: var(--hud-warning); transition: width 180ms ease, background-color 180ms ease; }
 .standard-edge-hud-track.passed i { background: var(--green); }
 .standard-edge-hud-track.locked i { width: 0; background: var(--faint); }
 .standard-edge-hud-gates { display: grid; grid-template-columns: 1fr 1fr; gap: 9px 12px; margin-top: 18px; }
