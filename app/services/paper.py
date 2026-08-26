@@ -855,19 +855,28 @@ class PaperTradingService:
         inside_window = 0 < seconds_remaining <= entry_window
         if not enabled or not inside_window or not decision.side:
             self.reset_automatic_confirmation()
-            return {"armed": False, "progress": 0.0, "entered": False}
+            return {
+                "armed": False, "progress": 0.0, "ready": False,
+                "entered": False,
+            }
         if self._automatic_key != key:
             self.reset_automatic_confirmation()
             self._automatic_key = key
             self._automatic_started_at = current_time
             self._automatic_last_at = current_time
             self._automatic_last_buy = decision.signal == "BUY"
-            return {"armed": True, "progress": 0.0, "entered": False}
+            return {
+                "armed": True, "progress": 0.0, "ready": False,
+                "entered": False,
+            }
         assert self._automatic_started_at is not None
         assert self._automatic_last_at is not None
         if current_time < self._automatic_last_at:
             self.reset_automatic_confirmation()
-            return {"armed": False, "progress": 0.0, "entered": False}
+            return {
+                "armed": False, "progress": 0.0, "ready": False,
+                "entered": False,
+            }
         if current_time > self._automatic_last_at:
             self._automatic_segments.append(
                 (self._automatic_last_at, current_time, self._automatic_last_buy)
@@ -891,13 +900,14 @@ class PaperTradingService:
         )
         complete = observed >= window
         required_ratio = float(settings.get("automatic_buy_duration_pct", 0.70))
-        entered = False
-        if (
+        ready = bool(
             complete
             and decision.signal == "BUY"
             and ratio + 1e-9 >= required_ratio
             and confidence_ok
-        ):
+        )
+        entered = False
+        if ready:
             entered = self.open_from_decision(ticker, decision, model_version)
             if entered:
                 self.reset_automatic_confirmation()
@@ -906,6 +916,7 @@ class PaperTradingService:
             "progress": min(1.0, observed / window) if window > 0 else 1.0,
             "buy_duration_pct": ratio,
             "confidence_ok": confidence_ok,
+            "ready": ready,
             "entered": entered,
         }
 
@@ -914,6 +925,308 @@ class PaperTradingService:
             "SELECT id FROM paper_entries WHERE ticker=? AND source='automatic' LIMIT 1",
             (ticker,),
         ) is not None
+
+    @staticmethod
+    def _confidence_meets(decision: Decision, required: str) -> bool:
+        rank = {"Low": 0, "Moderate": 1, "High": 2}
+        return rank.get(decision.confidence, 0) >= rank.get(required, 2)
+
+    def _standard_candidates(
+        self,
+        decisions: dict[str, Decision],
+        required_confidence: str,
+    ) -> list[Decision]:
+        return [
+            decision
+            for decision in decisions.values()
+            if decision.signal == "BUY"
+            and decision.side in {"YES", "NO"}
+            and self._confidence_meets(decision, required_confidence)
+        ]
+
+    def _standard_entry_readiness(
+        self,
+        *,
+        ticker: str,
+        assessments: dict[str, dict[str, Any]],
+        standard_decisions: dict[str, Decision],
+        standard: Decision | None,
+        confirmation: dict[str, Any],
+        seconds_remaining: float,
+        status_open: bool,
+        priority_strategy: str | None,
+        blocked_reason: str | None,
+        entry_exists: bool,
+        portfolio: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Describe Standard Edge using the same inputs that drive execution."""
+        settings = self.db.settings()
+        probability_required = float(settings.get("minimum_buy_probability", 0.55))
+        ev_required = float(settings.get("buy_edge", settings.get("min_edge", 0.05)))
+        ev_required += float(settings.get("hold_buffer", 0.005))
+        confirmation_required = float(
+            settings.get("automatic_confirmation_seconds", 10)
+        )
+        entry_window = float(settings.get("automatic_entry_window_minutes", 5)) * 60
+        required_confidence = str(settings.get("automatic_min_confidence", "High"))
+        spread_required = (
+            float(settings.get("confidence_high_max_spread", 0.02))
+            if required_confidence == "High"
+            else float(settings.get("confidence_moderate_max_spread", 0.03))
+            if required_confidence == "Moderate"
+            else None
+        )
+        liquidity_required = int(settings.get("minimum_liquidity_contracts", 1))
+
+        def side_score(side: str) -> tuple[float, float, float]:
+            assessment = assessments.get(side) or {}
+            probability = float(assessment.get("model_probability") or 0.0)
+            raw_expected_value = (assessment.get("buy") or {}).get("expected_value")
+            expected_value = (
+                float(raw_expected_value) if raw_expected_value is not None else -1.0
+            )
+            probability_progress = probability / max(probability_required, 1e-9)
+            ev_progress = (
+                1.0
+                if ev_required <= 0 and expected_value >= ev_required
+                else max(0.0, expected_value) / max(ev_required, 1e-9)
+            )
+            return min(probability_progress, ev_progress), expected_value, probability
+
+        if standard is not None and standard.side in {"YES", "NO"}:
+            side = str(standard.side)
+        else:
+            available_sides = [
+                side
+                for side in ("YES", "NO")
+                if (assessments.get(side) or {}).get("model_probability") is not None
+            ]
+            side = max(available_sides, key=side_score, default="YES")
+        assessment = assessments.get(side) or {}
+        decision = standard_decisions.get(side)
+        buy = assessment.get("buy") or {}
+        probability = assessment.get("model_probability")
+        expected_value = buy.get("expected_value")
+        spread = assessment.get("spread")
+        liquidity = assessment.get("ask_size")
+        probability_value = float(probability) if probability is not None else None
+        ev_value = float(expected_value) if expected_value is not None else None
+        spread_value = float(spread) if spread is not None else None
+        liquidity_value = float(liquidity) if liquidity is not None else None
+
+        probability_passed = bool(
+            probability_value is not None
+            and probability_value + 1e-12 >= probability_required
+        )
+        ev_passed = bool(
+            ev_value is not None and ev_value + 1e-12 >= ev_required
+        )
+        spread_passed = bool(
+            spread_value is not None
+            and (spread_required is None or spread_value <= spread_required + 1e-12)
+        )
+        liquidity_passed = bool(
+            liquidity_value is not None
+            and liquidity_value + 1e-12 >= liquidity_required
+        )
+        confidence_ok = bool(
+            decision is not None
+            and self._confidence_meets(decision, required_confidence)
+        )
+        data_reliable = bool(assessment.get("data_reliable"))
+        trade_allowed = bool(assessment.get("trade_allowed"))
+        raw_data_passed = data_reliable and trade_allowed and status_open
+        data_passed = raw_data_passed
+        data_detail = str(assessment.get("quality_reason") or "Market data unavailable.")
+        quality_detail = "Entry quality is unavailable."
+        if decision is not None:
+            quality_detail = (
+                f"Entry quality is {decision.confidence}; {required_confidence} is required."
+            )
+        if not status_open:
+            data_detail = "The market is not active."
+
+        entered = bool(confirmation.get("entered"))
+        risk_passed = bool(portfolio.get("automatic_trade_allowed", False))
+        risk_detail = str(
+            portfolio.get("automatic_trade_block_reason") or "Risk controls are clear."
+        )
+        if entry_exists:
+            risk_passed = False
+            risk_detail = "An automatic entry already exists for this market."
+        elif decision is not None and decision.reason_code == "SIZE_TOO_SMALL":
+            risk_passed = False
+            risk_detail = decision.explanation
+        elif (
+            not entered
+            and risk_passed
+            and decision is not None
+            and decision.signal == "BUY"
+            and decision.executable_price is not None
+            and decision.suggested_contracts > 0
+        ):
+            try:
+                self._validate_buy(
+                    ticker,
+                    str(decision.side),
+                    float(decision.executable_price),
+                    int(decision.suggested_contracts),
+                )
+            except ValueError as exc:
+                risk_passed = False
+                risk_detail = str(exc)
+
+        enabled = bool(settings.get("paper_trading_enabled", False))
+        inside_window = 0 < seconds_remaining <= entry_window
+        priority_blocked = bool(
+            priority_strategy and priority_strategy != "STANDARD_EDGE"
+        )
+        prerequisites_passed = bool(
+            enabled
+            and inside_window
+            and not priority_blocked
+            and blocked_reason is None
+            and standard is not None
+            and probability_passed
+            and ev_passed
+            and spread_passed
+            and liquidity_passed
+            and data_passed
+            and confidence_ok
+            and risk_passed
+        )
+        confirmation_progress = (
+            min(1.0, max(0.0, float(confirmation.get("progress") or 0.0)))
+            if prerequisites_passed
+            else 0.0
+        )
+        confirmation_ready = bool(
+            prerequisites_passed
+            and (confirmation.get("ready") or confirmation.get("entered"))
+        )
+        if entered:
+            status = "ENTERED"
+        elif confirmation_ready:
+            status = "READY"
+        elif prerequisites_passed:
+            status = "CONFIRMING"
+        elif (
+            blocked_reason
+            or priority_blocked
+            or not enabled
+            or not inside_window
+            or not spread_passed
+            or not liquidity_passed
+            or not data_passed
+            or not confidence_ok
+            or not risk_passed
+        ):
+            status = "BLOCKED"
+        else:
+            status = "WATCHING"
+
+        if priority_blocked:
+            blocker = f"{str(priority_strategy).replace('_', ' ').title()} has priority."
+        elif blocked_reason:
+            blocker = blocked_reason
+        elif not enabled:
+            blocker = "Automatic paper trading is off."
+        elif not inside_window:
+            blocker = "Outside the Standard Edge entry window."
+        elif not raw_data_passed:
+            blocker = data_detail
+        elif not risk_passed:
+            blocker = risk_detail
+        elif not spread_passed:
+            blocker = "Spread exceeds the Standard Edge limit."
+        elif not liquidity_passed:
+            blocker = "Not enough contracts are available at the ask."
+        elif not confidence_ok:
+            blocker = quality_detail
+        elif not probability_passed:
+            shortfall = probability_required - float(probability_value or 0.0)
+            blocker = f"Waiting for {shortfall * 100:.1f} points more win chance."
+        elif not ev_passed:
+            shortfall = ev_required - float(ev_value or 0.0)
+            blocker = f"Waiting for {shortfall * 100:.1f} cents more EV."
+        elif confirmation_ready:
+            blocker = "Entry is ready."
+        else:
+            remaining = max(
+                0.0, confirmation_required * (1.0 - confirmation_progress)
+            )
+            blocker = f"Confirming for {remaining:.1f} more seconds."
+
+        return {
+            "strategy": "STANDARD_EDGE",
+            "side": side,
+            "status": status,
+            "ready": confirmation_ready,
+            "entered": entered,
+            "priority_strategy": priority_strategy,
+            "blocker": blocker,
+            "metrics": {
+                "probability": {
+                    "current": probability_value,
+                    "required": probability_required,
+                    "progress": min(
+                        1.0,
+                        max(0.0, float(probability_value or 0.0))
+                        / max(probability_required, 1e-9),
+                    ),
+                    "passed": probability_passed,
+                },
+                "net_ev": {
+                    "current": ev_value,
+                    "required": ev_required,
+                    "progress": min(
+                        1.0,
+                        1.0
+                        if ev_required <= 0 and ev_passed
+                        else max(0.0, float(ev_value or 0.0))
+                        / max(ev_required, 1e-9),
+                    ),
+                    "passed": ev_passed,
+                },
+                "confirmation": {
+                    "current_seconds": confirmation_progress * confirmation_required,
+                    "required_seconds": confirmation_required,
+                    "progress": confirmation_progress,
+                    "passed": confirmation_ready,
+                    "locked": not prerequisites_passed,
+                },
+            },
+            "gates": {
+                "spread": {
+                    "passed": spread_passed,
+                    "current": spread_value,
+                    "required": spread_required,
+                    "detail": "Spread is within the entry-quality limit."
+                    if spread_passed else "Spread exceeds the entry-quality limit.",
+                },
+                "liquidity": {
+                    "passed": liquidity_passed,
+                    "current": liquidity_value,
+                    "required": liquidity_required,
+                    "detail": "Enough contracts are available at the ask."
+                    if liquidity_passed else "Not enough contracts are available at the ask.",
+                },
+                "data": {
+                    "passed": data_passed,
+                    "detail": data_detail,
+                },
+                "quality": {
+                    "passed": confidence_ok,
+                    "current": decision.confidence if decision is not None else None,
+                    "required": required_confidence,
+                    "detail": quality_detail,
+                },
+                "risk": {
+                    "passed": risk_passed,
+                    "detail": risk_detail,
+                },
+            },
+        }
 
     def _fixed_strategy_size(
         self,
@@ -1143,6 +1456,7 @@ class PaperTradingService:
         settlement_window: dict[str, Any],
         z_distance: float,
         model_version: str,
+        portfolio: dict[str, Any] | None = None,
         now: float | None = None,
     ) -> dict[str, Any]:
         settings = self.db.settings()
@@ -1156,21 +1470,53 @@ class PaperTradingService:
             "standard_edge": dict(empty),
             "late_conviction": dict(empty),
         }
+        portfolio_state = portfolio or self.portfolio()
+        required_confidence = str(settings.get("automatic_min_confidence", "High"))
+        standard_candidates = self._standard_candidates(
+            standard_decisions, required_confidence
+        )
+        standard = max(
+            standard_candidates,
+            key=lambda item: float(item.expected_value or float("-inf")),
+            default=None,
+        )
+        status_open = str(market_status or "").lower() in {"active", "open"}
+        entry_exists = self._automatic_entry_exists(ticker)
+
+        def finish(
+            *,
+            priority_strategy: str | None = None,
+            blocked_reason: str | None = None,
+        ) -> dict[str, Any]:
+            result["standard_edge_readiness"] = self._standard_entry_readiness(
+                ticker=ticker,
+                assessments=assessments,
+                standard_decisions=standard_decisions,
+                standard=standard,
+                confirmation=result["standard_edge"],
+                seconds_remaining=seconds_remaining,
+                status_open=status_open,
+                priority_strategy=priority_strategy,
+                blocked_reason=blocked_reason,
+                entry_exists=entry_exists,
+                portfolio=portfolio_state,
+            )
+            return result
+
         if not bool(settings.get("paper_trading_enabled", False)):
             self.reset_automatic_confirmation()
-            return result
-        if self._automatic_entry_exists(ticker):
+            return finish(blocked_reason="Automatic paper trading is off.")
+        if entry_exists:
             self.reset_automatic_confirmation()
             result["blocked_reason"] = "An automatic entry already exists for this market."
-            return result
+            return finish(blocked_reason=result["blocked_reason"])
 
         observed = parse_time(market_observed_at)
         opened = parse_time(market_open_time)
-        status_open = str(market_status or "").lower() in {"active", "open"}
         if not status_open:
             self.reset_automatic_confirmation()
             result["blocked_reason"] = "The market is not active."
-            return result
+            return finish(blocked_reason=result["blocked_reason"])
         opening_elapsed = (
             (observed - opened).total_seconds()
             if observed is not None and opened is not None
@@ -1231,24 +1577,9 @@ class PaperTradingService:
                 result["early_threshold"]["entered"] = entered
                 if entered:
                     self.reset_automatic_confirmation()
-            return result
+            return finish(priority_strategy="EARLY_THRESHOLD")
         self._strategy_states.pop("EARLY_THRESHOLD", None)
 
-        confidence_rank = {"Low": 0, "Moderate": 1, "High": 2}
-        required_confidence = str(settings.get("automatic_min_confidence", "High"))
-        standard_candidates = [
-            decision
-            for decision in standard_decisions.values()
-            if decision.signal == "BUY"
-            and decision.side in {"YES", "NO"}
-            and confidence_rank.get(decision.confidence, 0)
-            >= confidence_rank.get(required_confidence, 2)
-        ]
-        standard = max(
-            standard_candidates,
-            key=lambda item: float(item.expected_value or float("-inf")),
-            default=None,
-        )
         if standard is not None:
             standard_result = self.consider_automatic_entry(
                 ticker=ticker, decision=standard, seconds_remaining=seconds_remaining,
@@ -1261,7 +1592,7 @@ class PaperTradingService:
                 standard.suggested_fraction or 0.0
             )
             self._strategy_states.pop("LATE_CONVICTION", None)
-            return result
+            return finish(priority_strategy="STANDARD_EDGE")
         self._reset_standard_confirmation()
 
         late_candidate = None
@@ -1306,9 +1637,9 @@ class PaperTradingService:
                 result["late_conviction"]["entered"] = entered
                 if entered:
                     self.reset_automatic_confirmation()
-            return result
+            return finish(priority_strategy="LATE_CONVICTION")
         self._strategy_states.pop("LATE_CONVICTION", None)
-        return result
+        return finish()
 
     def settle(self, ticker: str, result: int, settled_at: str) -> int:
         starting_bankroll = float(self.db.settings()["starting_bankroll"])

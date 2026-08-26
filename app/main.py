@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
@@ -28,6 +29,11 @@ db = Database(config.database_path)
 engine = AnalysisEngine(config, db)
 credential_store = CredentialStore()
 templates = Jinja2Templates(directory=ROOT / "app" / "templates")
+static_root = ROOT / "app" / "static"
+asset_digest = hashlib.sha256()
+for asset_name in ("styles.css", "app.js"):
+    asset_digest.update((static_root / asset_name).read_bytes())
+asset_version = asset_digest.hexdigest()[:12]
 
 
 @asynccontextmanager
@@ -44,12 +50,16 @@ app = FastAPI(
     version="0.1.0",
     lifespan=lifespan,
 )
-app.mount("/static", StaticFiles(directory=ROOT / "app" / "static"), name="static")
+app.mount("/static", StaticFiles(directory=static_root), name="static")
 
 
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request) -> HTMLResponse:
-    return templates.TemplateResponse(request=request, name="index.html")
+    return templates.TemplateResponse(
+        request=request,
+        name="index.html",
+        context={"asset_version": asset_version},
+    )
 
 
 @app.get("/favicon.ico", include_in_schema=False)

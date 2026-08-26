@@ -15,7 +15,7 @@
       document.documentElement.dataset.themePreference = preference;
     })();
   </script>
-  <link rel="stylesheet" href="/static/styles.css?v=0.4.1">
+  <link rel="stylesheet" href="/static/styles.css?v={{ asset_version }}">
 </head>
 <body>
   <div class="app-shell">
@@ -106,7 +106,8 @@
           </section>
         </div>
 
-        <div class="lower-grid">
+        <div class="dashboard-lower-stage">
+          <div class="lower-grid">
           <section class="contract-panel">
             <div class="section-heading"><div><h3>Current contract</h3><p id="contract-ticker">--</p></div><strong class="countdown" id="countdown">--:--</strong></div>
             <div class="threshold-block"><span>Threshold</span><strong id="threshold">--</strong><small id="distance-to-strike">--</small></div>
@@ -179,6 +180,45 @@
               <div id="open-order-list"></div>
             </div>
           </section>
+          </div>
+
+          <aside class="standard-edge-hud" id="standard-edge-hud" aria-label="Standard Edge entry readiness">
+            <div class="standard-edge-hud-inner">
+              <div class="standard-edge-hud-kicker">
+                <span>Standard Edge</span>
+                <button class="hud-help" type="button" aria-label="About Standard Edge" data-tooltip="Tracks the automatic Standard Edge strategy. Its side is selected independently from Manual Order.">i</button>
+              </div>
+              <div class="standard-edge-hud-heading">
+                <strong id="standard-edge-hud-side">--</strong>
+                <div class="standard-edge-hud-status-wrap">
+                  <span class="standard-edge-hud-state" id="standard-edge-hud-status" data-status="watching">Watching</span>
+                  <button class="hud-help" type="button" aria-label="About readiness status" data-tooltip="Watching means thresholds are incomplete. Confirming means every requirement is passing. Ready can enter; Blocked cannot.">i</button>
+                </div>
+              </div>
+
+              <div class="standard-edge-hud-metric">
+                <div><span class="hud-label">Win chance <button class="hud-help" type="button" aria-label="About win chance" data-tooltip="The model probability for the automatically selected side versus your configured minimum buy probability.">i</button></span><strong id="standard-edge-probability-value">-- / --</strong></div>
+                <div class="standard-edge-hud-track" id="standard-edge-probability-track" role="progressbar" aria-label="Standard Edge win chance" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><i id="standard-edge-probability-bar"></i></div>
+              </div>
+              <div class="standard-edge-hud-metric">
+                <div><span class="hud-label">Net EV <button class="hud-help" type="button" aria-label="About net expected value" data-tooltip="Expected profit per contract after executable price, fees, and slippage. The target includes the hold buffer.">i</button></span><strong id="standard-edge-ev-value">-- / --</strong></div>
+                <div class="standard-edge-hud-track" id="standard-edge-ev-track" role="progressbar" aria-label="Standard Edge net expected value" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><i id="standard-edge-ev-bar"></i></div>
+              </div>
+              <div class="standard-edge-hud-metric">
+                <div><span class="hud-label">Confirmation <button class="hud-help" type="button" aria-label="About confirmation" data-tooltip="Elapsed confirmation time versus the configured duration. It stays locked until every entry requirement passes and resets when one stops passing.">i</button></span><strong id="standard-edge-confirmation-value">Locked</strong></div>
+                <div class="standard-edge-hud-track locked" id="standard-edge-confirmation-track" role="progressbar" aria-label="Standard Edge confirmation" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><i id="standard-edge-confirmation-bar"></i></div>
+              </div>
+
+              <div class="standard-edge-hud-gates" aria-label="Standard Edge entry gates">
+                <span id="standard-edge-spread-gate"><i></i><b>Spread <button class="hud-help" type="button" aria-label="About spread" data-tooltip="Current bid-ask spread versus the maximum allowed for the required entry quality.">i</button></b><small>--</small></span>
+                <span id="standard-edge-liquidity-gate"><i></i><b>Liquidity <button class="hud-help" type="button" aria-label="About liquidity" data-tooltip="Contracts available at the executable ask versus the configured minimum.">i</button></b><small>--</small></span>
+                <span id="standard-edge-data-gate"><i></i><b>Data <button class="hud-help" type="button" aria-label="About data quality" data-tooltip="Whether critical feeds are current, reliable, mutually consistent, and the market is active.">i</button></b><small>--</small></span>
+                <span id="standard-edge-quality-gate"><i></i><b>Quality <button class="hud-help" type="button" aria-label="About entry quality" data-tooltip="Current decision strength versus the minimum confidence required for automatic Standard Edge entries.">i</button></b><small>--</small></span>
+                <span id="standard-edge-risk-gate"><i></i><b>Risk <button class="hud-help" type="button" aria-label="About risk controls" data-tooltip="Whether bankroll, drawdown, position, duplicate-entry, and sizing controls permit an automatic entry.">i</button></b><small>--</small></span>
+              </div>
+              <p class="standard-edge-hud-blocker"><button class="hud-help" type="button" aria-label="About the primary blocker" data-tooltip="The first requirement currently preventing Standard Edge confirmation or entry.">i</button><span id="standard-edge-hud-blocker">Waiting for live trade data.</span></p>
+            </div>
+          </aside>
         </div>
 
         <div class="orderbook-grid">
@@ -318,6 +358,6 @@
     </main>
   </div>
   <div class="toast" id="toast" role="status" aria-live="polite" hidden><strong id="toast-title"></strong><span id="toast-detail"></span></div>
-  <script src="/static/app.js?v=0.4.1" defer></script>
+  <script src="/static/app.js?v={{ asset_version }}" defer></script>
 </body>
 </html>

@@ -44,16 +44,21 @@ def test_database_migrations_and_settings_persist(tmp_path: Path) -> None:
     assert ModelManager(reopened).active()["version"] == "baseline-1.1"
 
 
-def test_new_database_starts_with_clean_manual_paper_account(tmp_path: Path) -> None:
+def test_new_database_uses_project_calibration_and_paper_defaults(tmp_path: Path) -> None:
     db = make_db(tmp_path)
     settings = db.settings()
     portfolio = PaperTradingService(db).portfolio()
 
     assert settings["starting_bankroll"] == 1_000.0
-    assert settings["paper_trading_enabled"] is False
+    assert settings["paper_trading_enabled"] is True
+    assert settings["minimum_buy_probability"] == 0.65
+    assert settings["min_edge"] == 0.10
+    assert settings["automatic_confirmation_seconds"] == 5
+    assert settings["early_entry_window_seconds"] == 60
+    assert settings["late_min_probability"] == 0.79
     assert portfolio["starting_bankroll"] == 1_000.0
     assert portfolio["current_bankroll"] == 1_000.0
-    assert portfolio["automatic_trading_enabled"] is False
+    assert portfolio["automatic_trading_enabled"] is True
     assert portfolio["trades"] == []
     assert portfolio["orders"] == []
 

@@ -274,7 +274,89 @@ nav { display: grid; gap: 2px; }
 .metric-list dd { margin: 0; font-size: 12px; font-weight: 500; text-align: right; }
 .quality-row { display: flex; align-items: center; gap: 8px; padding-top: 14px; color: var(--muted); font-size: 10px; }
 
+.dashboard-lower-stage { position: relative; display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+.dashboard-lower-stage > .lower-grid { grid-column: 1 / -1; }
 .lower-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+.standard-edge-hud { min-width: 0; grid-column: 2; padding: 5px 0 7px 18px; border-left: 1px solid var(--line-strong); background: transparent; }
+.standard-edge-hud-inner { min-width: 0; }
+.standard-edge-hud-kicker { display: flex; align-items: center; gap: 5px; color: var(--muted); font-size: 8px; font-weight: 760; letter-spacing: 0.13em; text-transform: uppercase; }
+.standard-edge-hud-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; margin: 5px 0 18px; }
+.standard-edge-hud-heading strong { font-size: 15px; font-weight: 720; text-transform: uppercase; }
+.standard-edge-hud-status-wrap { display: flex; align-items: center; gap: 5px; }
+.standard-edge-hud-state { color: var(--amber); font-size: 8px; font-weight: 760; letter-spacing: 0.08em; text-transform: uppercase; }
+.standard-edge-hud-state[data-status="ready"], .standard-edge-hud-state[data-status="entered"] { color: var(--green); }
+.standard-edge-hud-state[data-status="blocked"] { color: var(--red); }
+.standard-edge-hud-metric { margin-bottom: 14px; }
+.standard-edge-hud-metric > div:first-child { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; margin-bottom: 6px; }
+.standard-edge-hud-metric span { color: var(--muted); font-size: 9px; font-weight: 650; }
+.hud-label { display: inline-flex; align-items: center; gap: 5px; }
+.standard-edge-hud-metric strong { font-family: var(--number-font); font-size: 10px; font-weight: 560; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.standard-edge-hud-track { --progress: 0%; position: relative; height: 5px; overflow: hidden; background: var(--surface-hover); }
+.standard-edge-hud-track::after { position: absolute; top: -2px; right: 0; width: 1px; height: 9px; background: var(--ink); content: ""; opacity: 0.72; }
+.standard-edge-hud-track i { display: block; width: var(--progress); height: 100%; background: var(--amber); transition: width 180ms ease, background-color 180ms ease; }
+.standard-edge-hud-track.passed i { background: var(--green); }
+.standard-edge-hud-track.locked i { width: 0; background: var(--faint); }
+.standard-edge-hud-gates { display: grid; grid-template-columns: 1fr 1fr; gap: 9px 12px; margin-top: 18px; }
+.standard-edge-hud-gates > span { display: grid; min-width: 0; grid-template-columns: 6px minmax(0, 1fr); align-items: center; column-gap: 6px; }
+.standard-edge-hud-gates i { width: 6px; height: 6px; grid-row: 1 / 3; border-radius: 50%; background: var(--red); box-shadow: 0 0 0 3px color-mix(in srgb, var(--red) 10%, transparent); }
+.standard-edge-hud-gates span.pass i { background: var(--green); box-shadow: 0 0 0 3px color-mix(in srgb, var(--green) 10%, transparent); }
+.standard-edge-hud-gates b, .standard-edge-hud-gates small { min-width: 0; white-space: nowrap; }
+.standard-edge-hud-gates b { display: flex; align-items: center; gap: 4px; overflow: visible; color: var(--muted); font-size: 8px; font-weight: 700; }
+.standard-edge-hud-gates small { overflow: hidden; text-overflow: ellipsis; }
+.standard-edge-hud-gates small { margin-top: 2px; color: var(--faint); font-family: var(--number-font); font-size: 8px; font-variant-numeric: tabular-nums; }
+.standard-edge-hud-blocker { display: flex; min-height: 28px; align-items: flex-start; gap: 6px; margin: 18px 0 0; color: var(--amber); font-size: 9px; line-height: 1.45; }
+.standard-edge-hud[data-status="ready"] .standard-edge-hud-blocker, .standard-edge-hud[data-status="entered"] .standard-edge-hud-blocker { color: var(--green); }
+.standard-edge-hud[data-status="blocked"] .standard-edge-hud-blocker { color: var(--red); }
+.hud-help {
+  position: relative;
+  display: inline-grid;
+  width: 12px;
+  height: 12px;
+  flex: 0 0 12px;
+  place-items: center;
+  padding: 0;
+  border: 1px solid color-mix(in srgb, var(--faint) 58%, transparent);
+  border-radius: 50%;
+  color: var(--faint);
+  background: transparent;
+  font-family: var(--number-font);
+  font-size: 8px;
+  font-weight: 650;
+  line-height: 1;
+  opacity: 0.62;
+  cursor: help;
+  transition: color 120ms ease, border-color 120ms ease, opacity 120ms ease;
+}
+.hud-help:hover, .hud-help:focus-visible { border-color: var(--muted); color: var(--muted); opacity: 1; }
+.hud-help:focus-visible { outline-width: 1px; outline-offset: 2px; }
+.hud-help::after {
+  position: absolute;
+  z-index: 30;
+  right: -4px;
+  bottom: calc(100% + 8px);
+  width: 218px;
+  padding: 9px 10px;
+  border: 1px solid var(--line-strong);
+  border-radius: 5px;
+  color: var(--bg);
+  background: var(--ink);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.18);
+  content: attr(data-tooltip);
+  font-family: inherit;
+  font-size: 10px;
+  font-weight: 520;
+  letter-spacing: 0;
+  line-height: 1.4;
+  text-align: left;
+  text-transform: none;
+  white-space: normal;
+  opacity: 0;
+  pointer-events: none;
+  transform: translateY(3px);
+  transition: opacity 100ms ease, transform 100ms ease;
+}
+.hud-help:hover::after, .hud-help:focus-visible::after { opacity: 1; transform: translateY(0); }
+.standard-edge-hud-kicker .hud-help::after { top: calc(100% + 8px); bottom: auto; }
 .orderbook-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-top: 14px; }
 .orderbook-panel { min-width: 0; padding: 18px 20px 20px; }
 .orderbook-heading { margin-bottom: 14px; }
@@ -590,7 +672,8 @@ td { padding: 12px 16px; border-top: 1px solid var(--line); white-space: nowrap;
   .chart-tools > span { width: 100%; text-align: right; }
   .chart-wrap { height: 238px; }
   .chart-legend { flex-wrap: wrap; gap: 8px 14px; }
-  .lower-grid, .orderbook-grid, .settings-layout { grid-template-columns: 1fr; gap: 10px; }
+  .dashboard-lower-stage, .lower-grid, .orderbook-grid, .settings-layout { grid-template-columns: 1fr; gap: 10px; }
+  .standard-edge-hud { grid-column: 1; padding: 15px 0 2px; border-top: 1px solid var(--line-strong); border-left: 0; }
   .calibration-layout { grid-template-columns: 1fr; gap: 8px; padding-bottom: 24px; }
   .calibration-results { position: static; }
   .calibration-control { grid-template-columns: 1fr; gap: 8px; padding: 11px 0; }
@@ -613,6 +696,33 @@ td { padding: 12px 16px; border-top: 1px solid var(--line); white-space: nowrap;
   .calibration-bars { grid-template-columns: repeat(6, minmax(76px, 1fr)); gap: 6px; overflow-x: auto; }
   .section-heading { align-items: flex-start; }
   .button-row { flex-direction: column; }
+}
+
+@media (min-width: 2200px) {
+  .standard-edge-hud {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    left: calc(100% + 28px);
+    width: clamp(220px, calc((100vw - 1752px) / 2 - 28px), 320px);
+    padding: 7px 0 9px clamp(20px, 1.15vw, 28px);
+  }
+  .standard-edge-hud-inner { position: sticky; top: 24px; }
+  .standard-edge-hud-kicker { font-size: clamp(8px, 0.42vw, 10px); }
+  .standard-edge-hud-heading { margin: 6px 0 clamp(20px, 1.15vw, 28px); }
+  .standard-edge-hud-heading strong { font-size: clamp(16px, 0.86vw, 20px); }
+  .standard-edge-hud-state { font-size: clamp(8px, 0.42vw, 10px); }
+  .standard-edge-hud-metric { margin-bottom: clamp(16px, 0.9vw, 21px); }
+  .standard-edge-hud-metric > div:first-child { margin-bottom: 8px; }
+  .standard-edge-hud-metric span { font-size: clamp(9px, 0.47vw, 11px); }
+  .standard-edge-hud-metric strong { font-size: clamp(10px, 0.51vw, 12px); }
+  .standard-edge-hud-track { height: clamp(5px, 0.28vw, 7px); }
+  .standard-edge-hud-gates { gap: 12px 18px; margin-top: clamp(20px, 1.1vw, 26px); }
+  .standard-edge-hud-gates > span { grid-template-columns: 7px minmax(0, 1fr); column-gap: 8px; }
+  .standard-edge-hud-gates i { width: 7px; height: 7px; }
+  .standard-edge-hud-gates b { font-size: clamp(8px, 0.42vw, 10px); }
+  .standard-edge-hud-gates small { font-size: clamp(8px, 0.42vw, 10px); }
+  .standard-edge-hud-blocker { margin-top: clamp(20px, 1.1vw, 26px); font-size: clamp(9px, 0.47vw, 11px); }
 }
 
 @media (prefers-reduced-motion: reduce) {

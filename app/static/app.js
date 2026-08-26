@@ -224,6 +224,78 @@ function renderTradeAssessment() {
   $("#trade-ev").className = Number(economics?.expected_value) > 0 ? "positive" : Number(economics?.expected_value) < 0 ? "negative" : "";
 }
 
+function renderReadinessProgress(trackSelector, metric, locked = false) {
+  const track = $(trackSelector);
+  if (!track) return;
+  const progress = Math.max(0, Math.min(1, Number(metric?.progress || 0)));
+  track.style.setProperty("--progress", `${(progress * 100).toFixed(1)}%`);
+  track.classList.toggle("passed", Boolean(metric?.passed));
+  track.classList.toggle("locked", Boolean(locked));
+  track.setAttribute("aria-valuenow", String(Math.round(progress * 100)));
+  track.setAttribute("aria-valuetext", locked ? "Locked" : `${Math.round(progress * 100)}%`);
+}
+
+function renderReadinessGate(selector, gate, value) {
+  const element = $(selector);
+  if (!element) return;
+  element.classList.toggle("pass", Boolean(gate?.passed));
+  element.querySelector("small").textContent = value;
+  element.title = gate?.detail || "";
+}
+
+function renderStandardEdgeHud(readiness) {
+  const hud = $("#standard-edge-hud");
+  if (!hud) return;
+  const metrics = readiness?.metrics || {};
+  const probability = metrics.probability || {};
+  const netEv = metrics.net_ev || {};
+  const confirmation = metrics.confirmation || {};
+  const gates = readiness?.gates || {};
+  const status = String(readiness?.status || "WATCHING").toLowerCase();
+
+  hud.dataset.status = status;
+  $("#standard-edge-hud-side").textContent = readiness?.side
+    ? marketSideLabel(readiness.side)
+    : "--";
+  const statusElement = $("#standard-edge-hud-status");
+  statusElement.dataset.status = status;
+  statusElement.textContent = status.charAt(0).toUpperCase() + status.slice(1);
+  $("#standard-edge-probability-value").textContent = probability.current == null
+    ? `-- / ${percent(probability.required, 0)}`
+    : `${percent(probability.current, 1)} / ${percent(probability.required, 0)}`;
+  $("#standard-edge-ev-value").textContent = netEv.current == null
+    ? `-- / ${cents(netEv.required, 1)}`
+    : `${cents(netEv.current, 1)} / ${cents(netEv.required, 1)}`;
+  $("#standard-edge-confirmation-value").textContent = confirmation.locked
+    ? "Locked"
+    : `${Number(confirmation.current_seconds || 0).toFixed(1)} / ${Number(confirmation.required_seconds || 0).toFixed(0)}s`;
+  renderReadinessProgress("#standard-edge-probability-track", probability);
+  renderReadinessProgress("#standard-edge-ev-track", netEv);
+  renderReadinessProgress(
+    "#standard-edge-confirmation-track", confirmation, Boolean(confirmation.locked),
+  );
+
+  const spread = gates.spread || {};
+  const spreadValue = spread.current == null
+    ? "--"
+    : spread.required == null ? cents(spread.current, 1) : `${cents(spread.current, 1)} / ${cents(spread.required, 1)}`;
+  const liquidity = gates.liquidity || {};
+  const liquidityValue = liquidity.current == null
+    ? "--"
+    : `${compact(liquidity.current)} / ${compact(liquidity.required)}`;
+  renderReadinessGate("#standard-edge-spread-gate", spread, spreadValue);
+  renderReadinessGate("#standard-edge-liquidity-gate", liquidity, liquidityValue);
+  renderReadinessGate("#standard-edge-data-gate", gates.data, gates.data?.passed ? "Fresh" : "Blocked");
+  const quality = gates.quality || {};
+  const qualityValue = quality.current == null
+    ? "--"
+    : `${quality.current} / ${quality.required || "--"}`;
+  renderReadinessGate("#standard-edge-quality-gate", quality, qualityValue);
+  renderReadinessGate("#standard-edge-risk-gate", gates.risk, gates.risk?.passed ? "Clear" : "Blocked");
+  $("#standard-edge-hud-blocker").textContent = readiness?.blocker
+    || "Waiting for live trade data.";
+}
+
 function renderDashboard(data) {
   state.dashboard = data;
   const system = data.system || {};
@@ -331,6 +403,10 @@ function renderDashboard(data) {
     btcConnection.textContent = sources.length ? `${sources.join(" + ")} live` : "REST fallback";
   }
 
+  renderStandardEdgeHud(
+    current?.standard_edge_readiness
+      || current?.automatic_entry?.standard_edge_readiness,
+  );
   renderTradeAssessment();
   renderOrderBook(state.paperOrder.side, current?.orderbook || {});
   renderRecentPaperTrades(data.paper?.recent_paper_trades || []);

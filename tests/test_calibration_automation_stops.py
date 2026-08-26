@@ -142,7 +142,11 @@ def test_automatic_confirmation_resets_and_requires_buy_at_completion(tmp_path: 
     db = make_db(tmp_path)
     add_market(db, "A")
     add_market(db, "B")
-    db.update_settings({"paper_trading_enabled": True, "automatic_min_confidence": "High"})
+    db.update_settings({
+        "paper_trading_enabled": True,
+        "automatic_entry_window_minutes": 5,
+        "automatic_min_confidence": "High",
+    })
     service = PaperTradingService(db)
 
     service.consider_automatic_entry(

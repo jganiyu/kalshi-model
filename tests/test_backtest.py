@@ -75,6 +75,6 @@ def test_backtest_excludes_low_probability_value_bets(tmp_path: Path) -> None:
 
     result = BacktestService(db).run(0.05)
 
-    assert result["minimum_buy_probability"] == 0.55
+    assert result["minimum_buy_probability"] == 0.65
     assert result["trades"] == 1
     assert result["trade_log"][0]["ticker"] == "LIKELY-UP"

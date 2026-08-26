@@ -205,7 +205,7 @@ def test_limit_validation_and_bankroll_controls(tmp_path: Path) -> None:
             dollars=2_000,
         )
 
-    db.update_settings({"risk_controls_enabled": True})
+    db.update_settings({"risk_controls_enabled": True, "max_risk_per_trade_pct": 0.03})
     with pytest.raises(ValueError, match="maximum risk per trade"):
         service.place_order(
             ticker="TEST-MARKET",

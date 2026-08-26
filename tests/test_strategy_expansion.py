@@ -50,6 +50,17 @@ def hold(side: str) -> Decision:
     )
 
 
+def buy(side: str, assessment: dict, confidence: str = "Moderate") -> Decision:
+    economics = assessment["buy"]
+    return Decision(
+        "BUY", "BUY_EDGE", confidence, "fixture",
+        assessment["model_probability"], assessment["market_probability"],
+        economics["net_edge"], economics["expected_value"],
+        economics["executable_price"], economics["fee_per_contract"],
+        0.02, 20.0, 20, side,
+    )
+
+
 def assessments(
     probability: float = 0.75,
     *,
@@ -92,11 +103,14 @@ def strategy_call(
     status: str = "active",
     coverage: float = 0.0,
     z_distance: float = 0.0,
+    standard_decisions: dict[str, Decision] | None = None,
 ) -> dict:
     return service.consider_strategies(
         ticker=ticker,
         assessments=side_assessments,
-        standard_decisions={"YES": hold("YES"), "NO": hold("NO")},
+        standard_decisions=standard_decisions or {
+            "YES": hold("YES"), "NO": hold("NO")
+        },
         seconds_remaining=seconds_remaining,
         market_status=status,
         market_open_time="2026-08-24T12:00:00+00:00",
@@ -118,6 +132,181 @@ def test_buy_and_sell_ev_are_action_specific() -> None:
     )
     assert result["buy"]["executable_price"] > 0.83
     assert result["sell"]["executable_price"] < 0.82
+
+
+def test_standard_readiness_uses_automatic_side_and_effective_target(
+    tmp_path: Path,
+) -> None:
+    db = make_db(tmp_path)
+    add_market(db, "STANDARD-HUD")
+    db.update_settings(
+        {
+            "selected_side": "YES",
+            "early_threshold_enabled": False,
+            "late_conviction_enabled": False,
+            "minimum_buy_probability": 0.65,
+            "buy_edge": 0.10,
+            "hold_buffer": 0.005,
+            "automatic_confirmation_seconds": 5,
+            "automatic_entry_window_minutes": 15,
+            "automatic_min_confidence": "Moderate",
+        }
+    )
+    service = PaperTradingService(db)
+    side_assessments = assessments(0.28, yes_bid=0.48, yes_ask=0.50)
+    decisions = {
+        "YES": hold("YES"),
+        "NO": buy("NO", side_assessments["NO"]),
+    }
+
+    confirming = strategy_call(
+        service,
+        ticker="STANDARD-HUD",
+        side_assessments=side_assessments,
+        observed_at="2026-08-24T12:01:00+00:00",
+        standard_decisions=decisions,
+        now=0,
+    )
+    readiness = confirming["standard_edge_readiness"]
+
+    assert db.settings()["selected_side"] == "YES"
+    assert readiness["side"] == "NO"
+    assert readiness["status"] == "CONFIRMING"
+    assert readiness["metrics"]["probability"]["current"] == pytest.approx(0.72)
+    assert readiness["metrics"]["probability"]["required"] == pytest.approx(0.65)
+    assert readiness["metrics"]["net_ev"]["required"] == pytest.approx(0.105)
+    assert readiness["metrics"]["confirmation"]["locked"] is False
+    assert all(gate["passed"] for gate in readiness["gates"].values())
+
+    entered = strategy_call(
+        service,
+        ticker="STANDARD-HUD",
+        side_assessments=side_assessments,
+        observed_at="2026-08-24T12:01:05+00:00",
+        standard_decisions=decisions,
+        now=5,
+    )
+    readiness = entered["standard_edge_readiness"]
+    assert entered["entered"] is True
+    assert readiness["status"] == "ENTERED"
+    assert readiness["ready"] is True
+    assert all(metric["passed"] for metric in readiness["metrics"].values())
+
+
+def test_standard_readiness_confirmation_resets_when_side_changes(
+    tmp_path: Path,
+) -> None:
+    db = make_db(tmp_path)
+    add_market(db, "STANDARD-RESET")
+    db.update_settings(
+        {
+            "early_threshold_enabled": False,
+            "late_conviction_enabled": False,
+            "buy_edge": 0.05,
+            "automatic_confirmation_seconds": 5,
+            "automatic_entry_window_minutes": 15,
+            "automatic_min_confidence": "Moderate",
+        }
+    )
+    service = PaperTradingService(db)
+    down_assessments = assessments(0.25, yes_bid=0.48, yes_ask=0.50)
+    up_assessments = assessments(0.75, yes_bid=0.48, yes_ask=0.50)
+    down_decisions = {
+        "YES": hold("YES"), "NO": buy("NO", down_assessments["NO"]),
+    }
+    up_decisions = {
+        "YES": buy("YES", up_assessments["YES"]), "NO": hold("NO"),
+    }
+
+    strategy_call(
+        service, ticker="STANDARD-RESET", side_assessments=down_assessments,
+        observed_at="2026-08-24T12:01:00+00:00",
+        standard_decisions=down_decisions, now=0,
+    )
+    progressed = strategy_call(
+        service, ticker="STANDARD-RESET", side_assessments=down_assessments,
+        observed_at="2026-08-24T12:01:02+00:00",
+        standard_decisions=down_decisions, now=2,
+    )
+    switched = strategy_call(
+        service, ticker="STANDARD-RESET", side_assessments=up_assessments,
+        observed_at="2026-08-24T12:01:03+00:00",
+        standard_decisions=up_decisions, now=3,
+    )
+
+    assert progressed["standard_edge_readiness"]["metrics"]["confirmation"][
+        "progress"
+    ] == pytest.approx(0.4)
+    assert switched["standard_edge_readiness"]["side"] == "YES"
+    assert switched["standard_edge_readiness"]["metrics"]["confirmation"][
+        "progress"
+    ] == pytest.approx(0.0)
+
+
+def test_standard_readiness_locks_when_spread_gate_fails(tmp_path: Path) -> None:
+    db = make_db(tmp_path)
+    add_market(db, "STANDARD-SPREAD")
+    db.update_settings(
+        {
+            "early_threshold_enabled": False,
+            "late_conviction_enabled": False,
+            "automatic_min_confidence": "Moderate",
+        }
+    )
+    service = PaperTradingService(db)
+    wide = assessments(0.75, yes_bid=0.40, yes_ask=0.45)
+
+    result = strategy_call(
+        service,
+        ticker="STANDARD-SPREAD",
+        side_assessments=wide,
+        observed_at="2026-08-24T12:01:00+00:00",
+        seconds_remaining=200,
+        now=0,
+    )
+    readiness = result["standard_edge_readiness"]
+
+    assert readiness["status"] == "BLOCKED"
+    assert readiness["gates"]["spread"]["passed"] is False
+    assert readiness["blocker"] == "Spread exceeds the Standard Edge limit."
+    assert readiness["metrics"]["confirmation"]["locked"] is True
+    assert readiness["metrics"]["confirmation"]["progress"] == 0
+
+
+def test_standard_readiness_separates_data_from_entry_quality(tmp_path: Path) -> None:
+    db = make_db(tmp_path)
+    add_market(db, "STANDARD-QUALITY")
+    db.update_settings(
+        {
+            "early_threshold_enabled": False,
+            "late_conviction_enabled": False,
+            "automatic_min_confidence": "Moderate",
+        }
+    )
+    service = PaperTradingService(db)
+    side_assessments = assessments(0.75)
+    decisions = {
+        "YES": buy("YES", side_assessments["YES"], confidence="Low"),
+        "NO": hold("NO"),
+    }
+
+    result = strategy_call(
+        service,
+        ticker="STANDARD-QUALITY",
+        side_assessments=side_assessments,
+        standard_decisions=decisions,
+        observed_at="2026-08-24T12:01:00+00:00",
+        seconds_remaining=200,
+        now=0,
+    )
+    readiness = result["standard_edge_readiness"]
+
+    assert readiness["gates"]["data"]["passed"] is True
+    assert readiness["gates"]["quality"]["passed"] is False
+    assert readiness["gates"]["quality"]["current"] == "Low"
+    assert readiness["gates"]["quality"]["required"] == "Moderate"
+    assert readiness["blocker"] == "Entry quality is Low; Moderate is required."
+    assert readiness["metrics"]["confirmation"]["locked"] is True
 
 
 def test_early_threshold_waits_for_stability_and_next_quote(tmp_path: Path) -> None:
@@ -167,6 +356,9 @@ def test_early_threshold_waits_for_stability_and_next_quote(tmp_path: Path) -> N
     )
 
     assert armed["active_strategy"] == "EARLY_THRESHOLD"
+    assert armed["standard_edge_readiness"]["status"] == "BLOCKED"
+    assert armed["standard_edge_readiness"]["priority_strategy"] == "EARLY_THRESHOLD"
+    assert "priority" in armed["standard_edge_readiness"]["blocker"]
     assert armed["effective_bankroll_allocation"] == pytest.approx(0.03)
     assert same_quote["early_threshold"]["next_quote_seen"] is False
     assert same_quote["entered"] is False
@@ -431,5 +623,14 @@ def test_dashboard_markup_has_one_book_and_paper_trade_history() -> None:
     assert "up-orderbook-rows" not in markup
     assert "down-orderbook-rows" not in markup
     assert 'id="recent-paper-trades"' in markup
+    assert 'id="standard-edge-hud"' in markup
+    assert 'id="standard-edge-confirmation-track"' in markup
+    assert 'id="standard-edge-quality-gate"' in markup
+    assert markup.count('class="hud-help"') == 11
+    assert 'data-tooltip="The model probability' in markup
+    assert 'aria-label="About risk controls"' in markup
+    assert markup.count("v={{ asset_version }}") == 2
+    assert "v=0.4.1" not in markup
     assert "recent_paper_trades" in script
+    assert "standard_edge_readiness" in script
     assert 'api("/api/model-side"' not in script

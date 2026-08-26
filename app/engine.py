@@ -1086,6 +1086,7 @@ class AnalysisEngine:
             settlement_window=settlement_window,
             z_distance=baseline.z_distance,
             model_version=model_version,
+            portfolio=portfolio,
         )
         summary = self._market_summary(market)
         summary.update(
@@ -1115,6 +1116,9 @@ class AnalysisEngine:
                 "trade_assessments": assessments,
                 "threshold_state": threshold_state,
                 "automatic_entry": automatic_entry,
+                "standard_edge_readiness": automatic_entry.get(
+                    "standard_edge_readiness"
+                ),
             }
         )
         return summary, notification
