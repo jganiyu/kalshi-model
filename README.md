@@ -6,8 +6,8 @@ A local macOS research and paper-trading app for Kalshi's 15-minute Bitcoin Up o
 
 <table>
   <tr>
-    <td width="50%"><img src="docs/screenshots/dashboard-available-after-light-20260825.jpg" alt="Kalshi Model dashboard in light mode"></td>
-    <td width="50%"><img src="docs/screenshots/dashboard-available-after-dark-20260825.jpg" alt="Kalshi Model dashboard in dark mode"></td>
+    <td width="50%"><img src="docs/screenshots/dashboard-hud-light-20260826.jpg" alt="Kalshi Model dashboard and Standard Edge HUD in light mode"></td>
+    <td width="50%"><img src="docs/screenshots/dashboard-hud-dark-20260826.jpg" alt="Kalshi Model dashboard and Standard Edge HUD in dark mode"></td>
   </tr>
   <tr>
     <td align="center"><strong>Light</strong></td>
@@ -17,7 +17,7 @@ A local macOS research and paper-trading app for Kalshi's 15-minute Bitcoin Up o
 
 ## Features
 
-- **Dashboard:** Live BTC proxy, outcome forecast, side-specific order book, recent paper trades, and manual controls.
+- **Dashboard:** Live BTC proxy, outcome forecast, Standard Edge readiness HUD, order book, recent trades, and manual controls.
 - **BTC proxy:** Median Coinbase, Kraken, and Bitstamp price with learned BRTI uncertainty.
 - **Paper trading:** Manual and automatic strategies with available funds recorded after each transaction.
 - **Calibration:** Tune each strategy and review its results separately.
@@ -31,6 +31,14 @@ A local macOS research and paper-trading app for Kalshi's 15-minute Bitcoin Up o
 - **Uncertain:** Up probability is above 40% and below 60%.
 - **Likely Down:** Up probability is 40% or lower.
 - The forecast always describes the expected outcome; price, edge, and trade action stay in **Trade assessment**.
+
+## Standard Edge HUD
+
+![Standard Edge entry-readiness HUD](docs/screenshots/standard-edge-hud-light-20260826.jpg)
+
+- Win chance and net EV fill toward their configured targets; confirmation starts only after every entry requirement passes.
+- Spread, liquidity, data, quality, and risk show what is blocking an automatic entry.
+- Hover over an info icon for a plain-language explanation of any metric.
 
 ## Calibration
 
