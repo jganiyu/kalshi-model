@@ -333,6 +333,7 @@ function renderDashboard(data) {
     ? automaticEntry[activeStrategy.toLowerCase()] || {}
     : {};
   const automaticAllocation = Number(automaticEntry.effective_bankroll_allocation || 0);
+  const swingReadiness = automaticEntry.swing_readiness || current?.swing_readiness;
   const allocationLabel = automaticAllocation > 0
     ? ` · ${percent(automaticAllocation, 1)} bankroll`
     : "";
@@ -341,7 +342,11 @@ function renderDashboard(data) {
     : automaticTradingEnabled
       ? confirmation.armed
         ? `${String(activeStrategy).replaceAll("_", " ")} armed · ${Math.round(Number(confirmation.progress || 0) * 100)}% confirmed${allocationLabel}`
-        : "Automatic trading on · waiting for entry window"
+        : swingReadiness?.status === "OPEN"
+          ? `Swing position open · ${swingReadiness.blocker}`
+          : swingReadiness?.status !== "DISABLED" && swingReadiness?.blocker
+            ? `Automatic trading on · ${swingReadiness.blocker}`
+            : "Automatic trading on · waiting for entry window"
       : "Automatic trading off";
   paperPermission.hidden = false;
   paperPermission.classList.toggle("on", automaticTradingEnabled && !paperBlocked);
@@ -993,8 +998,24 @@ const calibrationGroups = [
     { id: "late_max_spread", label: "Maximum spread", unit: "%", min: 0, max: 50, step: .5, scale: 100, tip: "Widest accepted spread for a late entry. Default: 3%." },
     { id: "late_min_liquidity_contracts", label: "Minimum liquidity", unit: "contracts", min: 1, max: 1000000, step: 1, integer: true, tip: "Minimum contracts available at the selected ask. Default: 1 contract." },
   ]],
+  ["Swing Trade", [
+    { id: "swing_enabled", label: "Swing strategy", type: "toggle", tip: "Buys a deeply discounted side early when the model supports it, then sells into a configured price move. Default: off." },
+    { id: "swing_entry_window_seconds", label: "Opening window", unit: "seconds", min: 1, max: 600, step: 1, tip: "Time after the official market open during which Swing may enter. Default: 300 seconds." },
+    { id: "swing_max_entry_price", label: "Maximum entry ask", unit: "cents", min: 1, max: 99, step: 1, scale: 100, tip: "Highest displayed ask that may qualify for Swing. Fees and slippage are added separately. Default: 5 cents." },
+    { id: "swing_target_exit_price", label: "Target exit bid", unit: "cents", min: 1, max: 99, step: 1, scale: 100, tip: "Displayed executable bid that triggers a Swing exit. Default: 10 cents." },
+    { id: "swing_bankroll_pct", label: "Bankroll allocation", unit: "% bankroll", min: 0, max: 100, step: 1, scale: 100, tip: "Target allocation before global trade and position caps. Default: 1%." },
+    { id: "swing_min_model_advantage", label: "Minimum model advantage", unit: "%", min: 0, max: 50, step: .5, scale: 100, tip: "Required model probability above the all-in break-even probability after fees and slippage. Default: 3%." },
+    { id: "swing_fallback_mode", label: "Fallback behavior", type: "select", options: ["Exit", "Hold to settlement"], tip: "Exit near expiration if the target is missed, or keep the position through settlement. Default: Exit." },
+    { id: "swing_fallback_seconds_remaining", label: "Fallback exit", unit: "seconds remaining", min: 1, max: 900, step: 1, tip: "When the fallback exit begins if Exit is selected. Default: 120 seconds remaining." },
+    { id: "swing_stop_loss_cents", label: "Swing stop-loss", unit: "cents", min: 0, max: 99, step: 1, nullable: true, tip: "Optional absolute bid trigger for Swing entries. Use 0 or leave blank to turn it off. Default: off." },
+    { id: "swing_max_spread", label: "Maximum spread", unit: "cents", min: 0, max: 50, step: .5, scale: 100, tip: "Widest contract spread allowed at entry. Default: 3 cents." },
+    { id: "swing_min_liquidity_contracts", label: "Minimum liquidity", unit: "contracts", min: 1, max: 1000000, step: 1, integer: true, tip: "Minimum contracts available at the qualifying ask. Default: 1 contract." },
+    { id: "swing_confirmation_seconds", label: "Confirmation period", unit: "seconds", min: 0, max: 120, step: .5, tip: "How long every Swing entry requirement must remain valid. Default: immediate." },
+  ]],
   ["Stops and Exits", [
     { id: "default_stop_loss_cents", label: "Default stop-loss", unit: "cents", min: 0, max: 99, step: 1, nullable: true, tip: "Optional absolute bid trigger prefilled on new Buy drafts. Use 0 or leave blank to turn it off; existing stops never change." },
+    { id: "global_profit_take_enabled", label: "Global profit take", type: "toggle", tip: "Closes any open paper position when its executable bid reaches the configured level. Default: on." },
+    { id: "global_profit_take_price", label: "Profit-take bid", unit: "cents", min: 1, max: 99, step: 1, scale: 100, tip: "Executable bid that triggers a profit-taking exit for every paper strategy and manual trade. Default: 99 cents." },
   ]],
   ["Position Sizing and Risk", [
     { id: "starting_bankroll", label: "Starting bankroll", unit: "dollars", min: 1, max: 100000000, step: 100, tip: "Paper capital used for sizing and performance. Default: $1,000." },
@@ -1115,12 +1136,19 @@ function renderCalibrationResults(data) {
     EARLY_THRESHOLD: "Early threshold",
     STANDARD_EDGE: "Standard edge",
     LATE_CONVICTION: "Late conviction",
+    SWING: "Swing trade",
   };
   $("#strategy-results").innerHTML = Object.entries(strategyLabels).map(([key, label]) => {
     const result = strategyResults[key] || {};
+    const detail = key === "SWING"
+      ? `${result.entries || 0} entries · ${result.completed_trades || 0} completed · avg ${cents(result.average_entry_price)} → ${cents(result.average_exit_price)} · ${result.average_holding_seconds == null ? "--" : `${Math.round(result.average_holding_seconds)}s`} held · ${percent(result.return_on_deployed_capital, 1)} return`
+      : `${result.entries || 0} entries · ${result.settled_trades || 0} settled · avg ${percent(result.average_entry_probability, 1)} at ${cents(result.average_entry_price)} · EV ${result.average_entry_ev == null ? "--" : money(result.average_entry_ev, 3)}`;
+    const rate = key === "SWING"
+      ? `${percent(result.target_hit_rate, 1)} target`
+      : `${percent(result.win_rate, 1)} wins`;
     return `<div class="strategy-result-row">
-      <span><strong>${label}</strong><small>${result.entries || 0} entries · ${result.settled_trades || 0} settled · avg ${percent(result.average_entry_probability, 1)} at ${cents(result.average_entry_price)} · EV ${result.average_entry_ev == null ? "--" : money(result.average_entry_ev, 3)}</small></span>
-      <span title="Win rate">${percent(result.win_rate, 1)} wins</span>
+      <span><strong>${label}</strong><small>${detail}</small></span>
+      <span title="${key === "SWING" ? "Target-hit rate" : "Win rate"}">${rate}</span>
       <span class="${Number(result.realized_pnl) > 0 ? "positive" : Number(result.realized_pnl) < 0 ? "negative" : ""}" title="Realized profit and loss">${money(result.realized_pnl || 0)}</span>
     </div>`;
   }).join("");

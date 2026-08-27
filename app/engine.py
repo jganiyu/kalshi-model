@@ -1119,6 +1119,7 @@ class AnalysisEngine:
                 "standard_edge_readiness": automatic_entry.get(
                     "standard_edge_readiness"
                 ),
+                "swing_readiness": automatic_entry.get("swing_readiness"),
             }
         )
         return summary, notification

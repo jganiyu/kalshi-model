@@ -232,6 +232,7 @@ def clean_settings_payload(payload: dict[str, Any]) -> dict[str, Any]:
         "max_risk_per_trade_pct": (0.0, 1.0),
         "max_session_drawdown_pct": (0.0, 1.0),
         "slippage_cents": (0.0, 10.0),
+        "global_profit_take_price": (0.01, 0.99),
         "automatic_entry_window_minutes": (0.25, 15.0),
         "automatic_confirmation_seconds": (1.0, 120.0),
         "automatic_buy_duration_pct": (0.50, 1.0),
@@ -252,6 +253,15 @@ def clean_settings_payload(payload: dict[str, Any]) -> dict[str, Any]:
         "late_min_z_distance": (0.0, 20.0),
         "late_max_spread": (0.0, 0.50),
         "late_min_liquidity_contracts": (1, 1_000_000),
+        "swing_entry_window_seconds": (1.0, 600.0),
+        "swing_max_entry_price": (0.01, 0.99),
+        "swing_target_exit_price": (0.01, 0.99),
+        "swing_bankroll_pct": (0.0, 1.0),
+        "swing_min_model_advantage": (0.0, 0.50),
+        "swing_fallback_seconds_remaining": (1.0, 900.0),
+        "swing_max_spread": (0.0, 0.50),
+        "swing_min_liquidity_contracts": (1, 1_000_000),
+        "swing_confirmation_seconds": (0.0, 120.0),
         "minimum_liquidity_contracts": (1, 1_000_000),
         "max_data_age_seconds": (1.0, 300.0),
         "max_exchange_dispersion_pct": (0.01, 5.0),
@@ -282,7 +292,8 @@ def clean_settings_payload(payload: dict[str, Any]) -> dict[str, Any]:
     }
     integer_settings = {
         "minimum_liquidity_contracts", "early_min_liquidity_contracts",
-        "late_min_liquidity_contracts", "minimum_exchange_feeds",
+        "late_min_liquidity_contracts", "swing_min_liquidity_contracts",
+        "minimum_exchange_feeds",
         "closing_guard_seconds", "confidence_high_min_samples",
         "training_min_samples", "benchmark_calibration_min_samples",
         "training_history_days", "benchmark_history_samples", "training_max_samples",
@@ -291,21 +302,21 @@ def clean_settings_payload(payload: dict[str, Any]) -> dict[str, Any]:
     }
     cleaned: dict[str, Any] = {}
     for key, value in payload.items():
-        if key == "default_stop_loss_cents":
+        if key in {"default_stop_loss_cents", "swing_stop_loss_cents"}:
             if value in (None, ""):
                 cleaned[key] = None
                 continue
             try:
                 number = float(value)
             except (TypeError, ValueError) as exc:
-                raise HTTPException(status_code=422, detail="default_stop_loss_cents must be numeric or blank") from exc
+                raise HTTPException(status_code=422, detail=f"{key} must be numeric or blank") from exc
             if number == 0:
                 cleaned[key] = None
                 continue
             if not 1 <= number <= 99:
                 raise HTTPException(
                     status_code=422,
-                    detail="default_stop_loss_cents must be 0 (off) or between 1 and 99",
+                    detail=f"{key} must be 0 (off) or between 1 and 99",
                 )
             cleaned[key] = number
             continue
@@ -322,7 +333,8 @@ def clean_settings_payload(payload: dict[str, Any]) -> dict[str, Any]:
             cleaned[key] = int(number) if key in integer_settings else number
         elif key in {
             "paper_trading_enabled", "risk_controls_enabled",
-            "early_threshold_enabled", "late_conviction_enabled",
+            "early_threshold_enabled", "late_conviction_enabled", "swing_enabled",
+            "global_profit_take_enabled",
         }:
             if not isinstance(value, bool):
                 raise HTTPException(status_code=422, detail=f"{key} must be true or false")
@@ -330,6 +342,10 @@ def clean_settings_payload(payload: dict[str, Any]) -> dict[str, Any]:
         elif key == "automatic_min_confidence":
             if value not in {"Low", "Moderate", "High"}:
                 raise HTTPException(status_code=422, detail="automatic_min_confidence is invalid")
+            cleaned[key] = value
+        elif key == "swing_fallback_mode":
+            if value not in {"Exit", "Hold to settlement"}:
+                raise HTTPException(status_code=422, detail="swing_fallback_mode is invalid")
             cleaned[key] = value
         elif key == "selected_side":
             side = str(value).upper()

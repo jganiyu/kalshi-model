@@ -116,7 +116,7 @@ def test_migration_preserves_legacy_history_without_inventing_balance(
 
     db.initialize()
 
-    assert db.fetch_one("SELECT MAX(version) version FROM schema_migrations")["version"] == 8
+    assert db.fetch_one("SELECT MAX(version) version FROM schema_migrations")["version"] == 10
     assert db.fetch_one("SELECT available_cash_after FROM paper_orders")["available_cash_after"] is None
     assert db.fetch_one("SELECT available_cash_after FROM paper_entries")["available_cash_after"] is None
     assert db.fetch_one("SELECT available_cash_after FROM paper_trades")["available_cash_after"] is None
@@ -213,6 +213,7 @@ def test_every_automatic_strategy_records_available_cash(tmp_path: Path) -> None
     for ticker, strategy in (
         ("EARLY", "EARLY_THRESHOLD"),
         ("LATE", "LATE_CONVICTION"),
+        ("SWING", "SWING"),
     ):
         add_market(db, ticker)
         entered, _ = service.open_fixed_strategy(
@@ -232,10 +233,15 @@ def test_every_automatic_strategy_records_available_cash(tmp_path: Path) -> None
             bankroll_fraction=0.03,
             model_version="test",
             reason="test",
+            target_exit_price=0.10 if strategy == "SWING" else None,
+            fallback_exit_mode="Exit" if strategy == "SWING" else None,
+            fallback_exit_seconds=120 if strategy == "SWING" else None,
         )
         assert entered is True
 
-    for strategy in ("STANDARD_EDGE", "EARLY_THRESHOLD", "LATE_CONVICTION"):
+    for strategy in (
+        "STANDARD_EDGE", "EARLY_THRESHOLD", "LATE_CONVICTION", "SWING"
+    ):
         order = db.fetch_one(
             "SELECT * FROM paper_orders WHERE strategy=?", (strategy,)
         )

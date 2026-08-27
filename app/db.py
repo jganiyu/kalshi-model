@@ -373,6 +373,25 @@ MIGRATIONS: list[tuple[int, str]] = [
         ALTER TABLE paper_trades ADD COLUMN available_cash_after REAL;
         """,
     ),
+    (
+        9,
+        """
+        ALTER TABLE paper_entries ADD COLUMN target_exit_price REAL;
+        ALTER TABLE paper_entries ADD COLUMN fallback_exit_mode TEXT;
+        ALTER TABLE paper_entries ADD COLUMN fallback_exit_seconds REAL;
+        ALTER TABLE paper_entries ADD COLUMN exit_reason TEXT;
+        ALTER TABLE paper_entries ADD COLUMN exit_price REAL;
+        ALTER TABLE paper_entries ADD COLUMN exit_fees REAL;
+        ALTER TABLE paper_entries ADD COLUMN max_favorable_bid REAL;
+        ALTER TABLE paper_entries ADD COLUMN min_adverse_bid REAL;
+        """,
+    ),
+    (
+        10,
+        """
+        ALTER TABLE paper_entries ADD COLUMN strategy_metadata_json TEXT;
+        """,
+    ),
 ]
 
 

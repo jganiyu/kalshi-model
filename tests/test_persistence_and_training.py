@@ -40,7 +40,7 @@ def test_database_migrations_and_settings_persist(tmp_path: Path) -> None:
     reopened.initialize()
     assert reopened.settings()["starting_bankroll"] == 2_500.0
     assert "unknown" not in reopened.settings()
-    assert reopened.fetch_one("SELECT MAX(version) version FROM schema_migrations")["version"] == 8
+    assert reopened.fetch_one("SELECT MAX(version) version FROM schema_migrations")["version"] == 10
     assert ModelManager(reopened).active()["version"] == "baseline-1.1"
 
 
@@ -56,7 +56,15 @@ def test_new_database_uses_project_calibration_and_paper_defaults(tmp_path: Path
     assert settings["automatic_confirmation_seconds"] == 5
     assert settings["early_entry_window_seconds"] == 60
     assert settings["late_min_probability"] == 0.79
+    assert settings["swing_enabled"] is False
+    assert settings["swing_bankroll_pct"] == pytest.approx(0.01)
+    assert settings["swing_max_entry_price"] == pytest.approx(0.05)
+    assert settings["swing_target_exit_price"] == pytest.approx(0.10)
     assert settings["default_stop_loss_cents"] is None
+    assert settings["global_profit_take_enabled"] is True
+    assert settings["global_profit_take_price"] == pytest.approx(0.99)
+    assert portfolio["global_profit_take_enabled"] is True
+    assert portfolio["global_profit_take_price"] == pytest.approx(0.99)
     assert portfolio["starting_bankroll"] == 1_000.0
     assert portfolio["current_bankroll"] == 1_000.0
     assert portfolio["automatic_trading_enabled"] is True

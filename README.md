@@ -19,7 +19,7 @@ A local macOS research and paper-trading app for Kalshi's 15-minute Bitcoin Up o
 
 - **Dashboard:** Live BTC proxy, outcome forecast, Standard Edge readiness HUD, order book, recent trades, and manual controls.
 - **BTC proxy:** Median Coinbase, Kraken, and Bitstamp price with learned BRTI uncertainty.
-- **Paper trading:** Manual and automatic strategies with available funds recorded after each transaction.
+- **Paper trading:** Manual orders plus Standard Edge, Early Threshold, Late Conviction, and Swing strategies.
 - **Calibration:** Tune each strategy and review its results separately.
 - **Local data:** Settings, evidence, trades, snapshots, reports, and backups stay in SQLite on your Mac.
 
@@ -91,12 +91,15 @@ It then compares that probability with the selected Buy or Sell price after fees
 - **Standard edge:** Waits for a strong, sustained pricing advantage.
 - **Early threshold:** Uses a threshold seen before opening, but enters only if the opening ask still offers positive EV.
 - **Late conviction:** Buys a highly likely outcome near settlement only when Buy EV remains positive.
+- **Swing trade:** Buys a model-supported side at a low early ask, then sells when its executable bid reaches the configured target.
 
-Only one automatic strategy may enter each market, and early threshold takes priority over standard edge and late conviction.
+Only one automatic strategy may enter each market. Swing runs last so it cannot displace the existing strategies.
 
 ### Risk and learning
 
 Every entry remains simulated and must pass cash, liquidity, exposure, drawdown, and confirmation checks.
+
+A global profit take closes any open paper position when its executable bid reaches the configured level—99¢ by default.
 
 Calibration compares predicted probabilities with settled outcomes and reports each strategy separately; judge results across many markets, not a short streak.
 

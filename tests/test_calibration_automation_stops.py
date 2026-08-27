@@ -96,6 +96,12 @@ def test_calibration_validation_accepts_nullable_stop_and_rejects_unsafe_values(
     assert clean_settings_payload({"minimum_buy_probability": 0.55})[
         "minimum_buy_probability"
     ] == pytest.approx(0.55)
+    assert clean_settings_payload({"global_profit_take_enabled": False})[
+        "global_profit_take_enabled"
+    ] is False
+    assert clean_settings_payload({"global_profit_take_price": 0.99})[
+        "global_profit_take_price"
+    ] == pytest.approx(0.99)
     with pytest.raises(HTTPException):
         clean_settings_payload({"default_stop_loss_cents": 100})
     with pytest.raises(HTTPException):
@@ -108,6 +114,10 @@ def test_calibration_validation_accepts_nullable_stop_and_rejects_unsafe_values(
         clean_settings_payload({"training_min_samples": 12.5})
     with pytest.raises(HTTPException):
         clean_settings_payload({"risk_controls_enabled": "false"})
+    with pytest.raises(HTTPException):
+        clean_settings_payload({"global_profit_take_enabled": "true"})
+    with pytest.raises(HTTPException):
+        clean_settings_payload({"global_profit_take_price": 1.0})
 
 
 def test_automatic_entry_uses_elapsed_buy_duration_and_current_signal(tmp_path: Path) -> None:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import math
 import time
 from collections import deque
@@ -11,11 +12,24 @@ from app.domain import iso_now, kalshi_fee, parse_time
 from app.services.decision import Decision
 
 
+_USE_DEFAULT_STOP = object()
+
+
 def _stop_price_from_cents(value: Any) -> float | None:
     if value in (None, ""):
         return None
     cents = float(value)
     return cents / 100 if cents > 0 else None
+
+
+def _strategy_metadata(value: Any) -> dict[str, Any]:
+    if not value:
+        return {}
+    try:
+        parsed = json.loads(str(value))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
 
 
 class PaperTradingService:
@@ -146,12 +160,26 @@ class PaperTradingService:
             ),
             "selected_side": settings.get("selected_side", "YES"),
             "default_stop_loss_cents": settings.get("default_stop_loss_cents"),
+            "global_profit_take_enabled": bool(
+                settings.get("global_profit_take_enabled", True)
+            ),
+            "global_profit_take_price": float(
+                settings.get("global_profit_take_price", 0.99)
+            ),
             "active_stop_losses": active_stops,
             "strategy_results": self.strategy_results(),
             "trades": [
                 {
                     **trade,
-                    "entries": [entry for entry in entries if entry["trade_id"] == trade["id"]],
+                    "entries": [
+                        {
+                            **entry,
+                            "strategy_metadata": _strategy_metadata(
+                                entry.get("strategy_metadata_json")
+                            ),
+                        }
+                        for entry in entries if entry["trade_id"] == trade["id"]
+                    ],
                 }
                 for trade in reversed(trades[-100:])
             ],
@@ -173,6 +201,13 @@ class PaperTradingService:
                             "stop_loss_price": entry.get("stop_loss_price"),
                             "stop_status": entry.get("stop_status"),
                             "source": entry["source"],
+                            "strategy": entry.get("strategy"),
+                            "target_exit_price": entry.get("target_exit_price"),
+                            "fallback_exit_mode": entry.get("fallback_exit_mode"),
+                            "fallback_exit_seconds": entry.get("fallback_exit_seconds"),
+                            "strategy_metadata": _strategy_metadata(
+                                entry.get("strategy_metadata_json")
+                            ),
                         }
                         for entry in entries
                         if entry["trade_id"] == trade["id"]
@@ -189,12 +224,14 @@ class PaperTradingService:
             SELECT e.*,t.outcome,t.status AS trade_status
             FROM paper_entries e
             JOIN paper_trades t ON t.id=e.trade_id
-            WHERE e.strategy IN ('STANDARD_EDGE','EARLY_THRESHOLD','LATE_CONVICTION')
+            WHERE e.strategy IN ('STANDARD_EDGE','EARLY_THRESHOLD','LATE_CONVICTION','SWING')
             ORDER BY e.id ASC
             """
         )
         results: dict[str, dict[str, Any]] = {}
-        for strategy in ("STANDARD_EDGE", "EARLY_THRESHOLD", "LATE_CONVICTION"):
+        for strategy in (
+            "STANDARD_EDGE", "EARLY_THRESHOLD", "LATE_CONVICTION", "SWING"
+        ):
             entries = [row for row in rows if row.get("strategy") == strategy]
             settled = [row for row in entries if row.get("status") == "settled"]
             wins = sum(
@@ -231,6 +268,115 @@ class PaperTradingService:
                 "average_entry_price": average("entry_price"),
                 "average_entry_ev": average("expected_value"),
             }
+            if strategy == "SWING":
+                completed = [
+                    row for row in entries if row.get("status") in {"closed", "settled"}
+                ]
+                pnl_by_entry: dict[int, float] = {}
+                exit_orders_by_entry: dict[int, list[dict[str, Any]]] = {}
+                for row in completed:
+                    if row.get("status") == "settled":
+                        won = int(row.get("outcome") or 0) == 1
+                        payout = float(row.get("initial_contracts") or 0) if won else 0.0
+                        pnl_by_entry[int(row["id"])] = (
+                            payout
+                            - float(row.get("entry_cost") or 0)
+                            - float(row.get("entry_fees") or 0)
+                        )
+                        continue
+                    exits = self.db.fetch_all(
+                        """
+                        SELECT * FROM paper_orders
+                        WHERE entry_id=? AND action='SELL' AND status='filled'
+                        """,
+                        (row["id"],),
+                    )
+                    exit_orders_by_entry[int(row["id"])] = exits
+                    pnl_by_entry[int(row["id"])] = sum(
+                        float(exit_row.get("realized_pnl") or 0) for exit_row in exits
+                    )
+
+                def swing_average(values: list[float]) -> float | None:
+                    return sum(values) / len(values) if values else None
+
+                hold_seconds = []
+                for row in completed:
+                    opened_at = parse_time(row.get("opened_at"))
+                    closed_at = parse_time(row.get("closed_at"))
+                    if opened_at and closed_at:
+                        hold_seconds.append(max(0.0, (closed_at - opened_at).total_seconds()))
+                exit_prices = []
+                target_count = 0
+                fallback_count = 0
+                stop_count = 0
+                risk_count = 0
+                settlement_count = 0
+                for row in completed:
+                    orders = exit_orders_by_entry.get(int(row["id"]), [])
+                    sources = {str(order.get("source") or "") for order in orders}
+                    target_count += int("swing_target" in sources)
+                    fallback_count += int("swing_fallback" in sources)
+                    stop_count += int("stop_loss" in sources)
+                    risk_count += int("risk_exit" in sources)
+                    settlement_count += int(row.get("status") == "settled")
+                    filled = [
+                        order for order in orders
+                        if order.get("filled_price") is not None
+                        and int(order.get("filled_contracts") or 0) > 0
+                    ]
+                    filled_contracts = sum(
+                        int(order.get("filled_contracts") or 0) for order in filled
+                    )
+                    if filled_contracts:
+                        exit_prices.append(
+                            sum(
+                                float(order["filled_price"])
+                                * int(order["filled_contracts"])
+                                for order in filled
+                            ) / filled_contracts
+                        )
+                    elif row.get("exit_price") is not None:
+                        exit_prices.append(float(row["exit_price"]))
+                realized_values = list(pnl_by_entry.values())
+                deployed = sum(
+                    float(row.get("entry_cost") or 0) + float(row.get("entry_fees") or 0)
+                    for row in completed
+                )
+                favorable = [
+                    float(row["max_favorable_bid"]) - float(row["entry_price"])
+                    for row in completed if row.get("max_favorable_bid") is not None
+                ]
+                adverse = [
+                    float(row["min_adverse_bid"]) - float(row["entry_price"])
+                    for row in completed if row.get("min_adverse_bid") is not None
+                ]
+                results[strategy].update(
+                    {
+                        "completed_trades": len(completed),
+                        "wins": sum(1 for value in realized_values if value > 0),
+                        "losses": sum(1 for value in realized_values if value <= 0),
+                        "win_rate": (
+                            sum(1 for value in realized_values if value > 0)
+                            / len(realized_values)
+                            if realized_values else None
+                        ),
+                        "target_hit_rate": (
+                            target_count / len(completed) if completed else None
+                        ),
+                        "average_exit_price": swing_average(exit_prices),
+                        "average_holding_seconds": swing_average(hold_seconds),
+                        "return_on_deployed_capital": (
+                            sum(realized_values) / deployed if deployed else None
+                        ),
+                        "target_exits": target_count,
+                        "fallback_exits": fallback_count,
+                        "stop_exits": stop_count,
+                        "risk_exits": risk_count,
+                        "settlement_exits": settlement_count,
+                        "average_favorable_move": swing_average(favorable),
+                        "average_adverse_move": swing_average(adverse),
+                    }
+                )
         return results
 
     @staticmethod
@@ -542,6 +688,13 @@ class PaperTradingService:
                 if not position or int(position["contracts"]) < contracts:
                     raise ValueError("The paper position no longer has enough contracts to sell.")
                 held = int(position["contracts"])
+                exit_reason = {
+                    "stop_loss": "STOP_LOSS",
+                    "profit_take": "PROFIT_TAKE",
+                    "swing_target": "TARGET",
+                    "swing_fallback": "FALLBACK",
+                    "risk_exit": "RISK",
+                }.get(str(order.get("source") or ""), "MANUAL")
                 allocated_cost, allocated_entry_fees, affected_entry_ids = self._consume_entries(
                     connection,
                     ticker=str(order["ticker"]),
@@ -550,6 +703,9 @@ class PaperTradingService:
                     closed_at=filled_at,
                     target_entry_id=order.get("entry_id"),
                     stop_triggered=order.get("source") == "stop_loss",
+                    exit_reason=exit_reason,
+                    exit_price=price,
+                    exit_fees=fees,
                 )
                 proceeds = price * contracts
                 realized_pnl = proceeds - fees - allocated_cost - allocated_entry_fees
@@ -620,6 +776,9 @@ class PaperTradingService:
         closed_at: str,
         target_entry_id: int | None = None,
         stop_triggered: bool = False,
+        exit_reason: str = "MANUAL",
+        exit_price: float | None = None,
+        exit_fees: float = 0.0,
     ) -> tuple[float, float, list[int]]:
         params: list[Any] = [ticker, side]
         where = "ticker=? AND side=? AND status='open' AND remaining_contracts>0"
@@ -646,6 +805,7 @@ class PaperTradingService:
             fraction = take / int(entry["initial_contracts"])
             allocated_cost += float(entry["entry_cost"]) * fraction
             allocated_fees += float(entry["entry_fees"]) * fraction
+            allocated_exit_fee = exit_fees * (take / contracts)
             left = int(entry["remaining_contracts"]) - take
             if left == 0:
                 stop_status = (
@@ -656,14 +816,24 @@ class PaperTradingService:
                 connection.execute(
                     """
                     UPDATE paper_entries SET remaining_contracts=0,status='closed',
-                        closed_at=?,stop_status=? WHERE id=?
+                        closed_at=?,stop_status=?,exit_reason=?,exit_price=?,
+                        exit_fees=COALESCE(exit_fees,0)+? WHERE id=?
                     """,
-                    (closed_at, stop_status, entry["id"]),
+                    (
+                        closed_at, stop_status, exit_reason, exit_price,
+                        allocated_exit_fee, entry["id"],
+                    ),
                 )
             else:
                 connection.execute(
-                    "UPDATE paper_entries SET remaining_contracts=? WHERE id=?",
-                    (left, entry["id"]),
+                    """
+                    UPDATE paper_entries SET remaining_contracts=?,exit_reason=?,
+                        exit_price=?,exit_fees=COALESCE(exit_fees,0)+? WHERE id=?
+                    """,
+                    (
+                        left, exit_reason, exit_price, allocated_exit_fee,
+                        entry["id"],
+                    ),
                 )
             remaining_to_sell -= take
         return allocated_cost, allocated_fees, affected_entry_ids
@@ -696,7 +866,75 @@ class PaperTradingService:
                         """,
                         (iso_now(), str(exc), order["id"]),
                     )
-        return filled + self.process_stop_losses(ticker, market)
+        filled += self.process_profit_takes(ticker, market)
+        filled += self.process_stop_losses(ticker, market)
+        return filled + self.process_swing_exits(ticker, market)
+
+    def process_profit_takes(self, ticker: str, market: dict[str, Any]) -> int:
+        settings = self.db.settings()
+        if not settings.get("global_profit_take_enabled", True):
+            return 0
+        target = float(settings.get("global_profit_take_price", 0.99))
+        slippage = float(settings.get("slippage_cents", 0.5)) / 100
+        entries = self.db.fetch_all(
+            """
+            SELECT * FROM paper_entries
+            WHERE ticker=? AND status='open' AND remaining_contracts>0
+            ORDER BY id ASC
+            """,
+            (ticker,),
+        )
+        liquidity: dict[str, int | None] = {}
+        closed = 0
+        for entry in entries:
+            side = str(entry["side"])
+            bid = self.executable_price(market, side, "SELL")
+            if bid is None or bid + 1e-12 < target:
+                continue
+            if side not in liquidity:
+                bid_size = market.get(f"{side.lower()}_bid_size")
+                liquidity[side] = (
+                    max(0, int(float(bid_size))) if bid_size is not None else None
+                )
+            available = self.available_contracts(ticker, side)
+            quoted = liquidity[side]
+            contracts = min(int(entry["remaining_contracts"]), available)
+            if quoted is not None:
+                contracts = min(contracts, quoted)
+            if contracts < 1:
+                continue
+            order_id = self.db.execute(
+                """
+                INSERT INTO paper_orders(
+                    ticker,side,action,order_type,status,created_at,
+                    requested_contracts,source,entry_id,strategy
+                ) VALUES (?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    ticker, side, "SELL", "MARKET", "open", iso_now(),
+                    contracts, "profit_take", entry["id"],
+                    entry.get("strategy") or "MANUAL",
+                ),
+            )
+            order = self.db.fetch_one(
+                "SELECT * FROM paper_orders WHERE id=?", (order_id,)
+            )
+            if not order:
+                continue
+            try:
+                self._fill_order(order, max(0.001, bid - slippage), market)
+                closed += 1
+                if quoted is not None:
+                    liquidity[side] = quoted - contracts
+            except ValueError as exc:
+                self.db.execute(
+                    """
+                    UPDATE paper_orders SET status='canceled',canceled_at=?,error=?
+                    WHERE id=?
+                    """,
+                    (iso_now(), str(exc), order_id),
+                )
+        return closed
 
     def process_stop_losses(self, ticker: str, market: dict[str, Any]) -> int:
         entries = self.db.fetch_all(
@@ -744,6 +982,99 @@ class PaperTradingService:
                     (iso_now(), str(exc), order_id),
                 )
         return triggered
+
+    def process_swing_exits(self, ticker: str, market: dict[str, Any]) -> int:
+        entries = self.db.fetch_all(
+            """
+            SELECT * FROM paper_entries
+            WHERE ticker=? AND strategy='SWING' AND status='open'
+              AND remaining_contracts>0
+            ORDER BY id ASC
+            """,
+            (ticker,),
+        )
+        if not entries:
+            return 0
+        market_row = self.db.fetch_one(
+            "SELECT close_time FROM markets WHERE ticker=?", (ticker,)
+        )
+        observed = parse_time(market.get("observed_at")) or parse_time(iso_now())
+        close = parse_time(market_row.get("close_time")) if market_row else None
+        seconds_remaining = (
+            max(0.0, (close - observed).total_seconds())
+            if close is not None and observed is not None else None
+        )
+        slippage = float(self.db.settings().get("slippage_cents", 0.5)) / 100
+        closed = 0
+        for entry in entries:
+            side = str(entry["side"])
+            bid = self.executable_price(market, side, "SELL")
+            if bid is None:
+                continue
+            self.db.execute(
+                """
+                UPDATE paper_entries SET
+                    max_favorable_bid=CASE
+                        WHEN max_favorable_bid IS NULL OR max_favorable_bid<? THEN ?
+                        ELSE max_favorable_bid END,
+                    min_adverse_bid=CASE
+                        WHEN min_adverse_bid IS NULL OR min_adverse_bid>? THEN ?
+                        ELSE min_adverse_bid END
+                WHERE id=?
+                """,
+                (bid, bid, bid, bid, entry["id"]),
+            )
+            target = float(entry.get("target_exit_price") or 0.10)
+            reason = None
+            source = None
+            if bid + 1e-12 >= target:
+                reason, source = "TARGET", "swing_target"
+            elif (
+                str(entry.get("fallback_exit_mode") or "Exit") == "Exit"
+                and seconds_remaining is not None
+                and seconds_remaining
+                <= float(entry.get("fallback_exit_seconds") or 120)
+            ):
+                reason, source = "FALLBACK", "swing_fallback"
+            if not reason or not source:
+                continue
+            bid_size = market.get(f"{side.lower()}_bid_size")
+            available = int(float(bid_size)) if bid_size is not None else int(
+                entry["remaining_contracts"]
+            )
+            contracts = min(int(entry["remaining_contracts"]), max(0, available))
+            if contracts < 1:
+                continue
+            fill_price = max(0.001, bid - slippage)
+            order_id = self.db.execute(
+                """
+                INSERT INTO paper_orders(
+                    ticker,side,action,order_type,status,created_at,
+                    requested_contracts,source,entry_id,strategy
+                ) VALUES (?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    ticker, side, "SELL", "MARKET", "open", iso_now(),
+                    contracts, source, entry["id"], "SWING",
+                ),
+            )
+            order = self.db.fetch_one(
+                "SELECT * FROM paper_orders WHERE id=?", (order_id,)
+            )
+            if not order:
+                continue
+            try:
+                self._fill_order(order, fill_price, market)
+                closed += 1
+            except ValueError as exc:
+                self.db.execute(
+                    """
+                    UPDATE paper_orders SET status='canceled',canceled_at=?,error=?
+                    WHERE id=?
+                    """,
+                    (iso_now(), str(exc), order_id),
+                )
+        return closed
 
     def cancel_order(self, order_id: int) -> bool:
         order = self.db.fetch_one(
@@ -1310,6 +1641,11 @@ class PaperTradingService:
         bankroll_fraction: float,
         model_version: str,
         reason: str,
+        stop_loss_cents: Any = _USE_DEFAULT_STOP,
+        target_exit_price: float | None = None,
+        fallback_exit_mode: str | None = None,
+        fallback_exit_seconds: float | None = None,
+        strategy_metadata: dict[str, Any] | None = None,
     ) -> tuple[bool, float]:
         side = str(assessment.get("side") or "")
         buy = assessment.get("buy") or {}
@@ -1336,9 +1672,11 @@ class PaperTradingService:
             self._validate_buy(ticker, side, float(price), contracts)
         except ValueError:
             return False, effective_fraction
-        stop_price = _stop_price_from_cents(
+        configured_stop = (
             self.db.settings().get("default_stop_loss_cents")
+            if stop_loss_cents is _USE_DEFAULT_STOP else stop_loss_cents
         )
+        stop_price = _stop_price_from_cents(configured_stop)
         order_id = self.db.execute(
             """
             INSERT INTO paper_orders(
@@ -1364,6 +1702,21 @@ class PaperTradingService:
                 "entry_reason": reason,
             },
         )
+        if strategy == "SWING":
+            initial_bid = (assessment.get("sell") or {}).get("raw_price")
+            self.db.execute(
+                """
+                UPDATE paper_entries SET target_exit_price=?,fallback_exit_mode=?,
+                    fallback_exit_seconds=?,max_favorable_bid=?,min_adverse_bid=?,
+                    strategy_metadata_json=?
+                WHERE order_id=?
+                """,
+                (
+                    target_exit_price, fallback_exit_mode, fallback_exit_seconds,
+                    initial_bid, initial_bid,
+                    json.dumps(strategy_metadata or {}, sort_keys=True), order_id,
+                ),
+            )
         trade = self.db.fetch_one(
             "SELECT id FROM paper_trades WHERE ticker=? AND side=? AND status='open'",
             (ticker, side),
@@ -1418,6 +1771,187 @@ class PaperTradingService:
             ),
             default=None,
         )
+
+    @staticmethod
+    def _swing_candidates(
+        assessments: dict[str, dict[str, Any]], settings: dict[str, Any]
+    ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+        available = [
+            assessment for assessment in assessments.values()
+            if (assessment.get("buy") or {}).get("raw_price") is not None
+        ]
+        monitored = max(
+            available,
+            key=lambda item: (
+                float((item.get("buy") or {}).get("expected_value") or -1.0),
+                -float((item.get("buy") or {}).get("raw_price") or 1.0),
+            ),
+            default=None,
+        )
+        maximum_price = float(settings.get("swing_max_entry_price", 0.05))
+        minimum_advantage = float(settings.get("swing_min_model_advantage", 0.03))
+        maximum_spread = float(settings.get("swing_max_spread", 0.03))
+        minimum_liquidity = int(settings.get("swing_min_liquidity_contracts", 1))
+        eligible = []
+        for assessment in available:
+            buy = assessment.get("buy") or {}
+            raw_ask = buy.get("raw_price")
+            advantage = buy.get("expected_value")
+            spread = assessment.get("spread")
+            liquidity = assessment.get("ask_size")
+            if (
+                assessment.get("trade_allowed")
+                and raw_ask is not None
+                and float(raw_ask) <= maximum_price + 1e-12
+                and advantage is not None
+                and float(advantage) + 1e-12 >= minimum_advantage
+                and spread is not None
+                and float(spread) <= maximum_spread + 1e-12
+                and liquidity is not None
+                and float(liquidity) >= minimum_liquidity
+                and buy.get("executable_price") is not None
+            ):
+                eligible.append(assessment)
+        candidate = max(
+            eligible,
+            key=lambda item: (
+                float((item.get("buy") or {}).get("expected_value") or -1.0),
+                float(item.get("model_probability") or 0.0),
+            ),
+            default=None,
+        )
+        return monitored, candidate
+
+    def _swing_entry_readiness(
+        self,
+        *,
+        ticker: str,
+        assessments: dict[str, dict[str, Any]],
+        opening_elapsed: float | None,
+        status_open: bool,
+        confirmation: dict[str, Any],
+        priority_strategy: str | None,
+        blocked_reason: str | None,
+        entry_exists: bool,
+        portfolio: dict[str, Any],
+        entered: bool,
+    ) -> dict[str, Any]:
+        settings = self.db.settings()
+        monitored, candidate = self._swing_candidates(assessments, settings)
+        selected = candidate or monitored
+        buy = (selected or {}).get("buy") or {}
+        raw_ask = buy.get("raw_price")
+        executable = buy.get("executable_price")
+        fee = buy.get("fee_per_contract")
+        break_even = (
+            float(executable) + float(fee or 0.0)
+            if executable is not None else None
+        )
+        advantage = buy.get("expected_value")
+        spread = (selected or {}).get("spread")
+        liquidity = (selected or {}).get("ask_size")
+        maximum_price = float(settings.get("swing_max_entry_price", 0.05))
+        required_advantage = float(settings.get("swing_min_model_advantage", 0.03))
+        maximum_spread = float(settings.get("swing_max_spread", 0.03))
+        minimum_liquidity = int(settings.get("swing_min_liquidity_contracts", 1))
+        entry_window = float(settings.get("swing_entry_window_seconds", 300))
+        inside_window = bool(
+            opening_elapsed is not None and 0 <= opening_elapsed < entry_window
+        )
+        data_passed = bool(selected and selected.get("trade_allowed"))
+        price_passed = bool(
+            raw_ask is not None and float(raw_ask) <= maximum_price + 1e-12
+        )
+        advantage_passed = bool(
+            advantage is not None and float(advantage) + 1e-12 >= required_advantage
+        )
+        spread_passed = bool(
+            spread is not None and float(spread) <= maximum_spread + 1e-12
+        )
+        liquidity_passed = bool(
+            liquidity is not None and float(liquidity) >= minimum_liquidity
+        )
+        risk_passed = bool(portfolio.get("automatic_trade_allowed", True))
+        confirmation_ready = bool(confirmation.get("ready"))
+        open_swing = self.db.fetch_one(
+            """
+            SELECT * FROM paper_entries
+            WHERE ticker=? AND strategy='SWING' AND status='open' LIMIT 1
+            """,
+            (ticker,),
+        )
+        blocker = None
+        status = "WATCHING"
+        if entered:
+            status, blocker = "ENTERED", "Swing position opened."
+        elif open_swing:
+            status = "OPEN"
+            blocker = (
+                f"Waiting for {float(open_swing.get('target_exit_price') or 0.10) * 100:.0f}¢ target."
+            )
+        elif not settings.get("swing_enabled", False):
+            status, blocker = "DISABLED", "Swing Trade is off."
+        elif blocked_reason:
+            status, blocker = "BLOCKED", blocked_reason
+        elif entry_exists:
+            status, blocker = "BLOCKED", "An automatic entry already exists for this market."
+        elif not status_open:
+            status, blocker = "BLOCKED", "The market is not active."
+        elif priority_strategy and priority_strategy != "SWING":
+            status = "BLOCKED"
+            blocker = f"{priority_strategy.replace('_', ' ').title()} has priority."
+        elif not inside_window:
+            status, blocker = "BLOCKED", "Swing entry window closed."
+        elif not data_passed:
+            status, blocker = "BLOCKED", str(
+                (selected or {}).get("quality_reason") or "Market data is not tradeable."
+            )
+        elif not price_passed:
+            blocker = f"Watching for an ask at or below {maximum_price * 100:.0f}¢."
+        elif not advantage_passed:
+            blocker = "Model advantage is below the Swing requirement."
+        elif not spread_passed:
+            status, blocker = "BLOCKED", "Spread exceeds the Swing limit."
+        elif not liquidity_passed:
+            status, blocker = "BLOCKED", "Swing liquidity is below the minimum."
+        elif not risk_passed:
+            status = "BLOCKED"
+            blocker = str(
+                portfolio.get("automatic_trade_block_reason") or "Risk controls block entry."
+            )
+        elif not confirmation_ready:
+            status, blocker = "CONFIRMING", "Swing conditions are confirming."
+        else:
+            status, blocker = "READY", "Swing entry is ready."
+        return {
+            "strategy": "SWING",
+            "side": (selected or {}).get("side"),
+            "status": status,
+            "ready": status in {"READY", "ENTERED"},
+            "entered": entered,
+            "opening_elapsed_seconds": opening_elapsed,
+            "entry_window_seconds": entry_window,
+            "executable_ask": raw_ask,
+            "simulated_fill_price": executable,
+            "maximum_entry_price": maximum_price,
+            "model_probability": (selected or {}).get("model_probability"),
+            "all_in_break_even_probability": break_even,
+            "model_advantage": advantage,
+            "required_model_advantage": required_advantage,
+            "target_exit_price": float(settings.get("swing_target_exit_price", 0.10)),
+            "confirmation": confirmation,
+            "priority_strategy": priority_strategy,
+            "blocker": blocker,
+            "gates": {
+                "entry_window": {"passed": inside_window},
+                "price": {"passed": price_passed, "current": raw_ask, "required": maximum_price},
+                "model_advantage": {"passed": advantage_passed, "current": advantage, "required": required_advantage},
+                "spread": {"passed": spread_passed, "current": spread, "required": maximum_spread},
+                "liquidity": {"passed": liquidity_passed, "current": liquidity, "required": minimum_liquidity},
+                "data": {"passed": data_passed},
+                "risk": {"passed": risk_passed},
+            },
+        }
 
     def _confirm_strategy(
         self,
@@ -1480,6 +2014,7 @@ class PaperTradingService:
             "early_threshold": dict(empty),
             "standard_edge": dict(empty),
             "late_conviction": dict(empty),
+            "swing": dict(empty),
         }
         portfolio_state = portfolio or self.portfolio()
         required_confidence = str(settings.get("automatic_min_confidence", "High"))
@@ -1493,6 +2028,13 @@ class PaperTradingService:
         )
         status_open = str(market_status or "").lower() in {"active", "open"}
         entry_exists = self._automatic_entry_exists(ticker)
+        observed = parse_time(market_observed_at)
+        opened = parse_time(market_open_time)
+        opening_elapsed = (
+            (observed - opened).total_seconds()
+            if observed is not None and opened is not None
+            else None
+        )
 
         def finish(
             *,
@@ -1512,6 +2054,18 @@ class PaperTradingService:
                 entry_exists=entry_exists,
                 portfolio=portfolio_state,
             )
+            result["swing_readiness"] = self._swing_entry_readiness(
+                ticker=ticker,
+                assessments=assessments,
+                opening_elapsed=opening_elapsed,
+                status_open=status_open,
+                confirmation=result["swing"],
+                priority_strategy=priority_strategy,
+                blocked_reason=blocked_reason,
+                entry_exists=entry_exists,
+                portfolio=portfolio_state,
+                entered=bool(result["swing"].get("entered")),
+            )
             return result
 
         if not bool(settings.get("paper_trading_enabled", False)):
@@ -1522,17 +2076,10 @@ class PaperTradingService:
             result["blocked_reason"] = "An automatic entry already exists for this market."
             return finish(blocked_reason=result["blocked_reason"])
 
-        observed = parse_time(market_observed_at)
-        opened = parse_time(market_open_time)
         if not status_open:
             self.reset_automatic_confirmation()
             result["blocked_reason"] = "The market is not active."
             return finish(blocked_reason=result["blocked_reason"])
-        opening_elapsed = (
-            (observed - opened).total_seconds()
-            if observed is not None and opened is not None
-            else None
-        )
         early_candidate = None
         threshold_ready = False
         if threshold_state and observed is not None and opened is not None:
@@ -1575,6 +2122,7 @@ class PaperTradingService:
             result["early_threshold"] = {**confirmation, "entered": False}
             self._reset_standard_confirmation()
             self._strategy_states.pop("LATE_CONVICTION", None)
+            self._strategy_states.pop("SWING", None)
             if confirmation["ready"]:
                 entered, effective = self.open_fixed_strategy(
                     ticker=ticker, strategy="EARLY_THRESHOLD",
@@ -1603,6 +2151,7 @@ class PaperTradingService:
                 standard.suggested_fraction or 0.0
             )
             self._strategy_states.pop("LATE_CONVICTION", None)
+            self._strategy_states.pop("SWING", None)
             return finish(priority_strategy="STANDARD_EDGE")
         self._reset_standard_confirmation()
 
@@ -1635,6 +2184,7 @@ class PaperTradingService:
             result["active_strategy"] = "LATE_CONVICTION"
             result["effective_bankroll_allocation"] = effective
             result["late_conviction"] = {**confirmation, "entered": False}
+            self._strategy_states.pop("SWING", None)
             if confirmation["ready"]:
                 entered, effective = self.open_fixed_strategy(
                     ticker=ticker, strategy="LATE_CONVICTION",
@@ -1650,6 +2200,88 @@ class PaperTradingService:
                     self.reset_automatic_confirmation()
             return finish(priority_strategy="LATE_CONVICTION")
         self._strategy_states.pop("LATE_CONVICTION", None)
+
+        _, swing_candidate = self._swing_candidates(assessments, settings)
+        swing_inside_window = bool(
+            opening_elapsed is not None
+            and 0 <= opening_elapsed
+            < float(settings.get("swing_entry_window_seconds", 300))
+        )
+        if (
+            settings.get("swing_enabled", False)
+            and swing_inside_window
+            and swing_candidate
+            and portfolio_state.get("automatic_trade_allowed", True)
+        ):
+            effective = self._effective_strategy_fraction(
+                settings, float(settings.get("swing_bankroll_pct", 0.01))
+            )
+            confirmation = self._confirm_strategy(
+                strategy="SWING", ticker=ticker,
+                side=str(swing_candidate["side"]),
+                duration=float(settings.get("swing_confirmation_seconds", 0)),
+                quote_marker=market_observed_at, require_next_quote=False,
+                now=current_time,
+            )
+            result["active_strategy"] = "SWING"
+            result["effective_bankroll_allocation"] = effective
+            result["swing"] = {**confirmation, "entered": False}
+            if confirmation["ready"]:
+                entered, effective = self.open_fixed_strategy(
+                    ticker=ticker,
+                    strategy="SWING",
+                    assessment=swing_candidate,
+                    bankroll_fraction=float(settings.get("swing_bankroll_pct", 0.01)),
+                    model_version=model_version,
+                    reason=(
+                        "Early ask was below the Swing entry limit with sufficient "
+                        "model advantage after fees and slippage."
+                    ),
+                    stop_loss_cents=settings.get("swing_stop_loss_cents"),
+                    target_exit_price=float(
+                        settings.get("swing_target_exit_price", 0.10)
+                    ),
+                    fallback_exit_mode=str(
+                        settings.get("swing_fallback_mode", "Exit")
+                    ),
+                    fallback_exit_seconds=float(
+                        settings.get("swing_fallback_seconds_remaining", 120)
+                    ),
+                    strategy_metadata={
+                        "entry_window_seconds": float(
+                            settings.get("swing_entry_window_seconds", 300)
+                        ),
+                        "maximum_entry_ask": float(
+                            settings.get("swing_max_entry_price", 0.05)
+                        ),
+                        "minimum_model_advantage": float(
+                            settings.get("swing_min_model_advantage", 0.03)
+                        ),
+                        "maximum_spread": float(
+                            settings.get("swing_max_spread", 0.03)
+                        ),
+                        "minimum_liquidity_contracts": int(
+                            settings.get("swing_min_liquidity_contracts", 1)
+                        ),
+                        "bankroll_fraction": float(
+                            settings.get("swing_bankroll_pct", 0.01)
+                        ),
+                        "confirmation_seconds": float(
+                            settings.get("swing_confirmation_seconds", 0)
+                        ),
+                    },
+                )
+                result["entered"] = entered
+                result["effective_bankroll_allocation"] = effective
+                result["swing"]["entered"] = entered
+                if entered:
+                    self.reset_automatic_confirmation()
+                    result["swing"] = {
+                        "armed": True, "progress": 1.0,
+                        "ready": True, "entered": True,
+                    }
+            return finish(priority_strategy="SWING")
+        self._strategy_states.pop("SWING", None)
         return finish()
 
     def settle(self, ticker: str, result: int, settled_at: str) -> int:
@@ -1671,10 +2303,15 @@ class PaperTradingService:
                 """
                 UPDATE paper_entries SET status='settled',remaining_contracts=0,
                     closed_at=?,stop_status=CASE
-                        WHEN stop_status='active' THEN 'settled' ELSE stop_status END
+                        WHEN stop_status='active' THEN 'settled' ELSE stop_status END,
+                    exit_reason=COALESCE(exit_reason,'SETTLEMENT'),
+                    exit_price=CASE
+                        WHEN (side='YES' AND ?=1) OR (side='NO' AND ?=0) THEN 1.0
+                        ELSE 0.0 END,
+                    exit_fees=COALESCE(exit_fees,0)
                 WHERE ticker=? AND status='open'
                 """,
-                (settled_at, ticker),
+                (settled_at, result, result, ticker),
             )
             for trade in trades:
                 wins = (trade["side"] == "YES" and result == 1) or (
