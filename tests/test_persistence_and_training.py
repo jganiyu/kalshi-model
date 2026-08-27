@@ -98,6 +98,38 @@ def test_paper_trade_settlement_uses_actual_binary_outcome(tmp_path: Path) -> No
     assert trade["realized_pnl"] > 0
 
 
+def test_strategy_results_use_position_outcome_for_up_and_down_trades(
+    tmp_path: Path,
+) -> None:
+    db = make_db(tmp_path)
+    service = PaperTradingService(db)
+
+    def open_standard(ticker: str, side: str, result: int) -> None:
+        add_market(db, ticker)
+        decision = Decision(
+            "BUY", "BUY_EDGE", "Moderate", "test", 0.75, 0.60, 0.15,
+            0.12, 0.61, 0.01, 0.02, 10.0, 16, side,
+        )
+        assert service.open_from_decision(ticker, decision)
+        assert service.settle(ticker, result, iso_now()) == 1
+
+    open_standard("STANDARD-UP-WIN", "YES", 1)
+    open_standard("STANDARD-DOWN-WIN", "NO", 0)
+    open_standard("STANDARD-UP-LOSS", "YES", 0)
+
+    result = service.strategy_results()["STANDARD_EDGE"]
+    ledger_pnl = db.fetch_one(
+        """
+        SELECT SUM(realized_pnl) AS total FROM paper_trades
+        WHERE strategy='STANDARD_EDGE' AND status='settled'
+        """
+    )
+    assert result["entries"] == 3
+    assert result["settled_trades"] == 3
+    assert result["win_rate"] == pytest.approx(2 / 3)
+    assert result["realized_pnl"] == pytest.approx(ledger_pnl["total"])
+
+
 def test_model_promotion_requires_forward_validation_and_minimum_sample(tmp_path: Path) -> None:
     db = make_db(tmp_path)
     manager = ModelManager(db)

@@ -237,11 +237,11 @@ class PaperTradingService:
             wins = sum(
                 1
                 for row in settled
-                if (row.get("side") == "YES") == (int(row.get("outcome") or 0) == 1)
+                if int(row.get("outcome") or 0) == 1
             )
             realized = 0.0
             for row in settled:
-                won = (row.get("side") == "YES") == (int(row.get("outcome") or 0) == 1)
+                won = int(row.get("outcome") or 0) == 1
                 payout = float(row.get("initial_contracts") or 0) if won else 0.0
                 realized += payout - float(row.get("entry_cost") or 0) - float(
                     row.get("entry_fees") or 0
