@@ -299,8 +299,14 @@ def clean_settings_payload(payload: dict[str, Any]) -> dict[str, Any]:
                 number = float(value)
             except (TypeError, ValueError) as exc:
                 raise HTTPException(status_code=422, detail="default_stop_loss_cents must be numeric or blank") from exc
+            if number == 0:
+                cleaned[key] = None
+                continue
             if not 1 <= number <= 99:
-                raise HTTPException(status_code=422, detail="default_stop_loss_cents must be between 1 and 99")
+                raise HTTPException(
+                    status_code=422,
+                    detail="default_stop_loss_cents must be 0 (off) or between 1 and 99",
+                )
             cleaned[key] = number
             continue
         if key in numeric_ranges:

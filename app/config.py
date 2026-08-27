@@ -73,7 +73,7 @@ DEFAULT_SETTINGS: dict[str, object] = {
     "max_risk_per_trade_pct": 0.05,
     "max_session_drawdown_pct": 0.50,
     "slippage_cents": 0.5,
-    "default_stop_loss_cents": 10.0,
+    "default_stop_loss_cents": None,
     "automatic_entry_window_minutes": 15,
     "automatic_confirmation_seconds": 5,
     "automatic_buy_duration_pct": 0.50,

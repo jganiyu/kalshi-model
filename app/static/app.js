@@ -509,8 +509,8 @@ function paperOrderDraft() {
   }
   if (!error && state.paperOrder.action === "BUY" && stopValue !== "") {
     const stopCents = Number(stopValue);
-    if (!Number.isFinite(stopCents) || stopCents < 1 || stopCents > 99) {
-      error = "Stop-loss must be between 1 and 99 cents.";
+    if (!Number.isFinite(stopCents) || (stopCents !== 0 && (stopCents < 1 || stopCents > 99))) {
+      error = "Stop-loss must be 0 (off) or between 1 and 99 cents.";
     }
   }
   return { available, bestPrice, contracts, orderValue, requestedValue, error };
@@ -994,7 +994,7 @@ const calibrationGroups = [
     { id: "late_min_liquidity_contracts", label: "Minimum liquidity", unit: "contracts", min: 1, max: 1000000, step: 1, integer: true, tip: "Minimum contracts available at the selected ask. Default: 1 contract." },
   ]],
   ["Stops and Exits", [
-    { id: "default_stop_loss_cents", label: "Default stop-loss", unit: "cents", min: 1, max: 99, step: 1, nullable: true, tip: "Optional absolute bid trigger prefilled on new Buy drafts. Blank by default; existing stops never change." },
+    { id: "default_stop_loss_cents", label: "Default stop-loss", unit: "cents", min: 0, max: 99, step: 1, nullable: true, tip: "Optional absolute bid trigger prefilled on new Buy drafts. Use 0 or leave blank to turn it off; existing stops never change." },
   ]],
   ["Position Sizing and Risk", [
     { id: "starting_bankroll", label: "Starting bankroll", unit: "dollars", min: 1, max: 100000000, step: 100, tip: "Paper capital used for sizing and performance. Default: $1,000." },

@@ -11,6 +11,13 @@ from app.domain import iso_now, kalshi_fee, parse_time
 from app.services.decision import Decision
 
 
+def _stop_price_from_cents(value: Any) -> float | None:
+    if value in (None, ""):
+        return None
+    cents = float(value)
+    return cents / 100 if cents > 0 else None
+
+
 class PaperTradingService:
     def __init__(self, db: Database):
         self.db = db
@@ -324,7 +331,9 @@ class PaperTradingService:
                 stop_loss_price = float(stop_loss_price)
             except (TypeError, ValueError) as exc:
                 raise ValueError("Enter a valid stop-loss price.") from exc
-            if not 0.01 <= stop_loss_price <= 0.99:
+            if stop_loss_price == 0:
+                stop_loss_price = None
+            elif not 0.01 <= stop_loss_price <= 0.99:
                 raise ValueError("Stop-loss must be between 1 and 99 cents.")
 
         best_price = self.executable_price(market, side, action)
@@ -782,8 +791,9 @@ class PaperTradingService:
             self._validate_buy(ticker, decision.side, decision.executable_price, contracts)
         except ValueError:
             return False
-        stop_cents = self.db.settings().get("default_stop_loss_cents")
-        stop_price = float(stop_cents) / 100 if stop_cents is not None else None
+        stop_price = _stop_price_from_cents(
+            self.db.settings().get("default_stop_loss_cents")
+        )
         order_id = self.db.execute(
             """
             INSERT INTO paper_orders(
@@ -1326,8 +1336,9 @@ class PaperTradingService:
             self._validate_buy(ticker, side, float(price), contracts)
         except ValueError:
             return False, effective_fraction
-        stop_cents = self.db.settings().get("default_stop_loss_cents")
-        stop_price = float(stop_cents) / 100 if stop_cents is not None else None
+        stop_price = _stop_price_from_cents(
+            self.db.settings().get("default_stop_loss_cents")
+        )
         order_id = self.db.execute(
             """
             INSERT INTO paper_orders(

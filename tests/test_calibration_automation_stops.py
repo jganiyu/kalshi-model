@@ -87,6 +87,9 @@ def test_calibration_validation_accepts_nullable_stop_and_rejects_unsafe_values(
     assert clean_settings_payload({"default_stop_loss_cents": ""})[
         "default_stop_loss_cents"
     ] is None
+    assert clean_settings_payload({"default_stop_loss_cents": 0})[
+        "default_stop_loss_cents"
+    ] is None
     assert clean_settings_payload({"automatic_buy_duration_pct": 0.70})[
         "automatic_buy_duration_pct"
     ] == pytest.approx(0.70)
@@ -95,6 +98,8 @@ def test_calibration_validation_accepts_nullable_stop_and_rejects_unsafe_values(
     ] == pytest.approx(0.55)
     with pytest.raises(HTTPException):
         clean_settings_payload({"default_stop_loss_cents": 100})
+    with pytest.raises(HTTPException):
+        clean_settings_payload({"default_stop_loss_cents": -1})
     with pytest.raises(HTTPException):
         clean_settings_payload({"automatic_confirmation_seconds": 0})
     with pytest.raises(HTTPException):
@@ -309,6 +314,30 @@ def test_settlement_cancels_active_stop_and_global_changes_do_not_rewrite_it(
     settled = db.fetch_one("SELECT * FROM paper_entries WHERE id=?", (entry["id"],))
     assert settled and settled["status"] == "settled"
     assert settled["stop_status"] == "settled"
+
+
+def test_zero_disables_manual_and_automatic_stop_losses(tmp_path: Path) -> None:
+    db = make_db(tmp_path)
+    add_market(db, "MANUAL-OFF")
+    add_market(db, "AUTO-OFF")
+    service = PaperTradingService(db)
+
+    manual = service.place_order(
+        ticker="MANUAL-OFF", side="YES", action="BUY", order_type="MARKET",
+        market=market(), dollars=10, stop_loss_price=0,
+    )
+    assert manual["stop_loss_price"] is None
+    manual_entry = db.fetch_one(
+        "SELECT * FROM paper_entries WHERE ticker='MANUAL-OFF'"
+    )
+    assert manual_entry and manual_entry["stop_loss_price"] is None
+
+    db.update_settings({"default_stop_loss_cents": 0})
+    assert service.open_from_decision("AUTO-OFF", decision(), "test")
+    automatic_entry = db.fetch_one(
+        "SELECT * FROM paper_entries WHERE ticker='AUTO-OFF'"
+    )
+    assert automatic_entry and automatic_entry["stop_loss_price"] is None
 
 
 def test_sell_execution_is_blocked_without_holdings(tmp_path: Path) -> None:

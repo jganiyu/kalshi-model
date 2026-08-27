@@ -56,6 +56,7 @@ def test_new_database_uses_project_calibration_and_paper_defaults(tmp_path: Path
     assert settings["automatic_confirmation_seconds"] == 5
     assert settings["early_entry_window_seconds"] == 60
     assert settings["late_min_probability"] == 0.79
+    assert settings["default_stop_loss_cents"] is None
     assert portfolio["starting_bankroll"] == 1_000.0
     assert portfolio["current_bankroll"] == 1_000.0
     assert portfolio["automatic_trading_enabled"] is True
