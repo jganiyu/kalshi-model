@@ -1052,6 +1052,7 @@ class AnalysisEngine:
         }
         for side, assessment in assessments.items():
             assessment["decision_confidence"] = decisions[side].confidence
+            assessment["exchange_index"] = market.get("exchange_index")
         decision = decisions.get(selected_side, decisions["YES"])
         previous = self.db.fetch_one(
             "SELECT * FROM signal_snapshots WHERE ticker=? ORDER BY id DESC LIMIT 1",
@@ -1365,6 +1366,7 @@ class AnalysisEngine:
             "event_ticker": market.get("event_ticker"),
             "title": market.get("title"),
             "status": market.get("status"),
+            "exchange_index": market.get("exchange_index"),
             "strike": market_strike(market),
             "open_time": market.get("open_time"),
             "close_time": market.get("close_time"),

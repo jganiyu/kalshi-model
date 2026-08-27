@@ -45,9 +45,14 @@ class FakeTradingClient:
         self.remote_positions: list[dict] = []
         self.remote_settlements: list[dict] = []
         self.timeout = False
+        self.balance_payload: dict = {
+            "balance_dollars": "1000.0000",
+            "portfolio_value": 0,
+        }
+        self.cancel_tickers: list[str | None] = []
 
     async def balance(self):
-        return {"balance_dollars": "1000.0000", "portfolio_value": 0}
+        return dict(self.balance_payload)
 
     async def orders(self, **_):
         return {"orders": list(self.remote_orders)}
@@ -85,8 +90,14 @@ class FakeTradingClient:
         })
         return order
 
-    async def cancel_order(self, exchange_order_id: str):
+    async def cancel_order(
+        self,
+        exchange_order_id: str,
+        *,
+        market_ticker: str | None = None,
+    ):
         self.canceled.append(exchange_order_id)
+        self.cancel_tickers.append(market_ticker)
         for order in self.remote_orders:
             if order["order_id"] == exchange_order_id:
                 order["status"] = "canceled"
@@ -243,6 +254,7 @@ async def test_kill_switch_disarms_and_attempts_resting_cancels(tmp_path: Path) 
     result = await broker.kill()
     assert result["active"] is True
     assert client.canceled == ["order-1"]
+    assert client.cancel_tickers == ["T"]
     assert broker.readiness()["session_armed"] is False
     assert broker.readiness()["kill_switch"] is True
 
@@ -365,6 +377,63 @@ async def test_v2_order_payload_is_fixed_point_limit_and_post_only(tmp_path: Pat
     assert captured["time_in_force"] == "good_till_canceled"
     assert captured["post_only"] is True
     assert captured["cancel_order_on_pause"] is True
+    assert "exchange_index" not in captured
+    await http.aclose()
+
+
+@run_async
+async def test_v2_cancel_auto_routes_by_market_ticker(tmp_path: Path) -> None:
+    captured: dict[str, str] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["market_ticker"] = request.url.params.get("market_ticker", "")
+        return httpx.Response(200, json={"order_id": "order-1"})
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client = KalshiTradingClient(
+        http,
+        "https://external-api.demo.kalshi.co/trade-api/v2",
+        "demo-key-id",
+        private_key(tmp_path),
+        environment="DEMO",
+    )
+    await client.cancel_order("order-1", market_ticker="KXBTC15M-TEST")
+    assert captured["market_ticker"] == "KXBTC15M-TEST"
+    await http.aclose()
+
+
+@run_async
+async def test_nested_exchange_error_is_actionable(tmp_path: Path) -> None:
+    http = httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda _: httpx.Response(
+                404,
+                json={
+                    "error": {
+                        "code": "user_not_found",
+                        "message": "user not found",
+                    }
+                },
+            )
+        )
+    )
+    client = KalshiTradingClient(
+        http,
+        "https://external-api.demo.kalshi.co/trade-api/v2",
+        "demo-key-id",
+        private_key(tmp_path),
+        environment="DEMO",
+    )
+    with pytest.raises(KalshiTradingError, match="no funds allocated") as error:
+        await client.create_order(
+            ticker="KXBTC15M-TEST",
+            client_order_id="client-1",
+            side="YES",
+            action="BUY",
+            contracts=1,
+            limit_price=0.01,
+        )
+    assert error.value.code == "user_not_found"
     await http.aclose()
 
 
@@ -492,6 +561,70 @@ async def test_each_entry_hard_limit_blocks_submission(
     )
     with pytest.raises(ValueError, match=message):
         await broker.submit(intent)
+    assert client.created == []
+
+
+@run_async
+async def test_unfunded_exchange_shard_blocks_before_submission(tmp_path: Path) -> None:
+    _, broker, client = await ready_broker(tmp_path)
+    client.balance_payload = {
+        "balance": 10000,
+        "portfolio_value": 0,
+        "balance_breakdown": [
+            {"exchange_index": 0, "balance": "100.0000"},
+            {"exchange_index": 2, "balance": "0.0000"},
+        ],
+    }
+    await broker.reconcile()
+    intent = OrderIntent(
+        "DEMO",
+        "KXBTC15M-TEST",
+        "YES",
+        "BUY",
+        1,
+        0.40,
+        "MANUAL",
+        "manual",
+        risk_snapshot={
+            "data_reliable": True,
+            "market_open": True,
+            "exchange_index": 2,
+        },
+    )
+    with pytest.raises(ValueError, match="exchange shard 2"):
+        await broker.submit(intent)
+    assert client.created == []
+    assert broker.portfolio()["balance_breakdown"] == [
+        {"exchange_index": 0, "balance": 100.0},
+        {"exchange_index": 2, "balance": 0.0},
+    ]
+
+
+@run_async
+async def test_demo_verification_explains_unfunded_market_shard(tmp_path: Path) -> None:
+    db = make_db(tmp_path)
+    coordinator = TradingCoordinator(
+        AppConfig(database_path=db.path), db, PaperTradingService(db)
+    )
+    broker = coordinator.broker("DEMO")
+    assert isinstance(broker, KalshiBroker)
+    client = FakeTradingClient()
+    client.balance_payload = {
+        "balance": 10000,
+        "portfolio_value": 0,
+        "balance_breakdown": [
+            {"exchange_index": 0, "balance": "100.0000"},
+            {"exchange_index": 2, "balance": "0.0000"},
+        ],
+    }
+    broker.set_client(client)  # type: ignore[arg-type]
+    current = {
+        "ticker": "KXBTC15M-TEST",
+        "yes_ask": 0.50,
+        "exchange_index": 2,
+    }
+    with pytest.raises(ValueError, match="Move mock funds to shard 2"):
+        await coordinator.verify_demo(current, "VERIFY DEMO TRADING")
     assert client.created == []
 
 
@@ -748,7 +881,12 @@ async def test_fill_wins_a_cancel_race_and_reconciliation_is_authoritative(
     intent = OrderIntent("DEMO", "RACE", "YES", "BUY", 1, 0.40, "MANUAL", "manual")
     result = await broker.submit(intent)
 
-    async def filled_during_cancel(_: str):
+    async def filled_during_cancel(
+        _: str,
+        *,
+        market_ticker: str | None = None,
+    ):
+        assert market_ticker == "RACE"
         client.remote_orders[0].update(
             {"status": "executed", "fill_count": "1.00", "remaining_count": "0.00"}
         )

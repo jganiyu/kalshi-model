@@ -633,6 +633,15 @@ def test_threshold_first_seen_and_revisions_are_persisted(tmp_path: Path) -> Non
     assert rows[1]["source"] == "WEBSOCKET"
 
 
+def test_market_summary_preserves_exchange_routing_index(tmp_path: Path) -> None:
+    db = make_db(tmp_path)
+    engine = AnalysisEngine(AppConfig(database_path=db.path), db)
+    summary = engine._market_summary(
+        {"ticker": "KXBTC15M-TEST", "status": "active", "exchange_index": 2}
+    )
+    assert summary and summary["exchange_index"] == 2
+
+
 def test_lifecycle_created_event_records_early_threshold(tmp_path: Path) -> None:
     db = make_db(tmp_path)
     engine = AnalysisEngine(AppConfig(database_path=db.path), db)

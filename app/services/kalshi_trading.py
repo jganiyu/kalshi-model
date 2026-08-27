@@ -148,8 +148,11 @@ class KalshiTradingClient:
                 payload = response.json()
             except ValueError:
                 payload = {}
-            code = str(payload.get("code") or "") or None
-            remote_message = str(payload.get("message") or "")
+            error_payload = payload.get("error") if isinstance(payload, dict) else None
+            if not isinstance(error_payload, dict):
+                error_payload = payload
+            code = str(error_payload.get("code") or "") or None
+            remote_message = str(error_payload.get("message") or "")
             if submission and response.status_code >= 500:
                 raise AmbiguousSubmissionError(
                     "Kalshi returned an uncertain submission result; reconciliation is required."
@@ -167,6 +170,13 @@ class KalshiTradingClient:
                 message = "Kalshi rate-limited the request."
             elif response.status_code >= 500:
                 message = "Kalshi is temporarily unavailable."
+            elif code == "user_not_found":
+                message = (
+                    "This account has no funds allocated to the market's Kalshi "
+                    "exchange shard."
+                )
+            elif code == "market_not_found":
+                message = "Kalshi could not route this order to the requested market."
             else:
                 message = remote_message or "Kalshi rejected the request."
             raise KalshiTradingError(
@@ -274,7 +284,6 @@ class KalshiTradingClient:
             "cancel_order_on_pause": True,
             "reduce_only": bool(reduce_only),
             "subaccount": 0,
-            "exchange_index": 0,
         }
         return await self._request(
             "POST",
@@ -284,7 +293,15 @@ class KalshiTradingClient:
             submission=True,
         )
 
-    async def cancel_order(self, exchange_order_id: str) -> dict[str, Any]:
+    async def cancel_order(
+        self,
+        exchange_order_id: str,
+        *,
+        market_ticker: str | None = None,
+    ) -> dict[str, Any]:
+        params = {"market_ticker": market_ticker} if market_ticker else None
         return await self._request(
-            "DELETE", f"/portfolio/events/orders/{exchange_order_id}"
+            "DELETE",
+            f"/portfolio/events/orders/{exchange_order_id}",
+            params=params,
         )

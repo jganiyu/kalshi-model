@@ -194,6 +194,52 @@ class KalshiBroker(Broker):
             last_error=None if client else "Credentials are not configured.",
         )
 
+    def _latest_account_snapshot(self) -> dict[str, Any]:
+        return self.db.fetch_one(
+            "SELECT * FROM broker_account_snapshots WHERE mode=? ORDER BY id DESC LIMIT 1",
+            (self.mode,),
+        ) or {}
+
+    def balance_breakdown(self) -> list[dict[str, Any]]:
+        account = self._latest_account_snapshot()
+        raw = account.get("raw_json")
+        try:
+            payload = json.loads(raw) if isinstance(raw, str) else (raw or {})
+        except (TypeError, json.JSONDecodeError):
+            payload = {}
+        rows: list[dict[str, Any]] = []
+        for item in payload.get("balance_breakdown") or []:
+            if not isinstance(item, dict):
+                continue
+            try:
+                exchange_index = int(item.get("exchange_index"))
+            except (TypeError, ValueError):
+                continue
+            balance = (
+                _number(item.get("balance_dollars"))
+                if item.get("balance_dollars") not in (None, "")
+                else _number(item.get("balance"))
+            )
+            rows.append({"exchange_index": exchange_index, "balance": balance})
+        return rows
+
+    def available_balance_for_exchange(self, exchange_index: int | None) -> float:
+        account = self._latest_account_snapshot()
+        total = _number(account.get("available_balance"))
+        if exchange_index is None:
+            return total
+        breakdown = self.balance_breakdown()
+        if not breakdown:
+            return total
+        return next(
+            (
+                _number(item.get("balance"))
+                for item in breakdown
+                if item.get("exchange_index") == int(exchange_index)
+            ),
+            0.0,
+        )
+
     def disarm(self, reason: str | None = None) -> None:
         self.session_armed = False
         self.automatic_armed = False
@@ -294,10 +340,7 @@ class KalshiBroker(Broker):
         }
 
     def portfolio(self) -> dict[str, Any]:
-        account = self.db.fetch_one(
-            "SELECT * FROM broker_account_snapshots WHERE mode=? ORDER BY id DESC LIMIT 1",
-            (self.mode,),
-        ) or {}
+        account = self._latest_account_snapshot()
         positions = self.db.fetch_all(
             "SELECT * FROM broker_positions WHERE mode=? AND status='open' ORDER BY updated_at DESC",
             (self.mode,),
@@ -349,6 +392,7 @@ class KalshiBroker(Broker):
             "available_cash": available,
             "current_bankroll": account_equity,
             "portfolio_value": portfolio_value,
+            "balance_breakdown": self.balance_breakdown(),
             "allocated_capital": allocated,
             "allocation_cap": cap,
             "remaining_allocation": max(0.0, cap - allocated),
@@ -585,12 +629,17 @@ class KalshiBroker(Broker):
         exposure = intent.contracts * intent.limit_price + kalshi_fee(
             intent.limit_price, intent.contracts
         )
-        account = self.db.fetch_one(
-            "SELECT available_balance,portfolio_value FROM broker_account_snapshots WHERE mode=? ORDER BY id DESC LIMIT 1",
-            (self.mode,),
-        ) or {}
+        account = self._latest_account_snapshot()
         available = _number(account.get("available_balance"))
         portfolio_value = _number(account.get("portfolio_value"))
+        exchange_index_raw = intent.risk_snapshot.get("exchange_index")
+        try:
+            exchange_index = (
+                int(exchange_index_raw) if exchange_index_raw is not None else None
+            )
+        except (TypeError, ValueError):
+            exchange_index = None
+        exchange_available = self.available_balance_for_exchange(exchange_index)
         allocated_before = self.allocated_capital(
             exclude_client_order_id=intent.client_order_id
         )
@@ -598,6 +647,15 @@ class KalshiBroker(Broker):
             0.0, self.allocation_cap(available, portfolio_value) - allocated_before
         )
         if intent.action == "BUY":
+            if (
+                exchange_index is not None
+                and self.balance_breakdown()
+                and exposure > exchange_available + 1e-9
+            ):
+                failures.append(
+                    f"Move funds to Kalshi exchange shard {exchange_index} before "
+                    "placing this order."
+                )
             if data_reliable is False:
                 failures.append("Market data is stale or unreliable.")
             if market_open is False:
@@ -866,7 +924,10 @@ class KalshiBroker(Broker):
             (iso_now(), order["id"]),
         )
         try:
-            response = await self.client.cancel_order(str(order["exchange_order_id"]))
+            response = await self.client.cancel_order(
+                str(order["exchange_order_id"]),
+                market_ticker=str(order.get("ticker") or "") or None,
+            )
         except KalshiTradingError:
             await self.reconcile()
             raise

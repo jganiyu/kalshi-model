@@ -253,6 +253,24 @@ class TradingCoordinator:
         broker = self.broker("DEMO")
         assert isinstance(broker, KalshiBroker)
         await broker.reconcile()
+        try:
+            exchange_index = int(current.get("exchange_index"))
+        except (TypeError, ValueError):
+            raise ValueError(
+                "Kalshi market routing data is unavailable. Wait for the active market "
+                "to refresh, then retry Verify Demo."
+            ) from None
+        verification_exposure = 0.01 + kalshi_fee(0.01)
+        if (
+            broker.balance_breakdown()
+            and broker.available_balance_for_exchange(exchange_index)
+            + 1e-9 < verification_exposure
+        ):
+            raise ValueError(
+                f"Demo funds are not allocated to this market's Kalshi exchange shard "
+                f"({exchange_index}). Move mock funds to shard {exchange_index} in "
+                "Kalshi Demo, then retry Verify Demo."
+            )
         broker.arm(confirmation="ARM DEMO TRADING", automatic=False)
         side = "YES" if float(current.get("yes_ask") or 1.0) > 0.01 else "NO"
         intent = OrderIntent(
@@ -266,6 +284,7 @@ class TradingCoordinator:
             source="verification",
             post_only=True,
             decision_snapshot={"purpose": "create, acknowledge, cancel, and reconcile"},
+            risk_snapshot={"exchange_index": exchange_index},
         )
         result = await broker.submit(intent)
         exchange_id = result.get("exchange_order_id")
@@ -421,6 +440,7 @@ class TradingCoordinator:
                 ),
                 "market_open": str(current.get("status") or "").lower()
                 in {"active", "open"},
+                "exchange_index": current.get("exchange_index"),
             },
         )
         risk = broker.risk_check(
@@ -490,6 +510,7 @@ class TradingCoordinator:
                     ),
                     "market_open": str(current.get("status") or "").lower()
                     in {"active", "open"},
+                    "exchange_index": current.get("exchange_index"),
                 },
             )
         broker = self.broker(intent.mode)
@@ -540,6 +561,16 @@ class TradingCoordinator:
         ) or {}
         available_cash = float(account.get("available_balance") or 0)
         portfolio_value = float(account.get("portfolio_value") or 0)
+        exchange_index_raw = assessment.get("exchange_index")
+        try:
+            exchange_index = (
+                int(exchange_index_raw) if exchange_index_raw is not None else None
+            )
+        except (TypeError, ValueError):
+            exchange_index = None
+        exchange_available = broker.available_balance_for_exchange(exchange_index)
+        if exchange_index is not None and broker.balance_breakdown():
+            available_cash = min(available_cash, exchange_available)
         current_bankroll = max(available_cash, portfolio_value)
         remaining_allocation = max(
             0.0,
@@ -552,6 +583,18 @@ class TradingCoordinator:
             remaining_allocation,
         )
         unit = float(price) + kalshi_fee(float(price))
+        if (
+            exchange_index is not None
+            and broker.balance_breakdown()
+            and exchange_available + 1e-9 < unit
+        ):
+            return (
+                broker,
+                None,
+                effective,
+                f"Move funds to Kalshi exchange shard {exchange_index} before "
+                "placing this order.",
+            )
         contracts = math.floor(target / unit) if unit > 0 else 0
         ask_size = assessment.get("ask_size")
         if ask_size is not None:
@@ -598,6 +641,7 @@ class TradingCoordinator:
                     and assessment.get("trade_allowed")
                 ),
                 "market_open": True,
+                "exchange_index": exchange_index,
             },
         )
         return broker, intent, effective, None
