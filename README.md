@@ -1,8 +1,8 @@
 # Kalshi Model
 
-A local macOS research and paper-trading app for Kalshi's 15-minute Bitcoin Up or Down markets; it never places real-money orders.
+A local macOS research and trading app for Kalshi's 15-minute Bitcoin Up or Down markets. Paper is the default; Demo and Live are optional.
 
-> Research only, not financial advice.
+> Research only, not financial advice. Live trading can lose real money.
 
 <table>
   <tr>
@@ -17,10 +17,11 @@ A local macOS research and paper-trading app for Kalshi's 15-minute Bitcoin Up o
 
 ## Features
 
-- **Dashboard:** Live BTC proxy, outcome forecast, Standard Edge readiness HUD, order book, recent trades, and manual controls.
+- **Dashboard:** Live BTC proxy, outcome forecast, Standard Edge HUD, order book, positions, and manual controls.
 - **BTC proxy:** Median Coinbase, Kraken, and Bitstamp price with learned BRTI uncertainty.
-- **Paper trading:** Manual orders plus Standard Edge, Early Threshold, Late Conviction, and Swing strategies.
-- **Calibration:** Tune each strategy and review its results separately.
+- **Three modes:** Paper, isolated Kalshi Demo, and deliberately armed Kalshi Live.
+- **Strategies:** Standard Edge, Early Threshold, Late Conviction, and Swing.
+- **Calibration:** Tune strategies, exits, allocation, and mode-specific hard limits.
 - **Local data:** Settings, evidence, trades, snapshots, reports, and backups stay in SQLite on your Mac.
 
 ## Outcome forecast
@@ -52,8 +53,9 @@ A local macOS research and paper-trading app for Kalshi's 15-minute Bitcoin Up o
 
 ![Kalshi credentials setup](docs/screenshots/credentials-setup.jpg)
 
-- Public REST data works without credentials; a Key ID and RSA private key enable live WebSocket prices.
-- Add them in **Settings**; the private copy stays under `~/Library/Application Support/Kalshi Model/`.
+- Public REST works without credentials; a read key enables faster market-data streaming.
+- Demo and Live trading use separate write-enabled keys and separate account histories.
+- Add keys in **Settings**; private copies stay under `~/Library/Application Support/Kalshi Model/`.
 - Never commit `.env`, your Key ID, or your private key.
 
 <details>
@@ -66,6 +68,10 @@ cp .env.example .env
 ```bash
 KALSHI_API_KEY_ID=your-key-id
 KALSHI_PRIVATE_KEY_PATH=/absolute/path/to/your-private-key.pem
+KALSHI_DEMO_API_KEY_ID=your-demo-key-id
+KALSHI_DEMO_PRIVATE_KEY_PATH=/absolute/path/to/demo-key.pem
+KALSHI_LIVE_API_KEY_ID=your-live-key-id
+KALSHI_LIVE_PRIVATE_KEY_PATH=/absolute/path/to/live-key.pem
 ```
 
 </details>
@@ -86,7 +92,7 @@ It combines live Bitcoin prices, threshold distance, time, volatility, momentum,
 
 It then compares that probability with the selected Buy or Sell price after fees and slippage; a likely outcome can still be overpriced.
 
-### Paper strategies
+### Trading strategies
 
 - **Standard edge:** Waits for a strong, sustained pricing advantage.
 - **Early threshold:** Uses a threshold seen before opening, but enters only if the opening ask still offers positive EV.
@@ -97,11 +103,34 @@ Only one automatic strategy may enter each market. Swing runs last so it cannot 
 
 ### Risk and learning
 
-Every entry remains simulated and must pass cash, liquidity, exposure, drawdown, and confirmation checks.
+Every entry must pass price, liquidity, data, confirmation, allocation, and risk checks.
 
-A global profit take closes any open paper position when its executable bid reaches the configured level—99¢ by default.
+A global profit take exits at a configured executable bid—99¢ by default. Stop-losses are optional and off by default.
 
-Calibration compares predicted probabilities with settled outcomes and reports each strategy separately; judge results across many markets, not a short streak.
+Calibration compares predicted probabilities with settled outcomes and reports each mode and strategy separately; judge results across many markets, not a short streak.
+
+## Paper, Demo, and Live
+
+<table>
+  <tr>
+    <td width="50%"><img src="docs/screenshots/trading-demo-light-20260827.png" alt="Kalshi Demo account in light mode"></td>
+    <td width="50%"><img src="docs/screenshots/trading-demo-dark-20260827.png" alt="Kalshi Demo account in dark mode"></td>
+  </tr>
+  <tr>
+    <td align="center"><strong>Demo · Light</strong></td>
+    <td align="center"><strong>Demo · Dark</strong></td>
+  </tr>
+</table>
+
+- **Paper:** Local simulated fills and bankroll; no Kalshi order is sent.
+- **Demo:** Kalshi's test exchange is the source of truth for balance, orders, partial fills, fees, positions, and settlement.
+- **Live:** Real funds. Demo verification, reviewed limits, typed session arming, and a separate Automatic switch are required.
+
+Demo and Live default to a 100% eligible-funds cap, but strategy sizing and hard limits still keep individual orders smaller. Positions, resting buys, pending intents, fees, and reserved exposure all count against the cap.
+
+All exchange orders are price-limited and may fill partially. A kill switch blocks new submissions and attempts to cancel resting orders. After a restart or disconnect, the app reconciles with Kalshi and requires rearming.
+
+Stop-losses and the global profit take are app-managed in Demo and Live. They work only while the app is running, connected, authenticated, reconciled, and armed; execution is not guaranteed.
 
 ## Download
 
@@ -121,6 +150,12 @@ Requires macOS and Python 3.11 or newer; the app opens at [http://127.0.0.1:8765
 
 ```bash
 .venv/bin/python -m pytest
+```
+
+The suite never sends Live orders. Demo order creation and cancellation are opt-in:
+
+```bash
+KALSHI_DEMO_E2E=1 KALSHI_DEMO_TEST_TICKER=your-demo-market .venv/bin/python -m pytest tests/test_kalshi_demo_e2e.py
 ```
 
 ## Build the Mac app

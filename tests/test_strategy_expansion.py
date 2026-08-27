@@ -273,6 +273,95 @@ def test_standard_readiness_locks_when_spread_gate_fails(tmp_path: Path) -> None
     assert readiness["metrics"]["confirmation"]["progress"] == 0
 
 
+def test_exchange_hud_ready_state_uses_the_same_execution_risk_gate(
+    tmp_path: Path,
+) -> None:
+    db = make_db(tmp_path)
+    add_market(db, "EXCHANGE-HUD")
+    db.update_settings(
+        {
+            "early_threshold_enabled": False,
+            "late_conviction_enabled": False,
+            "automatic_min_confidence": "Moderate",
+            "automatic_confirmation_seconds": 1,
+        }
+    )
+    service = PaperTradingService(db)
+    side_assessments = assessments(0.75, yes_bid=0.38, yes_ask=0.40)
+    decisions = {
+        "YES": buy("YES", side_assessments["YES"]),
+        "NO": hold("NO"),
+    }
+    result = service.consider_strategies(
+        ticker="EXCHANGE-HUD",
+        assessments=side_assessments,
+        standard_decisions=decisions,
+        seconds_remaining=300,
+        market_status="active",
+        market_open_time="2026-08-24T12:00:00+00:00",
+        market_observed_at="2026-08-24T12:01:00+00:00",
+        threshold_state=None,
+        settlement_window={"coverage": 1.0},
+        z_distance=2.0,
+        model_version="test",
+        portfolio={
+            "automatic_trade_allowed": True,
+            "automatic_trade_block_reason": None,
+        },
+        now=0,
+        execution_mode="DEMO",
+        automatic_enabled=True,
+        execution_risk_by_side={
+            "YES": {
+                "passed": False,
+                "primary_blocker": "The order exceeds the remaining mode allocation.",
+            }
+        },
+    )
+    readiness = result["standard_edge_readiness"]
+    assert result["entered"] is False
+    assert readiness["ready"] is False
+    assert readiness["status"] == "BLOCKED"
+    assert readiness["gates"]["risk"]["passed"] is False
+    assert readiness["blocker"] == "The order exceeds the remaining mode allocation."
+
+
+def test_forecast_or_hold_direction_alone_cannot_call_exchange_entry(
+    tmp_path: Path,
+) -> None:
+    db = make_db(tmp_path)
+    add_market(db, "FORECAST-ONLY")
+    db.update_settings(
+        {"early_threshold_enabled": False, "late_conviction_enabled": False}
+    )
+    service = PaperTradingService(db)
+    calls: list[dict] = []
+
+    def fixed_entry(**kwargs):
+        calls.append(kwargs)
+        return True, 0.01
+
+    result = service.consider_strategies(
+        ticker="FORECAST-ONLY",
+        assessments=assessments(0.90),
+        standard_decisions={"YES": hold("YES"), "NO": hold("NO")},
+        seconds_remaining=300,
+        market_status="active",
+        market_open_time="2026-08-24T12:00:00+00:00",
+        market_observed_at="2026-08-24T12:01:00+00:00",
+        threshold_state=None,
+        settlement_window={"coverage": 1.0},
+        z_distance=3.0,
+        model_version="test",
+        execution_mode="DEMO",
+        automatic_enabled=True,
+        execution_risk_by_side={"YES": {"passed": True}},
+        fixed_entry_handler=fixed_entry,
+    )
+    assert result["entered"] is False
+    assert calls == []
+
+
 def test_standard_readiness_separates_data_from_entry_quality(tmp_path: Path) -> None:
     db = make_db(tmp_path)
     add_market(db, "STANDARD-QUALITY")

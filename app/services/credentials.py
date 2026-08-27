@@ -30,10 +30,20 @@ class StoredCredentials:
 
 
 class CredentialStore:
-    def __init__(self, directory: Path | None = None):
+    def __init__(self, directory: Path | None = None, environment: str = "market_data"):
         self.directory = directory or credential_directory()
-        self.metadata_path = self.directory / METADATA_FILENAME
-        self.private_key_path = self.directory / PRIVATE_KEY_FILENAME
+        normalized = str(environment).strip().lower()
+        if normalized not in {"market_data", "demo", "live"}:
+            raise ValueError("Credential environment must be market_data, demo, or live.")
+        self.environment = normalized
+        if normalized == "market_data":
+            # Preserve the original paths so existing read-only credentials keep working.
+            self.metadata_path = self.directory / METADATA_FILENAME
+            self.private_key_path = self.directory / PRIVATE_KEY_FILENAME
+        else:
+            scoped = self.directory / "credentials" / normalized
+            self.metadata_path = scoped / METADATA_FILENAME
+            self.private_key_path = scoped / PRIVATE_KEY_FILENAME
 
     def load(self) -> StoredCredentials | None:
         if not self.metadata_path.exists():
@@ -63,8 +73,11 @@ class CredentialStore:
         if not isinstance(private_key, rsa.RSAPrivateKey):
             raise ValueError("The selected private key must use RSA.")
 
-        self.directory.mkdir(parents=True, exist_ok=True)
+        self.private_key_path.parent.mkdir(parents=True, exist_ok=True)
         os.chmod(self.directory, 0o700)
+        if self.private_key_path.parent != self.directory:
+            os.chmod(self.private_key_path.parent.parent, 0o700)
+            os.chmod(self.private_key_path.parent, 0o700)
         self._atomic_write(self.private_key_path, encoded + b"\n", 0o600)
         metadata = json.dumps(
             {
@@ -97,6 +110,32 @@ def environment_credentials() -> tuple[str | None, Path | None]:
     key_id = os.getenv("KALSHI_API_KEY_ID") or None
     key_path = os.getenv("KALSHI_PRIVATE_KEY_PATH")
     return key_id, Path(key_path).expanduser() if key_path else None
+
+
+def trading_environment_credentials(
+    environment: str,
+) -> tuple[str | None, Path | None]:
+    normalized = str(environment).strip().upper()
+    if normalized not in {"DEMO", "LIVE"}:
+        raise ValueError("Trading credentials are only available for Demo or Live.")
+    key_id = os.getenv(f"KALSHI_{normalized}_API_KEY_ID") or None
+    key_path = os.getenv(f"KALSHI_{normalized}_PRIVATE_KEY_PATH")
+    return key_id, Path(key_path).expanduser() if key_path else None
+
+
+def resolve_trading_credentials(
+    environment: str,
+) -> tuple[str | None, Path | None, str]:
+    normalized = str(environment).strip().lower()
+    if normalized not in {"demo", "live"}:
+        raise ValueError("Trading credentials are only available for Demo or Live.")
+    stored = CredentialStore(environment=normalized).load()
+    if stored:
+        return stored.key_id, stored.private_key_path, "local form"
+    key_id, key_path = trading_environment_credentials(normalized)
+    if key_id or key_path:
+        return key_id, key_path, "environment"
+    return None, None, "none"
 
 
 def resolve_credentials() -> tuple[str | None, Path | None, str]:

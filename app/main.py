@@ -20,7 +20,10 @@ from app.services.credentials import (
     CredentialStore,
     environment_credentials,
     masked_key_id,
+    resolve_trading_credentials,
 )
+from app.services.broker import KalshiBroker, normalize_mode
+from app.services.kalshi_trading import KalshiTradingError
 from app.services.training import report_rows
 
 
@@ -28,6 +31,10 @@ config = AppConfig()
 db = Database(config.database_path)
 engine = AnalysisEngine(config, db)
 credential_store = CredentialStore()
+trading_credential_stores = {
+    "DEMO": CredentialStore(environment="demo"),
+    "LIVE": CredentialStore(environment="live"),
+}
 templates = Jinja2Templates(directory=ROOT / "app" / "templates")
 static_root = ROOT / "app" / "static"
 asset_digest = hashlib.sha256()
@@ -46,7 +53,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="Kalshi Model",
-    description="Local, read-only Kalshi BTC probability analysis and paper trading",
+    description="Local Kalshi BTC analysis with isolated Paper, Demo, and Live trading",
     version="0.1.0",
     lifespan=lifespan,
 )
@@ -123,6 +130,216 @@ async def reset_paper_round() -> dict[str, Any]:
     return await engine.reset_paper_round()
 
 
+@app.get("/api/trading")
+async def trading() -> dict[str, Any]:
+    return engine.trading.summary()
+
+
+@app.get("/api/trading/{mode}/audit")
+async def trading_audit(
+    mode: str, limit: int = Query(default=200, ge=1, le=1000)
+) -> dict[str, Any]:
+    try:
+        broker = engine.trading.broker(mode)
+        if not isinstance(broker, KalshiBroker):
+            raise ValueError("Paper activity remains in the existing paper ledger.")
+        return {"mode": broker.mode, "events": broker.audit_history(limit)}
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.put("/api/trading/mode")
+async def select_trading_mode(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    try:
+        mode = normalize_mode(payload.get("mode"))
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    await engine.apply_settings({"trading_mode": mode})
+    engine.paper.reset_automatic_confirmation()
+    return engine.trading.summary()
+
+
+def trading_credential_status(mode: str) -> dict[str, Any]:
+    normalized = normalize_mode(mode)
+    if normalized == "PAPER":
+        raise HTTPException(status_code=404, detail="Paper mode does not use credentials.")
+    key_id, key_path, source = resolve_trading_credentials(normalized)
+    store = trading_credential_stores[normalized]
+    display_directory = str(store.private_key_path.parent)
+    home = str(Path.home())
+    if display_directory.startswith(home):
+        display_directory = display_directory.replace(home, "~", 1)
+    return {
+        "mode": normalized,
+        "configured": bool(key_id and key_path and key_path.exists()),
+        "source": source,
+        "key_id_hint": masked_key_id(key_id),
+        "private_key_ready": bool(key_path and key_path.exists()),
+        "storage_directory": display_directory,
+        "local_credentials_saved": store.load() is not None,
+        "readiness": engine.trading.broker(normalized).readiness(),
+    }
+
+
+@app.get("/api/trading/credentials/{mode}")
+async def get_trading_credentials(mode: str) -> dict[str, Any]:
+    return trading_credential_status(mode)
+
+
+@app.post("/api/trading/credentials/{mode}")
+async def save_trading_credentials(
+    mode: str, payload: dict[str, Any] = Body(...)
+) -> dict[str, Any]:
+    try:
+        normalized = normalize_mode(mode)
+        if normalized == "PAPER":
+            raise ValueError("Paper mode does not use credentials.")
+        trading_credential_stores[normalized].save(
+            str(payload.get("key_id") or ""),
+            str(payload.get("private_key") or ""),
+        )
+        await engine.trading.credentials_changed(normalized)
+    except (ValueError, KalshiTradingError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return trading_credential_status(normalized)
+
+
+@app.delete("/api/trading/credentials/{mode}")
+async def remove_trading_credentials(mode: str) -> dict[str, Any]:
+    try:
+        normalized = normalize_mode(mode)
+        if normalized == "PAPER":
+            raise ValueError("Paper mode does not use credentials.")
+        trading_credential_stores[normalized].remove()
+        await engine.trading.credentials_changed(normalized)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return trading_credential_status(normalized)
+
+
+@app.post("/api/trading/{mode}/reconcile")
+async def reconcile_trading(mode: str) -> dict[str, Any]:
+    try:
+        return await engine.trading.reconcile(mode)
+    except (ValueError, KalshiTradingError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.post("/api/trading/{mode}/orders/preview")
+async def preview_trading_order(
+    mode: str, payload: dict[str, Any] = Body(...)
+) -> dict[str, Any]:
+    try:
+        current = engine.dashboard.get("current") or {}
+        if not current.get("ticker"):
+            raise ValueError("There is no active Kalshi contract.")
+        return engine.trading.preview_manual(mode, payload, current)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.post("/api/trading/{mode}/orders/confirm")
+async def confirm_trading_order(
+    mode: str, payload: dict[str, Any] = Body(...)
+) -> dict[str, Any]:
+    try:
+        normalized = normalize_mode(mode)
+        result = await engine.trading.confirm_manual(
+            str(payload.get("confirmation_token") or ""),
+            normalized,
+            engine.dashboard.get("current") or {},
+        )
+        return {"order": result, "portfolio": engine.trading.broker(normalized).portfolio()}
+    except (ValueError, KalshiTradingError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.delete("/api/trading/{mode}/orders/{order_id}")
+async def cancel_trading_order(mode: str, order_id: str) -> dict[str, Any]:
+    try:
+        broker = engine.trading.broker(mode)
+        return await broker.cancel(order_id)
+    except (ValueError, KalshiTradingError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.post("/api/trading/{mode}/arm")
+async def arm_trading(mode: str, payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    try:
+        broker = engine.trading.broker(mode)
+        if not isinstance(broker, KalshiBroker):
+            raise ValueError("Paper mode does not require arming.")
+        return broker.arm(
+            confirmation=str(payload.get("confirmation") or ""),
+            automatic=bool(payload.get("automatic", False)),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.post("/api/trading/{mode}/disarm")
+async def disarm_trading(mode: str) -> dict[str, Any]:
+    broker = engine.trading.broker(mode)
+    if not isinstance(broker, KalshiBroker):
+        raise HTTPException(status_code=422, detail="Paper mode does not require arming.")
+    broker.disarm("Disarmed by the user.")
+    return broker.readiness()
+
+
+@app.put("/api/trading/{mode}/automatic")
+async def automatic_trading(mode: str, payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    try:
+        normalized = normalize_mode(mode)
+        broker = engine.trading.broker(normalized)
+        if not isinstance(broker, KalshiBroker):
+            raise ValueError("Use Paper Trading settings for Paper automation.")
+        enabled = bool(payload.get("enabled", False))
+        readiness = broker.set_automatic_armed(enabled)
+        await engine.apply_settings(
+            {f"{normalized.lower()}_automatic_trading_enabled": enabled}
+        )
+        return readiness
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.post("/api/trading/{mode}/kill")
+async def kill_trading(mode: str) -> dict[str, Any]:
+    broker = engine.trading.broker(mode)
+    if not isinstance(broker, KalshiBroker):
+        raise HTTPException(status_code=422, detail="Paper mode has no exchange kill switch.")
+    return await broker.kill()
+
+
+@app.post("/api/trading/{mode}/kill/release")
+async def release_trading_kill_switch(mode: str) -> dict[str, Any]:
+    broker = engine.trading.broker(mode)
+    if not isinstance(broker, KalshiBroker):
+        raise HTTPException(status_code=422, detail="Paper mode has no exchange kill switch.")
+    return broker.release_kill_switch()
+
+
+@app.post("/api/trading/live/limits-reviewed")
+async def review_live_limits() -> dict[str, Any]:
+    broker = engine.trading.broker("LIVE")
+    assert isinstance(broker, KalshiBroker)
+    broker.mark_limits_reviewed()
+    return broker.readiness()
+
+
+@app.post("/api/trading/demo/verify")
+async def verify_demo(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    try:
+        current = engine.dashboard.get("current") or {}
+        if not current.get("ticker"):
+            raise ValueError("There is no active Demo market to verify against.")
+        return await engine.trading.verify_demo(
+            current, str(payload.get("confirmation") or "")
+        )
+    except (ValueError, KalshiTradingError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
 @app.get("/api/signals")
 async def signals(limit: int = Query(default=100, ge=1, le=500)) -> dict[str, Any]:
     rows = db.fetch_all(
@@ -146,9 +363,13 @@ async def signal(signal_id: int) -> dict[str, Any]:
 
 @app.get("/api/calibration")
 async def calibration() -> dict[str, Any]:
+    mode = engine.trading.selected_mode
     return {
+        "mode": mode,
         "summary": engine.calibration_summary(),
-        "strategy_results": engine.paper.strategy_results(),
+        "strategy_results": engine.trading.broker(mode).portfolio().get(
+            "strategy_results", {}
+        ),
         "reports": report_rows(db),
         "configuration_snapshots": db.configuration_snapshots(),
     }
@@ -290,6 +511,23 @@ def clean_settings_payload(payload: dict[str, Any]) -> dict[str, Any]:
         "initial_retrain_settlements": (0, 10_000),
         "chart_window_minutes": (5, 360),
     }
+    for mode in ("demo", "live"):
+        numeric_ranges.update(
+            {
+                f"{mode}_bankroll_cap_pct": (0.0, 1.0),
+                f"{mode}_max_total_allocated_capital": (0.0, 100_000_000.0),
+                f"{mode}_max_amount_per_order": (0.0, 100_000_000.0),
+                f"{mode}_max_exposure_per_market": (0.0, 100_000_000.0),
+                f"{mode}_max_total_open_exposure": (0.0, 100_000_000.0),
+                f"{mode}_max_open_orders": (0, 10_000),
+                f"{mode}_max_daily_loss": (0.0, 100_000_000.0),
+                f"{mode}_max_daily_order_count": (0, 1_000_000),
+                f"{mode}_max_entry_price": (0.01, 0.99),
+                f"{mode}_max_spread": (0.0, 0.99),
+                f"{mode}_min_liquidity": (0, 1_000_000),
+                f"{mode}_entry_timeout_seconds": (1, 300),
+            }
+        )
     integer_settings = {
         "minimum_liquidity_contracts", "early_min_liquidity_contracts",
         "late_min_liquidity_contracts", "swing_min_liquidity_contracts",
@@ -299,6 +537,10 @@ def clean_settings_payload(payload: dict[str, Any]) -> dict[str, Any]:
         "training_history_days", "benchmark_history_samples", "training_max_samples",
         "promotion_min_samples", "promotion_min_days", "retraining_cadence_hours",
         "initial_retrain_settlements", "chart_window_minutes",
+        "demo_max_open_orders", "live_max_open_orders",
+        "demo_max_daily_order_count", "live_max_daily_order_count",
+        "demo_min_liquidity", "live_min_liquidity",
+        "demo_entry_timeout_seconds", "live_entry_timeout_seconds",
     }
     cleaned: dict[str, Any] = {}
     for key, value in payload.items():
@@ -335,6 +577,7 @@ def clean_settings_payload(payload: dict[str, Any]) -> dict[str, Any]:
             "paper_trading_enabled", "risk_controls_enabled",
             "early_threshold_enabled", "late_conviction_enabled", "swing_enabled",
             "global_profit_take_enabled",
+            "demo_automatic_trading_enabled", "live_automatic_trading_enabled",
         }:
             if not isinstance(value, bool):
                 raise HTTPException(status_code=422, detail=f"{key} must be true or false")
@@ -343,6 +586,15 @@ def clean_settings_payload(payload: dict[str, Any]) -> dict[str, Any]:
             if value not in {"Low", "Moderate", "High"}:
                 raise HTTPException(status_code=422, detail="automatic_min_confidence is invalid")
             cleaned[key] = value
+        elif key in {"demo_min_data_quality", "live_min_data_quality"}:
+            if value not in {"Low", "Moderate", "High"}:
+                raise HTTPException(status_code=422, detail=f"{key} is invalid")
+            cleaned[key] = value
+        elif key == "trading_mode":
+            try:
+                cleaned[key] = normalize_mode(value)
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
         elif key == "swing_fallback_mode":
             if value not in {"Exit", "Hold to settlement"}:
                 raise HTTPException(status_code=422, detail="swing_fallback_mode is invalid")
@@ -402,6 +654,8 @@ async def database_info() -> dict[str, Any]:
         "paper_orders",
         "paper_entries", "threshold_observations", "configuration_snapshots",
         "calibration_reports", "model_versions",
+        "broker_order_intents", "broker_orders", "broker_fills",
+        "broker_positions", "broker_settlements", "broker_audit_events",
     ):
         counts[table] = db.fetch_one(f"SELECT COUNT(*) AS count FROM {table}")["count"]
     return {

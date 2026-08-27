@@ -44,6 +44,22 @@ class AppConfig:
     kalshi_ws_url: str = os.getenv(
         "KALSHI_WS_URL", "wss://external-api-ws.kalshi.com/trade-api/ws/v2"
     )
+    kalshi_demo_api_base: str = os.getenv(
+        "KALSHI_DEMO_API_BASE",
+        "https://external-api.demo.kalshi.co/trade-api/v2",
+    )
+    kalshi_demo_ws_url: str = os.getenv(
+        "KALSHI_DEMO_WS_URL",
+        "wss://external-api-ws.demo.kalshi.co/trade-api/ws/v2",
+    )
+    kalshi_live_api_base: str = os.getenv(
+        "KALSHI_LIVE_API_BASE",
+        "https://external-api.kalshi.com/trade-api/v2",
+    )
+    kalshi_live_ws_url: str = os.getenv(
+        "KALSHI_LIVE_WS_URL",
+        "wss://external-api-ws.kalshi.com/trade-api/ws/v2",
+    )
     kalshi_api_key_id: str | None = field(default_factory=credential_key_id)
     kalshi_private_key_path: Path | None = field(default_factory=credential_key_path)
     kalshi_credentials_source: str = field(default_factory=credential_source)
@@ -139,4 +155,33 @@ DEFAULT_SETTINGS: dict[str, object] = {
     "initial_retrain_settlements": 20,
     "chart_window_minutes": 5,
     "kalshi_series": "KXBTC15M",
+    "trading_mode": "PAPER",
+    "demo_automatic_trading_enabled": False,
+    "live_automatic_trading_enabled": False,
+    "demo_bankroll_cap_pct": 1.0,
+    "live_bankroll_cap_pct": 1.0,
+    "demo_max_total_allocated_capital": 1000000.0,
+    "live_max_total_allocated_capital": 1000000.0,
+    "demo_max_amount_per_order": 1000000.0,
+    "live_max_amount_per_order": 1000000.0,
+    "demo_max_exposure_per_market": 1000000.0,
+    "live_max_exposure_per_market": 1000000.0,
+    "demo_max_total_open_exposure": 1000000.0,
+    "live_max_total_open_exposure": 1000000.0,
+    "demo_max_open_orders": 100,
+    "live_max_open_orders": 100,
+    "demo_max_daily_loss": 1000000.0,
+    "live_max_daily_loss": 1000000.0,
+    "demo_max_daily_order_count": 1000,
+    "live_max_daily_order_count": 1000,
+    "demo_max_entry_price": 0.99,
+    "live_max_entry_price": 0.99,
+    "demo_max_spread": 0.20,
+    "live_max_spread": 0.20,
+    "demo_min_liquidity": 1,
+    "live_min_liquidity": 1,
+    "demo_min_data_quality": "Moderate",
+    "live_min_data_quality": "Moderate",
+    "demo_entry_timeout_seconds": 15,
+    "live_entry_timeout_seconds": 15,
 }

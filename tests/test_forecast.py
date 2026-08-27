@@ -133,4 +133,4 @@ def test_forecast_migration_preserves_existing_signal_history(tmp_path: Path) ->
     assert row["model_probability"] == pytest.approx(0.15)
     assert row["forecast_signal"] is None
     assert row["forecast_explanation"] is None
-    assert db.fetch_one("SELECT MAX(version) version FROM schema_migrations")["version"] == 10
+    assert db.fetch_one("SELECT MAX(version) version FROM schema_migrations")["version"] == 11

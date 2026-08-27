@@ -160,6 +160,24 @@ def test_live_composite_is_not_pinned_by_rest_only_quote() -> None:
     assert len(composite.quotes) == 3
 
 
+@pytest.mark.parametrize(
+    ("market", "market_state"),
+    [
+        ({"ticker": "NEXT", "floor_strike": None}, {"ticker": "NEXT"}),
+        ({"ticker": "NEXT", "floor_strike": 100.0}, {"ticker": "PREVIOUS"}),
+    ],
+)
+def test_live_refresh_ignores_incomplete_or_mismatched_market_transition(
+    market: dict, market_state: dict
+) -> None:
+    engine = AnalysisEngine.__new__(AnalysisEngine)
+    engine._current_market = market
+    engine._market_state = market_state
+    engine._latest_btc = {"price": 100.0}
+
+    engine._refresh_cached_dashboard("2026-08-27T08:00:00+00:00")
+
+
 def test_benchmark_band_and_sparse_settlement_window_block_automatic_trade() -> None:
     btc = {"exchange_count": 3, "dispersion_pct": 0.01}
     market = {"yes_bid": 0.54, "yes_ask": 0.55, "no_bid": 0.45, "no_ask": 0.46}

@@ -1,15 +1,14 @@
 # Startup Guide
 
-Chief, your objective is simple: determine whether Kalshi has mispriced the next
-15 minutes of Bitcoin. The app handles the probability work. You decide whether
-the evidence deserves your attention.
+Use the app to separate two questions: what Bitcoin is likely to do, and whether
+the contract price offers a worthwhile trade.
 
 ## Launch
 
 Open Terminal and run:
 
 ```bash
-cd /Users/jonathanganiyu/Coding/kalshi-model
+cd /path/to/kalshi-model
 ./start.sh
 ```
 
@@ -20,33 +19,32 @@ are prepared.
 When the sidebar says **Streaming live**, BTC and dashboard updates are arriving
 through the live feed. Kalshi prices also stream once the Key ID is configured.
 
-## Read The Dashboard
+## Read the dashboard
 
 - **BTC vs threshold:** Where Bitcoin is relative to the settlement target.
-- **Model vs market:** Our estimated Up probability compared with Kalshi's price.
-- **Edge and EV:** Whether the difference survives spread, fees, and slippage.
-- **Signal:** `BUY UP`, `BUY DOWN`, or, most often, `HOLD`.
-- **Position:** A conservative paper amount based on the configured bankroll.
+- **Outcome forecast:** Likely Up, Uncertain, or Likely Down.
+- **Trade assessment:** Price, edge, EV, fees, and slippage for the selected side.
+- **Standard Edge HUD:** The probability, EV, confirmation, and safety gates still needed before entry.
 
-Confidence measures data quality, calibration, model agreement, liquidity, and
-spread. It is not a measure of how dramatic the number looks. Convenient, I know.
+Forecast direction alone never places an order.
 
-## Four Stations
+## Trading modes
 
-- **Dashboard:** Live contract, chart, decision, and upcoming market.
-- **Calibration History:** Whether past probabilities matched actual outcomes.
-- **Paper Trading:** Simulated positions, bankroll, P&L, and drawdown.
-- **Settings:** Bankroll, edge threshold, Kelly fraction, risk limits, and backups.
+- **Paper:** Simulated locally and enabled by default.
+- **Demo:** Uses a separate write-enabled Demo key and Kalshi's test account.
+- **Live:** Uses a separate Live key and real funds.
 
-## Rules Of Engagement
+Live requires successful Demo verification, reviewed hard limits, typed session
+arming, and a separate Automatic switch. Arming resets after restart, credential
+changes, disconnects, failed reconciliation, or a triggered risk limit.
 
-This system cannot place real trades. It uses public read-only data and records
-paper positions locally in SQLite.
+## Safety
 
-If you see `HOLD - Data Unreliable`, hold position. A stale feed, missing ask,
-market transition, or exchange disagreement has made the estimate unsafe.
+- Orders always use an explicit worst acceptable price and may fill partially.
+- The kill switch blocks submissions and attempts to cancel resting orders.
+- Mode-specific caps and hard limits apply before every new exposure.
+- Stop-losses are optional and off by default.
+- Stop-losses and the 99¢ profit take require the app to remain running and connected.
+- Reconcile and rearm after every restart or disconnect.
 
 To shut the app down, return to Terminal and press `Control-C`.
-
-That's it, Chief. Watch the price, respect the edge, and don't confuse luck with
-calibration.

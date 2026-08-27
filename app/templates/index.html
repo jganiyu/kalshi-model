@@ -25,12 +25,13 @@
       </div>
       <nav aria-label="Primary navigation">
         <button class="nav-item active" data-page="dashboard">Dashboard</button>
-        <button class="nav-item" data-page="paper">Paper Trading</button>
+        <button class="nav-item" data-page="paper">Trading</button>
         <button class="nav-item" data-page="calibration">Calibration</button>
       </nav>
       <div class="sidebar-foot">
         <span class="status-dot" id="sidebar-status-dot"></span>
         <div><strong id="sidebar-status">Connecting</strong><small>Analysis only</small></div>
+        <strong class="live-armed-indicator" id="live-armed-indicator" hidden>LIVE ARMED</strong>
         <button class="settings-icon" data-page="settings" aria-label="Settings" title="Settings">&#9881;</button>
       </div>
     </aside>
@@ -123,8 +124,17 @@
           </section>
           <section class="paper-controller" aria-labelledby="paper-controller-title">
             <div class="section-heading paper-controller-heading">
-              <div><p class="eyebrow">PAPER TRADING</p><h3 id="paper-controller-title">Manual order</h3></div>
-              <span class="simulated-label">SIMULATED</span>
+              <div><p class="eyebrow" id="dashboard-trading-label">PAPER TRADING</p><h3 id="paper-controller-title">Manual order</h3></div>
+              <span class="simulated-label" id="dashboard-environment-badge">SIMULATED</span>
+            </div>
+            <div class="trading-mode-selector segmented" aria-label="Trading environment">
+              <button type="button" data-trading-mode="PAPER">Paper</button>
+              <button type="button" data-trading-mode="DEMO">Demo</button>
+              <button type="button" data-trading-mode="LIVE">Live</button>
+            </div>
+            <div class="trading-account-strip" id="dashboard-account-strip">
+              <span><i></i><b id="dashboard-account-state">Paper account</b></span>
+              <span id="dashboard-allocation-state">-- available</span>
             </div>
             <span class="paper-permission" id="paper-permission" hidden></span>
             <section class="trade-assessment" aria-labelledby="trade-assessment-title">
@@ -236,8 +246,8 @@
           </section>
           <section class="orderbook-panel">
             <div class="section-heading orderbook-heading">
-              <div><p class="eyebrow">PAPER TRADING</p><h3>Recent trades</h3></div>
-              <span class="simulated-label">SIMULATED</span>
+              <div><p class="eyebrow" id="recent-trades-label">PAPER TRADING</p><h3>Recent trades</h3></div>
+              <span class="simulated-label" id="recent-trades-badge">SIMULATED</span>
             </div>
             <div class="orderbook-table-wrap">
               <table class="orderbook-table recent-trades-table">
@@ -266,7 +276,7 @@
           <aside class="calibration-results" aria-label="Calibration results">
             <div class="compact-stats" id="calibration-stats"></div>
             <section class="compact-result-section">
-              <div class="section-heading"><div><h3>Strategy results</h3><p>Forward paper performance</p></div></div>
+              <div class="section-heading"><div><h3>Strategy results</h3><p id="strategy-results-subtitle">Forward Paper performance</p></div></div>
               <div id="strategy-results" class="strategy-results"><p class="empty-state">No strategy entries yet.</p></div>
             </section>
             <section class="compact-result-section">
@@ -287,13 +297,33 @@
 
       <section class="page" id="page-paper">
         <header class="page-header">
-          <div><p class="eyebrow">FORWARD TEST</p><h1>Paper Trading</h1></div>
+          <div><p class="eyebrow" id="trading-page-kicker">FORWARD TEST</p><h1 id="trading-page-title">Paper Trading</h1></div>
           <div class="paper-page-actions">
-            <span class="read-only-badge">SIMULATED ONLY</span>
+            <span class="read-only-badge" id="trading-page-badge">SIMULATED ONLY</span>
             <button class="secondary-button reset-round-button" id="reset-paper-round" type="button" title="Start a new paper-trading round" aria-label="Reset paper-trading round"><span aria-hidden="true">&#8635;</span><span data-reset-label>Reset round</span></button>
           </div>
         </header>
+        <section class="trading-command-bar">
+          <div class="trading-mode-selector segmented" aria-label="Trading environment">
+            <button type="button" data-trading-mode="PAPER">Paper</button>
+            <button type="button" data-trading-mode="DEMO">Demo</button>
+            <button type="button" data-trading-mode="LIVE">Live</button>
+          </div>
+          <div class="trading-command-status" id="trading-command-status">Paper is ready.</div>
+          <div class="button-row exchange-actions" id="exchange-actions" hidden>
+            <label class="compact-toggle exchange-auto-toggle"><span>Automatic</span><input id="automatic-trading-toggle" type="checkbox"><i></i></label>
+            <button class="secondary-button" id="reconcile-trading" type="button">Reconcile</button>
+            <button class="secondary-button" id="arm-trading" type="button">Arm session</button>
+            <button class="secondary-button danger-button" id="kill-trading" type="button">Kill switch</button>
+          </div>
+        </section>
         <div class="paper-stats" id="paper-stats"></div>
+        <section class="table-section" id="position-section" hidden>
+          <div class="section-heading"><div><h3>Positions and orders</h3><p>Kalshi is the source of truth</p></div></div>
+          <p class="protection-warning" id="protection-warning">Protective exits require the app to remain running and connected.</p>
+          <div class="table-wrap"><table><thead><tr><th>Market</th><th>Side</th><th>Contracts</th><th>Exposure</th><th>Stop</th><th>Profit take</th><th>Status</th></tr></thead><tbody id="position-table"></tbody></table></div>
+          <div class="table-wrap"><table><thead><tr><th>Updated</th><th>Market</th><th>Side</th><th>Action</th><th>Filled</th><th>Remaining</th><th>Price</th><th>Status</th><th></th></tr></thead><tbody id="exchange-order-table"></tbody></table></div>
+        </section>
         <section class="table-section">
           <div class="section-heading"><div><h3>Trade ledger</h3><p>Executable asks, fees, and settlement results</p></div><button class="secondary-button" id="run-backtest">Run backtest</button></div>
           <div id="backtest-result" class="inline-result" hidden></div>
@@ -348,6 +378,26 @@
               </div>
             </div>
           </section>
+          <section class="settings-section wide trading-credentials-section">
+            <div class="section-heading"><div><h3>Demo and Live credentials</h3><p>Keep environments separate. Trading requires write-enabled keys.</p></div></div>
+            <div class="trading-credential-grid">
+              <form class="credential-form trading-credential-form" data-trading-credential-form="DEMO" novalidate>
+                <div class="credential-mode-heading"><strong>Kalshi Demo</strong><span data-trading-credential-state="DEMO">Checking</span></div>
+                <label class="credential-field"><span>Demo API Key ID</span><input data-trading-key-id="DEMO" type="text" autocomplete="off" spellcheck="false"></label>
+                <label class="credential-field credential-file-field"><span>Demo RSA private key</span><input data-trading-key-file="DEMO" type="file" accept=".key,.pem,.txt,text/plain"><small data-trading-file-name="DEMO">Choose the Demo key file.</small></label>
+                <div class="button-row"><button class="primary-button" type="submit">Save Demo key</button><button class="secondary-button" data-remove-trading-credentials="DEMO" type="button">Remove</button><button class="secondary-button" data-verify-demo type="button">Verify Demo</button></div>
+                <div class="inline-result" data-trading-credential-result="DEMO" hidden></div>
+              </form>
+              <form class="credential-form trading-credential-form live-credentials" data-trading-credential-form="LIVE" novalidate>
+                <div class="credential-mode-heading"><strong>Kalshi Live</strong><span data-trading-credential-state="LIVE">Checking</span></div>
+                <label class="credential-field"><span>Live API Key ID</span><input data-trading-key-id="LIVE" type="text" autocomplete="off" spellcheck="false"></label>
+                <label class="credential-field credential-file-field"><span>Live RSA private key</span><input data-trading-key-file="LIVE" type="file" accept=".key,.pem,.txt,text/plain"><small data-trading-file-name="LIVE">Choose the Live key file.</small></label>
+                <div class="button-row"><button class="primary-button" type="submit">Save Live key</button><button class="secondary-button" data-remove-trading-credentials="LIVE" type="button">Remove</button><button class="secondary-button" data-review-live-limits type="button">Limits reviewed</button></div>
+                <p class="risk-warning">Live orders can lose real money. Arming resets whenever the app restarts or loses a safe connection.</p>
+                <div class="inline-result" data-trading-credential-result="LIVE" hidden></div>
+              </form>
+            </div>
+          </section>
           <section class="settings-section wide">
             <div class="section-heading"><div><h3>Local database</h3><p id="database-path">Loading</p></div><div class="button-row"><button class="secondary-button" id="run-bootstrap">Refresh history</button><button class="secondary-button" id="backup-database">Create backup</button></div></div>
             <div class="database-counts" id="database-counts"></div>
@@ -357,6 +407,15 @@
       </section>
     </main>
   </div>
+  <dialog class="trade-confirmation" id="trade-confirmation">
+    <form method="dialog">
+      <p class="eyebrow" id="confirmation-environment">ORDER REVIEW</p>
+      <h3>Confirm Kalshi order</h3>
+      <dl id="confirmation-details"></dl>
+      <p class="risk-warning">Limit orders may fill partially. App-managed exits require this Mac to remain running and connected.</p>
+      <div class="button-row"><button class="secondary-button" value="cancel">Cancel</button><button class="primary-button" id="confirm-exchange-order" value="default" type="button">Submit order</button></div>
+    </form>
+  </dialog>
   <div class="toast" id="toast" role="status" aria-live="polite" hidden><strong id="toast-title"></strong><span id="toast-detail"></span></div>
   <script src="/static/app.js?v={{ asset_version }}" defer></script>
 </body>

@@ -5,7 +5,7 @@ import math
 import time
 from collections import deque
 from datetime import date
-from typing import Any
+from typing import Any, Callable
 
 from app.db import Database
 from app.domain import iso_now, kalshi_fee, parse_time
@@ -1186,13 +1186,18 @@ class PaperTradingService:
         seconds_remaining: float,
         model_version: str,
         now: float | None = None,
+        automatic_enabled: bool | None = None,
+        open_handler: Callable[[str, Decision, str], bool] | None = None,
     ) -> dict[str, Any]:
         settings = self.db.settings()
         key = (ticker, str(decision.side or ""))
         current_time = time.monotonic() if now is None else float(now)
         window = float(settings.get("automatic_confirmation_seconds", 10))
         entry_window = float(settings.get("automatic_entry_window_minutes", 5)) * 60
-        enabled = bool(settings.get("paper_trading_enabled", False))
+        enabled = (
+            bool(settings.get("paper_trading_enabled", False))
+            if automatic_enabled is None else bool(automatic_enabled)
+        )
         inside_window = 0 < seconds_remaining <= entry_window
         if not enabled or not inside_window or not decision.side:
             self.reset_automatic_confirmation()
@@ -1249,7 +1254,11 @@ class PaperTradingService:
         )
         entered = False
         if ready:
-            entered = self.open_from_decision(ticker, decision, model_version)
+            entered = (
+                open_handler(ticker, decision, model_version)
+                if open_handler is not None
+                else self.open_from_decision(ticker, decision, model_version)
+            )
             if entered:
                 self.reset_automatic_confirmation()
         return {
@@ -1299,6 +1308,10 @@ class PaperTradingService:
         blocked_reason: str | None,
         entry_exists: bool,
         portfolio: dict[str, Any],
+        automatic_enabled: bool | None = None,
+        execution_mode: str = "PAPER",
+        execution_block_reason: str | None = None,
+        execution_risk_by_side: dict[str, dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         """Describe Standard Edge using the same inputs that drive execution."""
         settings = self.db.settings()
@@ -1399,6 +1412,8 @@ class PaperTradingService:
             risk_passed = False
             risk_detail = decision.explanation
         elif (
+            execution_mode == "PAPER"
+            and
             not entered
             and risk_passed
             and decision is not None
@@ -1417,7 +1432,21 @@ class PaperTradingService:
                 risk_passed = False
                 risk_detail = str(exc)
 
-        enabled = bool(settings.get("paper_trading_enabled", False))
+        enabled = (
+            bool(settings.get("paper_trading_enabled", False))
+            if automatic_enabled is None else bool(automatic_enabled)
+        )
+        if execution_block_reason:
+            risk_passed = False
+            risk_detail = execution_block_reason
+        elif execution_mode != "PAPER" and standard is not None:
+            execution_risk = (execution_risk_by_side or {}).get(side) or {}
+            if not execution_risk.get("passed", False):
+                risk_passed = False
+                risk_detail = str(
+                    execution_risk.get("primary_blocker")
+                    or "The selected account cannot accept this entry."
+                )
         inside_window = 0 < seconds_remaining <= entry_window
         priority_blocked = bool(
             priority_strategy and priority_strategy != "STANDARD_EDGE"
@@ -1471,7 +1500,7 @@ class PaperTradingService:
         elif blocked_reason:
             blocker = blocked_reason
         elif not enabled:
-            blocker = "Automatic paper trading is off."
+            blocker = f"Automatic {execution_mode.title()} trading is off."
         elif not inside_window:
             blocker = "Outside the Standard Edge entry window."
         elif not raw_data_passed:
@@ -1500,6 +1529,7 @@ class PaperTradingService:
 
         return {
             "strategy": "STANDARD_EDGE",
+            "mode": execution_mode,
             "side": side,
             "status": status,
             "ready": confirmation_ready,
@@ -2003,6 +2033,13 @@ class PaperTradingService:
         model_version: str,
         portfolio: dict[str, Any] | None = None,
         now: float | None = None,
+        execution_mode: str = "PAPER",
+        automatic_enabled: bool | None = None,
+        execution_block_reason: str | None = None,
+        execution_risk_by_side: dict[str, dict[str, Any]] | None = None,
+        entry_exists_override: bool | None = None,
+        standard_entry_handler: Callable[[str, Decision, str], bool] | None = None,
+        fixed_entry_handler: Callable[..., tuple[bool, float]] | None = None,
     ) -> dict[str, Any]:
         settings = self.db.settings()
         current_time = time.monotonic() if now is None else float(now)
@@ -2027,7 +2064,10 @@ class PaperTradingService:
             default=None,
         )
         status_open = str(market_status or "").lower() in {"active", "open"}
-        entry_exists = self._automatic_entry_exists(ticker)
+        entry_exists = (
+            self._automatic_entry_exists(ticker)
+            if entry_exists_override is None else bool(entry_exists_override)
+        )
         observed = parse_time(market_observed_at)
         opened = parse_time(market_open_time)
         opening_elapsed = (
@@ -2053,6 +2093,10 @@ class PaperTradingService:
                 blocked_reason=blocked_reason,
                 entry_exists=entry_exists,
                 portfolio=portfolio_state,
+                automatic_enabled=automatic_enabled,
+                execution_mode=execution_mode,
+                execution_block_reason=execution_block_reason,
+                execution_risk_by_side=execution_risk_by_side,
             )
             result["swing_readiness"] = self._swing_entry_readiness(
                 ticker=ticker,
@@ -2068,9 +2112,18 @@ class PaperTradingService:
             )
             return result
 
-        if not bool(settings.get("paper_trading_enabled", False)):
+        enabled = (
+            bool(settings.get("paper_trading_enabled", False))
+            if automatic_enabled is None else bool(automatic_enabled)
+        )
+        if not enabled:
             self.reset_automatic_confirmation()
-            return finish(blocked_reason="Automatic paper trading is off.")
+            return finish(
+                blocked_reason=f"Automatic {execution_mode.title()} trading is off."
+            )
+        if execution_block_reason:
+            self.reset_automatic_confirmation()
+            return finish(blocked_reason=execution_block_reason)
         if entry_exists:
             self.reset_automatic_confirmation()
             result["blocked_reason"] = "An automatic entry already exists for this market."
@@ -2124,7 +2177,8 @@ class PaperTradingService:
             self._strategy_states.pop("LATE_CONVICTION", None)
             self._strategy_states.pop("SWING", None)
             if confirmation["ready"]:
-                entered, effective = self.open_fixed_strategy(
+                opener = fixed_entry_handler or self.open_fixed_strategy
+                entered, effective = opener(
                     ticker=ticker, strategy="EARLY_THRESHOLD",
                     assessment=early_candidate,
                     bankroll_fraction=float(settings.get("early_bankroll_pct", 0.03)),
@@ -2143,6 +2197,7 @@ class PaperTradingService:
             standard_result = self.consider_automatic_entry(
                 ticker=ticker, decision=standard, seconds_remaining=seconds_remaining,
                 model_version=model_version, now=current_time,
+                automatic_enabled=enabled, open_handler=standard_entry_handler,
             )
             result["active_strategy"] = "STANDARD_EDGE"
             result["standard_edge"] = standard_result
@@ -2186,7 +2241,8 @@ class PaperTradingService:
             result["late_conviction"] = {**confirmation, "entered": False}
             self._strategy_states.pop("SWING", None)
             if confirmation["ready"]:
-                entered, effective = self.open_fixed_strategy(
+                opener = fixed_entry_handler or self.open_fixed_strategy
+                entered, effective = opener(
                     ticker=ticker, strategy="LATE_CONVICTION",
                     assessment=late_candidate,
                     bankroll_fraction=float(settings.get("late_bankroll_pct", 0.03)),
@@ -2227,7 +2283,8 @@ class PaperTradingService:
             result["effective_bankroll_allocation"] = effective
             result["swing"] = {**confirmation, "entered": False}
             if confirmation["ready"]:
-                entered, effective = self.open_fixed_strategy(
+                opener = fixed_entry_handler or self.open_fixed_strategy
+                entered, effective = opener(
                     ticker=ticker,
                     strategy="SWING",
                     assessment=swing_candidate,

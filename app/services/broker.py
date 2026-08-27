@@ -1,0 +1,1648 @@
+from __future__ import annotations
+
+import abc
+import asyncio
+import json
+import math
+import time
+import uuid
+from collections import defaultdict, deque
+from dataclasses import asdict, dataclass, field
+from datetime import UTC, datetime, timedelta
+from typing import Any
+
+from app.db import Database
+from app.domain import iso_now, kalshi_fee, parse_time
+from app.services.kalshi_trading import (
+    AmbiguousSubmissionError,
+    KalshiTradingClient,
+    KalshiTradingError,
+    book_to_outcome,
+)
+from app.services.paper import PaperTradingService
+
+
+TRADING_MODES = {"PAPER", "DEMO", "LIVE"}
+OPEN_ORDER_STATES = {
+    "INTENT_CREATED",
+    "SUBMITTING",
+    "ACKNOWLEDGED",
+    "RESTING",
+    "PARTIALLY_FILLED",
+    "CANCEL_PENDING",
+    "RECONCILIATION_REQUIRED",
+}
+FINAL_ORDER_STATES = {"FILLED", "CANCELED", "REJECTED", "EXPIRED", "SETTLED"}
+
+
+def normalize_mode(value: Any) -> str:
+    mode = str(value or "PAPER").upper()
+    if mode not in TRADING_MODES:
+        raise ValueError("Trading mode must be Paper, Demo, or Live.")
+    return mode
+
+
+@dataclass(frozen=True)
+class OrderIntent:
+    mode: str
+    ticker: str
+    side: str
+    action: str
+    contracts: int
+    limit_price: float
+    strategy: str
+    source: str
+    client_order_id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    post_only: bool = False
+    stop_loss_price: float | None = None
+    target_exit_price: float | None = None
+    fallback_exit_mode: str | None = None
+    fallback_exit_seconds: float | None = None
+    cancel_after_seconds: float | None = None
+    decision_snapshot: dict[str, Any] = field(default_factory=dict)
+    risk_snapshot: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "mode", normalize_mode(self.mode))
+        object.__setattr__(self, "side", str(self.side).upper())
+        object.__setattr__(self, "action", str(self.action).upper())
+        if self.mode == "PAPER":
+            return
+        if self.side not in {"YES", "NO"}:
+            raise ValueError("Choose Up or Down.")
+        if self.action not in {"BUY", "SELL"}:
+            raise ValueError("Choose Buy or Sell.")
+        if isinstance(self.contracts, bool) or int(self.contracts) < 1:
+            raise ValueError("Contracts must be a positive whole number.")
+        if not 0.01 <= float(self.limit_price) <= 0.99:
+            raise ValueError("Limit price must be between 1 and 99 cents.")
+
+
+class Broker(abc.ABC):
+    mode: str
+
+    @abc.abstractmethod
+    def portfolio(self) -> dict[str, Any]: ...
+
+    @abc.abstractmethod
+    async def submit(self, intent: OrderIntent) -> dict[str, Any]: ...
+
+    @abc.abstractmethod
+    async def cancel(self, order_id: str | int) -> dict[str, Any]: ...
+
+    @abc.abstractmethod
+    async def reconcile(self) -> dict[str, Any]: ...
+
+
+class PaperBroker(Broker):
+    mode = "PAPER"
+
+    def __init__(self, service: PaperTradingService):
+        self.service = service
+
+    def portfolio(self) -> dict[str, Any]:
+        return {"mode": self.mode, **self.service.portfolio()}
+
+    async def submit(self, intent: OrderIntent) -> dict[str, Any]:
+        raise ValueError("Paper orders use the existing paper order path.")
+
+    async def cancel(self, order_id: str | int) -> dict[str, Any]:
+        if not self.service.cancel_order(int(order_id)):
+            raise ValueError("That paper order is no longer open.")
+        return {"canceled": int(order_id)}
+
+    async def reconcile(self) -> dict[str, Any]:
+        return {"mode": self.mode, "reconciled": True}
+
+
+def _number(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _dollars(payload: dict[str, Any], fixed_key: str, cents_key: str) -> float:
+    if payload.get(fixed_key) not in (None, ""):
+        return _number(payload.get(fixed_key))
+    return _number(payload.get(cents_key)) / 100.0
+
+
+def _safe_json(payload: dict[str, Any]) -> str:
+    blocked = {"private_key", "signature", "authorization", "auth", "api_key"}
+
+    def scrub(value: Any) -> Any:
+        if isinstance(value, dict):
+            return {
+                key: ("[redacted]" if key.lower() in blocked else scrub(item))
+                for key, item in value.items()
+            }
+        if isinstance(value, list):
+            return [scrub(item) for item in value]
+        return value
+
+    return json.dumps(scrub(payload), sort_keys=True, default=str)
+
+
+def fill_aggregate(
+    fills: list[dict[str, Any]], requested_contracts: float
+) -> dict[str, float | str | None]:
+    filled = sum(_number(row.get("contracts")) for row in fills)
+    value = sum(
+        _number(row.get("contracts")) * _number(row.get("price")) for row in fills
+    )
+    fees = sum(_number(row.get("fee")) for row in fills)
+    remaining = max(0.0, float(requested_contracts) - filled)
+    return {
+        "filled_contracts": filled,
+        "remaining_contracts": remaining,
+        "average_fill_price": value / filled if filled else None,
+        "fees": fees,
+        "status": (
+            "FILLED"
+            if requested_contracts > 0 and remaining <= 1e-9
+            else "PARTIALLY_FILLED"
+        ),
+    }
+
+
+class KalshiBroker(Broker):
+    def __init__(
+        self,
+        mode: str,
+        db: Database,
+        client: KalshiTradingClient | None = None,
+    ):
+        normalized = normalize_mode(mode)
+        if normalized == "PAPER":
+            raise ValueError("KalshiBroker only supports Demo or Live.")
+        self.mode = normalized
+        self.db = db
+        self.client = client
+        self.session_armed = False
+        self.automatic_armed = False
+        self._last_connection_at: float | None = None
+
+    def set_client(self, client: KalshiTradingClient | None) -> None:
+        self.client = client
+        self.disarm("Credentials changed.")
+        self._update_mode_state(
+            connected=False,
+            authenticated=False,
+            reconciled=False,
+            reconciliation_required=True,
+            last_error=None if client else "Credentials are not configured.",
+        )
+
+    def disarm(self, reason: str | None = None) -> None:
+        self.session_armed = False
+        self.automatic_armed = False
+        if reason:
+            self._audit("DISARMED", {"reason": reason})
+
+    def arm(self, *, confirmation: str, automatic: bool = False) -> dict[str, Any]:
+        state = self.mode_state()
+        if self.mode == "LIVE":
+            if confirmation.strip() != "ARM LIVE TRADING":
+                raise ValueError('Type "ARM LIVE TRADING" to continue.')
+            if not state.get("demo_verified_at"):
+                raise ValueError("Complete Demo readiness verification before arming Live.")
+            if not state.get("limits_reviewed_at"):
+                raise ValueError("Review and save the Live hard limits before first arming.")
+        elif confirmation.strip() != "ARM DEMO TRADING":
+            raise ValueError('Type "ARM DEMO TRADING" to continue.')
+        if not state.get("authenticated") or not state.get("reconciled"):
+            raise ValueError("Authenticate and reconcile this account before arming.")
+        if state.get("kill_switch"):
+            raise ValueError("Release the kill switch before arming.")
+        self.session_armed = True
+        self.automatic_armed = bool(automatic)
+        self._audit("ARMED", {"automatic": self.automatic_armed})
+        return self.readiness()
+
+    def set_automatic_armed(self, enabled: bool) -> dict[str, Any]:
+        if enabled and not self.session_armed:
+            raise ValueError(f"Arm the {self.mode.title()} session first.")
+        self.automatic_armed = bool(enabled)
+        self._audit("AUTOMATIC_ARMING_CHANGED", {"enabled": self.automatic_armed})
+        return self.readiness()
+
+    def mark_limits_reviewed(self) -> None:
+        self._update_mode_state(limits_reviewed_at=iso_now())
+
+    def mark_demo_verified(self) -> None:
+        if self.mode != "DEMO":
+            raise ValueError("Demo verification can only be completed in Demo.")
+        verified_at = iso_now()
+        self._update_mode_state(demo_verified_at=verified_at)
+        self.db.execute(
+            "UPDATE broker_mode_state SET demo_verified_at=?,updated_at=? WHERE mode='LIVE'",
+            (verified_at, iso_now()),
+        )
+        self._audit("DEMO_VERIFIED", {"verified_at": verified_at})
+
+    def mode_state(self) -> dict[str, Any]:
+        row = self.db.fetch_one(
+            "SELECT * FROM broker_mode_state WHERE mode=?", (self.mode,)
+        )
+        return row or {
+            "mode": self.mode,
+            "connected": 0,
+            "authenticated": 0,
+            "reconciled": 0,
+            "reconciliation_required": 1,
+            "kill_switch": 0,
+        }
+
+    def readiness(self) -> dict[str, Any]:
+        state = self.mode_state()
+        credentials = self.client is not None
+        reasons: list[str] = []
+        if not credentials:
+            reasons.append(f"{self.mode.title()} trading credentials are not configured.")
+        if not state.get("authenticated"):
+            reasons.append("Account authentication is not verified.")
+        if not state.get("reconciled") or state.get("reconciliation_required"):
+            reasons.append("Account reconciliation is required.")
+        if state.get("kill_switch"):
+            reasons.append("The kill switch is active.")
+        if not self.session_armed:
+            reasons.append(f"The {self.mode.title()} session is disarmed.")
+        return {
+            "mode": self.mode,
+            "credentials_configured": credentials,
+            "connected": bool(state.get("connected")),
+            "authenticated": bool(state.get("authenticated")),
+            "reconciled": bool(state.get("reconciled")),
+            "reconciliation_required": bool(state.get("reconciliation_required")),
+            "session_armed": self.session_armed,
+            "automatic_armed": self.automatic_armed,
+            "kill_switch": bool(state.get("kill_switch")),
+            "demo_verified": bool(state.get("demo_verified_at")),
+            "limits_reviewed": bool(state.get("limits_reviewed_at")),
+            "ready_for_manual": not reasons,
+            "ready_for_automatic": not reasons and self.automatic_armed,
+            "blocker": reasons[0] if reasons else None,
+            "automatic_blocker": (
+                reasons[0]
+                if reasons else None if self.automatic_armed
+                else f"Automatic {self.mode.title()} trading is disarmed."
+            ),
+            "warnings": reasons,
+            "last_reconciled_at": state.get("last_reconciled_at"),
+            "last_error": state.get("last_error"),
+        }
+
+    def portfolio(self) -> dict[str, Any]:
+        account = self.db.fetch_one(
+            "SELECT * FROM broker_account_snapshots WHERE mode=? ORDER BY id DESC LIMIT 1",
+            (self.mode,),
+        ) or {}
+        positions = self.db.fetch_all(
+            "SELECT * FROM broker_positions WHERE mode=? AND status='open' ORDER BY updated_at DESC",
+            (self.mode,),
+        )
+        orders = self.db.fetch_all(
+            "SELECT * FROM broker_orders WHERE mode=? ORDER BY updated_at DESC LIMIT 100",
+            (self.mode,),
+        )
+        fills = self.db.fetch_all(
+            "SELECT * FROM broker_fills WHERE mode=? ORDER BY filled_at DESC LIMIT 100",
+            (self.mode,),
+        )
+        fee_total = self.db.fetch_one(
+            "SELECT COALESCE(SUM(fee),0) AS amount FROM broker_fills WHERE mode=?",
+            (self.mode,),
+        ) or {}
+        intents = self.db.fetch_all(
+            "SELECT * FROM broker_order_intents WHERE mode=? ORDER BY created_at DESC LIMIT 100",
+            (self.mode,),
+        )
+        settlements = self.db.fetch_all(
+            "SELECT * FROM broker_settlements WHERE mode=? ORDER BY settled_at DESC LIMIT 100",
+            (self.mode,),
+        )
+        available = _number(account.get("available_balance"))
+        portfolio_value = _number(account.get("portfolio_value"))
+        allocated = self.allocated_capital()
+        cap = self.allocation_cap(available, portfolio_value)
+        open_orders = [order for order in orders if order.get("status") in OPEN_ORDER_STATES]
+        settings = self.db.settings()
+        profit_take_enabled = bool(settings.get("global_profit_take_enabled", True))
+        stop_positions = [
+            position for position in positions
+            if position.get("stop_loss_price") is not None
+        ]
+        managed_positions = [
+            position for position in positions if position.get("contracts")
+        ]
+        readiness = self.readiness()
+        strategy_results = self.strategy_results()
+        realized_row = self.db.fetch_one(
+            "SELECT COALESCE(SUM(realized_pnl),0) AS amount FROM broker_positions WHERE mode=?",
+            (self.mode,),
+        ) or {}
+        realized_pnl = _number(realized_row.get("amount"))
+        account_equity = max(available, portfolio_value)
+        return {
+            "mode": self.mode,
+            "available_cash": available,
+            "current_bankroll": account_equity,
+            "portfolio_value": portfolio_value,
+            "allocated_capital": allocated,
+            "allocation_cap": cap,
+            "remaining_allocation": max(0.0, cap - allocated),
+            "positions": positions,
+            "orders": orders,
+            "open_orders": open_orders,
+            "fills": fills,
+            "intents": intents,
+            "settlements": settlements,
+            "open_positions": len(positions),
+            "open_order_count": len(open_orders),
+            # Activity is bounded to 100 rows; the account fee total is not.
+            "actual_fees": _number(fee_total.get("amount")),
+            "realized_pnl": realized_pnl,
+            "strategy_results": strategy_results,
+            "automatic_trading_enabled": self.automatic_armed,
+            "automatic_trade_allowed": readiness["ready_for_automatic"],
+            "automatic_trade_block_reason": readiness["automatic_blocker"],
+            "readiness": readiness,
+            "risk_state": self.risk_state(),
+            "reconciliation_state": {
+                "reconciled": readiness["reconciled"],
+                "required": readiness["reconciliation_required"],
+                "last_reconciled_at": readiness["last_reconciled_at"],
+                "last_error": readiness["last_error"],
+            },
+            "stop_loss_state": {
+                "active_positions": len(stop_positions),
+                "positions": [
+                    {
+                        "ticker": row.get("ticker"),
+                        "side": row.get("side"),
+                        "trigger_price": row.get("stop_loss_price"),
+                    }
+                    for row in stop_positions
+                ],
+                "warning": (
+                    "Stop-loss execution requires the Kalshi Model to remain running and connected."
+                ),
+            },
+            "profit_take_state": {
+                "enabled": profit_take_enabled,
+                "trigger_price": (
+                    float(settings.get("global_profit_take_price", 0.99))
+                    if profit_take_enabled else None
+                ),
+                "managed_positions": len(managed_positions),
+                "warning": (
+                    "Profit taking requires the app to remain running, connected, "
+                    "authenticated, reconciled, and armed."
+                ),
+            },
+        }
+
+    def risk_state(self) -> dict[str, Any]:
+        settings = self.db.settings()
+        prefix = self.mode.lower()
+        today = datetime.now(UTC).date().isoformat()
+        first = self.db.fetch_one(
+            """
+            SELECT available_balance,portfolio_value FROM broker_account_snapshots
+            WHERE mode=? AND observed_at LIKE ? ORDER BY observed_at ASC,id ASC LIMIT 1
+            """,
+            (self.mode, f"{today}%"),
+        ) or {}
+        latest = self.db.fetch_one(
+            """
+            SELECT available_balance,portfolio_value FROM broker_account_snapshots
+            WHERE mode=? ORDER BY observed_at DESC,id DESC LIMIT 1
+            """,
+            (self.mode,),
+        ) or {}
+        starting_equity = max(
+            _number(first.get("available_balance")),
+            _number(first.get("portfolio_value")),
+        )
+        current_equity = max(
+            _number(latest.get("available_balance")),
+            _number(latest.get("portfolio_value")),
+        )
+        daily_pnl = current_equity - starting_equity if first and latest else 0.0
+        count = self.db.fetch_one(
+            "SELECT COUNT(*) AS count FROM broker_order_intents WHERE mode=? AND created_at LIKE ?",
+            (self.mode, f"{today}%"),
+        ) or {}
+        open_orders = self.db.fetch_one(
+            """
+            SELECT COUNT(*) AS count FROM broker_orders WHERE mode=?
+            AND status IN ('ACKNOWLEDGED','RESTING','PARTIALLY_FILLED','CANCEL_PENDING')
+            """,
+            (self.mode,),
+        ) or {}
+        limits = {
+            "bankroll_cap_pct": float(settings[f"{prefix}_bankroll_cap_pct"]),
+            "max_total_allocated_capital": float(settings[f"{prefix}_max_total_allocated_capital"]),
+            "max_amount_per_order": float(settings[f"{prefix}_max_amount_per_order"]),
+            "max_exposure_per_market": float(settings[f"{prefix}_max_exposure_per_market"]),
+            "max_total_open_exposure": float(settings[f"{prefix}_max_total_open_exposure"]),
+            "max_open_orders": int(settings[f"{prefix}_max_open_orders"]),
+            "max_daily_loss": float(settings[f"{prefix}_max_daily_loss"]),
+            "max_daily_order_count": int(settings[f"{prefix}_max_daily_order_count"]),
+            "max_entry_price": float(settings[f"{prefix}_max_entry_price"]),
+            "max_spread": float(settings[f"{prefix}_max_spread"]),
+            "min_liquidity": int(settings[f"{prefix}_min_liquidity"]),
+            "min_data_quality": str(settings[f"{prefix}_min_data_quality"]),
+        }
+        order_count = int(count.get("count") or 0)
+        open_order_count = int(open_orders.get("count") or 0)
+        allocated = self.allocated_capital()
+        failures: list[str] = []
+        if allocated > limits["max_total_allocated_capital"] + 1e-9:
+            failures.append("The total allocated-capital limit is active.")
+        if allocated > limits["max_total_open_exposure"] + 1e-9:
+            failures.append("The total open-exposure limit is active.")
+        if open_order_count >= limits["max_open_orders"]:
+            failures.append("The maximum open-order count is active.")
+        if daily_pnl < -limits["max_daily_loss"] - 1e-9:
+            failures.append("The daily realized and unrealized loss limit is active.")
+        if order_count >= limits["max_daily_order_count"]:
+            failures.append("The daily order-count limit is active.")
+        return {
+            "passed": not failures,
+            "primary_blocker": failures[0] if failures else None,
+            "failures": failures,
+            "allocated_capital": allocated,
+            "open_orders": open_order_count,
+            "daily_order_count": order_count,
+            "daily_realized_and_unrealized_pnl": daily_pnl,
+            "limits": limits,
+            "checked_at": iso_now(),
+        }
+
+    def audit_history(self, limit: int = 200) -> list[dict[str, Any]]:
+        rows = self.db.fetch_all(
+            "SELECT * FROM broker_audit_events WHERE mode=? ORDER BY id DESC LIMIT ?",
+            (self.mode, max(1, min(1000, int(limit)))),
+        )
+        for row in rows:
+            try:
+                row["detail"] = json.loads(row.pop("detail_json"))
+            except (TypeError, json.JSONDecodeError):
+                row["detail"] = {}
+                row.pop("detail_json", None)
+        return rows
+
+    def allocation_cap(self, available: float, portfolio_value: float) -> float:
+        settings = self.db.settings()
+        fraction = float(settings.get(f"{self.mode.lower()}_bankroll_cap_pct", 1.0))
+        # Kalshi's portfolio_value is total account equity, including cash.
+        # max() preserves compatibility with responses where it is unavailable.
+        eligible = max(0.0, available, portfolio_value)
+        hard = float(
+            settings.get(f"{self.mode.lower()}_max_total_allocated_capital", 1000000.0)
+        )
+        return min(eligible * max(0.0, min(1.0, fraction)), hard)
+
+    def allocated_capital(self, *, exclude_client_order_id: str | None = None) -> float:
+        position = self.db.fetch_one(
+            "SELECT COALESCE(SUM(ABS(market_exposure)+fees),0) AS amount FROM broker_positions WHERE mode=? AND status='open'",
+            (self.mode,),
+        )
+        resting = self.db.fetch_all(
+            """
+            SELECT limit_price,remaining_contracts
+            FROM broker_orders WHERE mode=? AND action='BUY'
+              AND status IN ('ACKNOWLEDGED','RESTING','PARTIALLY_FILLED','CANCEL_PENDING')
+            """,
+            (self.mode,),
+        )
+        pending_sql = """
+            SELECT limit_price,requested_contracts
+            FROM broker_order_intents WHERE mode=? AND action='BUY'
+              AND status IN ('INTENT_CREATED','SUBMITTING','RECONCILIATION_REQUIRED')
+        """
+        pending_params: tuple[Any, ...] = (self.mode,)
+        if exclude_client_order_id:
+            pending_sql += " AND client_order_id<>?"
+            pending_params = (self.mode, exclude_client_order_id)
+        pending = self.db.fetch_all(pending_sql, pending_params)
+
+        def reserved(rows: list[dict[str, Any]], quantity_key: str) -> float:
+            total = 0.0
+            for row in rows:
+                price = _number(row.get("limit_price"))
+                contracts = max(0, math.floor(_number(row.get(quantity_key))))
+                total += price * contracts + kalshi_fee(price, contracts)
+            return total
+
+        return (
+            _number((position or {}).get("amount"))
+            + reserved(resting, "remaining_contracts")
+            + reserved(pending, "requested_contracts")
+        )
+
+    def has_automatic_entry(self, ticker: str) -> bool:
+        row = self.db.fetch_one(
+            """
+            SELECT id FROM broker_order_intents
+            WHERE mode=? AND ticker=? AND source='automatic'
+              AND action='BUY' AND status NOT IN ('CANCELED','REJECTED','EXPIRED','SETTLED')
+            LIMIT 1
+            """,
+            (self.mode, ticker),
+        )
+        return row is not None
+
+    def risk_check(
+        self,
+        intent: OrderIntent,
+        *,
+        spread: float | None = None,
+        liquidity: float | None = None,
+        data_quality: str | None = None,
+        data_reliable: bool | None = None,
+        market_open: bool | None = None,
+        allow_unarmed: bool = False,
+    ) -> dict[str, Any]:
+        settings = self.db.settings()
+        prefix = self.mode.lower()
+        readiness = self.readiness()
+        failures: list[str] = []
+        ready_key = (
+            "ready_for_automatic" if intent.source == "automatic" else "ready_for_manual"
+        )
+        if not allow_unarmed and not readiness[ready_key]:
+            failures.append(
+                str(
+                    readiness.get(
+                        "automatic_blocker" if ready_key == "ready_for_automatic" else "blocker"
+                    )
+                    or "Trading is not ready."
+                )
+            )
+        exposure = intent.contracts * intent.limit_price + kalshi_fee(
+            intent.limit_price, intent.contracts
+        )
+        account = self.db.fetch_one(
+            "SELECT available_balance,portfolio_value FROM broker_account_snapshots WHERE mode=? ORDER BY id DESC LIMIT 1",
+            (self.mode,),
+        ) or {}
+        available = _number(account.get("available_balance"))
+        portfolio_value = _number(account.get("portfolio_value"))
+        allocated_before = self.allocated_capital(
+            exclude_client_order_id=intent.client_order_id
+        )
+        remaining_allocation = max(
+            0.0, self.allocation_cap(available, portfolio_value) - allocated_before
+        )
+        if intent.action == "BUY":
+            if data_reliable is False:
+                failures.append("Market data is stale or unreliable.")
+            if market_open is False:
+                failures.append("The market is not open for new exposure.")
+            if exposure > float(settings[f"{prefix}_max_amount_per_order"]) + 1e-9:
+                failures.append("The order exceeds the maximum amount per order.")
+            if exposure > available + 1e-9:
+                failures.append("The order exceeds the available account balance.")
+            if exposure > remaining_allocation + 1e-9:
+                failures.append("The order exceeds the remaining mode allocation.")
+            positions = self.db.fetch_all(
+                "SELECT * FROM broker_positions WHERE mode=? AND status='open'",
+                (self.mode,),
+            )
+            market_exposure = sum(
+                abs(_number(position.get("market_exposure")))
+                for position in positions
+                if position.get("ticker") == intent.ticker
+            )
+            market_resting = self.db.fetch_all(
+                """
+                SELECT limit_price,remaining_contracts FROM broker_orders
+                WHERE mode=? AND ticker=? AND action='BUY'
+                  AND status IN ('ACKNOWLEDGED','RESTING','PARTIALLY_FILLED','CANCEL_PENDING')
+                """,
+                (self.mode, intent.ticker),
+            )
+            market_pending = self.db.fetch_all(
+                """
+                SELECT limit_price,requested_contracts FROM broker_order_intents
+                WHERE mode=? AND ticker=? AND action='BUY'
+                  AND status IN ('INTENT_CREATED','SUBMITTING','RECONCILIATION_REQUIRED')
+                  AND client_order_id<>?
+                """,
+                (self.mode, intent.ticker, intent.client_order_id),
+            )
+            reserved_market_exposure = sum(
+                _number(row.get("limit_price"))
+                * math.floor(max(0.0, _number(row.get("remaining_contracts"))))
+                + kalshi_fee(
+                    _number(row.get("limit_price")),
+                    math.floor(max(0.0, _number(row.get("remaining_contracts")))),
+                )
+                for row in market_resting
+            ) + sum(
+                _number(row.get("limit_price"))
+                * math.floor(max(0.0, _number(row.get("requested_contracts"))))
+                + kalshi_fee(
+                    _number(row.get("limit_price")),
+                    math.floor(max(0.0, _number(row.get("requested_contracts")))),
+                )
+                for row in market_pending
+            )
+            if market_exposure + reserved_market_exposure + exposure > float(
+                settings[f"{prefix}_max_exposure_per_market"]
+            ) + 1e-9:
+                failures.append("The order exceeds the per-market exposure limit.")
+            if allocated_before + exposure > float(
+                settings[f"{prefix}_max_total_open_exposure"]
+            ) + 1e-9:
+                failures.append("The total open-exposure limit would be exceeded.")
+            open_orders = self.db.fetch_one(
+                """
+                SELECT COUNT(*) AS count FROM broker_orders WHERE mode=?
+                AND status IN ('ACKNOWLEDGED','RESTING','PARTIALLY_FILLED','CANCEL_PENDING')
+                """,
+                (self.mode,),
+            ) or {}
+            if int(open_orders.get("count") or 0) >= int(settings[f"{prefix}_max_open_orders"]):
+                failures.append("The maximum open-order count is active.")
+            if intent.limit_price > float(settings[f"{prefix}_max_entry_price"]) + 1e-9:
+                failures.append("The entry price exceeds the hard limit.")
+            if spread is not None and spread > float(settings[f"{prefix}_max_spread"]) + 1e-9:
+                failures.append("The spread exceeds the hard limit.")
+            if liquidity is not None and liquidity + 1e-9 < int(settings[f"{prefix}_min_liquidity"]):
+                failures.append("Liquidity is below the hard minimum.")
+            quality_rank = {"Low": 0, "Moderate": 1, "High": 2}
+            required = str(settings[f"{prefix}_min_data_quality"])
+            if data_quality is not None and quality_rank.get(data_quality, -1) < quality_rank.get(required, 1):
+                failures.append("Data quality is below the hard minimum.")
+            today = datetime.now(UTC).date().isoformat()
+            order_count = self.db.fetch_one(
+                "SELECT COUNT(*) AS count FROM broker_order_intents WHERE mode=? AND created_at LIKE ?",
+                (self.mode, f"{today}%"),
+            )
+            if int((order_count or {}).get("count") or 0) > int(
+                settings[f"{prefix}_max_daily_order_count"]
+            ):
+                failures.append("The daily order-count limit is active.")
+            first_account = self.db.fetch_one(
+                """
+                SELECT available_balance,portfolio_value FROM broker_account_snapshots
+                WHERE mode=? AND observed_at LIKE ? ORDER BY observed_at ASC,id ASC LIMIT 1
+                """,
+                (self.mode, f"{today}%"),
+            ) or {}
+            if first_account:
+                start_equity = max(
+                    _number(first_account.get("available_balance")),
+                    _number(first_account.get("portfolio_value")),
+                )
+                current_equity = max(available, portfolio_value)
+                if current_equity - start_equity < -float(
+                    settings[f"{prefix}_max_daily_loss"]
+                ) - 1e-9:
+                    failures.append(
+                        "The daily realized and unrealized loss limit is active."
+                    )
+        else:
+            position = self.db.fetch_one(
+                "SELECT contracts FROM broker_positions WHERE mode=? AND ticker=? AND side=? AND status='open'",
+                (self.mode, intent.ticker, intent.side),
+            )
+            reserved = self.db.fetch_one(
+                """
+                SELECT COALESCE(SUM(remaining_contracts),0) AS contracts
+                FROM broker_orders WHERE mode=? AND ticker=? AND side=? AND action='SELL'
+                  AND status IN ('ACKNOWLEDGED','RESTING','PARTIALLY_FILLED','CANCEL_PENDING')
+                """,
+                (self.mode, intent.ticker, intent.side),
+            )
+            available_contracts = max(
+                0,
+                math.floor(_number((position or {}).get("contracts")) - _number((reserved or {}).get("contracts"))),
+            )
+            if intent.contracts > available_contracts:
+                failures.append(f"Only {available_contracts} contracts are available to sell.")
+        return {
+            "passed": not failures,
+            "failures": failures,
+            "primary_blocker": failures[0] if failures else None,
+            "order_exposure": exposure,
+            "remaining_allocation": remaining_allocation,
+            "checked_at": iso_now(),
+        }
+
+    async def submit(self, intent: OrderIntent) -> dict[str, Any]:
+        if intent.mode != self.mode:
+            raise ValueError("Order intent belongs to a different trading mode.")
+        if self.client is None:
+            raise ValueError(f"{self.mode.title()} credentials are not configured.")
+        existing = self.db.fetch_one(
+            "SELECT * FROM broker_order_intents WHERE mode=? AND client_order_id=?",
+            (self.mode, intent.client_order_id),
+        )
+        if existing:
+            return existing
+        now = iso_now()
+        deadline = None
+        if intent.cancel_after_seconds:
+            deadline = (datetime.now(UTC) + timedelta(seconds=intent.cancel_after_seconds)).isoformat()
+        self.db.execute(
+            """
+            INSERT INTO broker_order_intents(
+                mode,client_order_id,ticker,side,action,requested_contracts,limit_price,
+                status,strategy,source,created_at,updated_at,stop_loss_price,
+                target_exit_price,fallback_exit_mode,fallback_exit_seconds,
+                cancel_deadline_at,decision_snapshot_json,risk_snapshot_json
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                self.mode, intent.client_order_id, intent.ticker, intent.side,
+                intent.action, intent.contracts, intent.limit_price, "INTENT_CREATED",
+                intent.strategy, intent.source, now, now, intent.stop_loss_price,
+                intent.target_exit_price, intent.fallback_exit_mode,
+                intent.fallback_exit_seconds, deadline,
+                _safe_json(intent.decision_snapshot), _safe_json(intent.risk_snapshot),
+            ),
+        )
+        self._audit("INTENT_CREATED", asdict(intent), intent=intent)
+        risk = self.risk_check(
+            intent,
+            spread=intent.risk_snapshot.get("spread"),
+            liquidity=intent.risk_snapshot.get("liquidity"),
+            data_quality=intent.risk_snapshot.get("data_quality"),
+            data_reliable=intent.risk_snapshot.get("data_reliable"),
+            market_open=intent.risk_snapshot.get("market_open"),
+        )
+        self.db.execute(
+            "UPDATE broker_order_intents SET risk_snapshot_json=?,updated_at=? WHERE mode=? AND client_order_id=?",
+            (_safe_json(risk), iso_now(), self.mode, intent.client_order_id),
+        )
+        self._audit("RISK_CHECKED", risk, intent=intent)
+        if not risk["passed"]:
+            self._set_intent(intent.client_order_id, "REJECTED", error=risk["primary_blocker"])
+            if self.mode == "LIVE" and intent.action == "BUY":
+                self.automatic_armed = False
+                self._audit(
+                    "AUTOMATIC_DISARMED_BY_RISK",
+                    {"reason": risk["primary_blocker"]},
+                    intent=intent,
+                )
+            raise ValueError(str(risk["primary_blocker"]))
+        self._set_intent(intent.client_order_id, "SUBMITTING")
+        try:
+            response = await self.client.create_order(
+                ticker=intent.ticker,
+                client_order_id=intent.client_order_id,
+                side=intent.side,
+                action=intent.action,
+                contracts=intent.contracts,
+                limit_price=intent.limit_price,
+                reduce_only=intent.action == "SELL",
+                post_only=intent.post_only,
+                live_authorized=self.session_armed,
+            )
+        except AmbiguousSubmissionError as exc:
+            self._set_intent(
+                intent.client_order_id, "RECONCILIATION_REQUIRED", error=str(exc)
+            )
+            self._update_mode_state(
+                reconciled=False,
+                reconciliation_required=True,
+                last_error=str(exc),
+            )
+            self.disarm(str(exc))
+            self._audit("SUBMISSION_AMBIGUOUS", {"error": str(exc)}, intent=intent)
+            raise
+        except (KalshiTradingError, ValueError) as exc:
+            self._set_intent(intent.client_order_id, "REJECTED", error=str(exc))
+            self._audit("SUBMISSION_REJECTED", {"error": str(exc)}, intent=intent)
+            raise
+        exchange_order_id = str(response.get("order_id") or "")
+        fill_count = _number(response.get("fill_count") or response.get("fill_count_fp"))
+        remaining = _number(response.get("remaining_count") or response.get("remaining_count_fp"), intent.contracts)
+        status = "FILLED" if remaining <= 0 else "PARTIALLY_FILLED" if fill_count > 0 else "ACKNOWLEDGED"
+        self._set_intent(
+            intent.client_order_id,
+            status,
+            exchange_order_id=exchange_order_id or None,
+        )
+        self._upsert_order(
+            {
+                **response,
+                "order_id": exchange_order_id,
+                "client_order_id": intent.client_order_id,
+                "ticker": intent.ticker,
+                "status": status,
+                "requested_contracts": intent.contracts,
+                "filled_contracts": fill_count,
+                "remaining_contracts": remaining,
+                "limit_price": intent.limit_price,
+                "outcome_side": intent.side,
+                "action": intent.action,
+                "strategy": intent.strategy,
+                "source": intent.source,
+            }
+        )
+        self._audit("SUBMISSION_ACKNOWLEDGED", response, intent=intent, exchange_order_id=exchange_order_id)
+        return self.db.fetch_one(
+            "SELECT * FROM broker_order_intents WHERE mode=? AND client_order_id=?",
+            (self.mode, intent.client_order_id),
+        ) or response
+
+    async def cancel(self, order_id: str | int) -> dict[str, Any]:
+        if self.client is None:
+            raise ValueError(f"{self.mode.title()} credentials are not configured.")
+        order = self.db.fetch_one(
+            "SELECT * FROM broker_orders WHERE mode=? AND (exchange_order_id=? OR id=?)",
+            (self.mode, str(order_id), order_id),
+        )
+        if not order or order.get("status") not in OPEN_ORDER_STATES:
+            raise ValueError("That order is no longer resting.")
+        self.db.execute(
+            "UPDATE broker_orders SET status='CANCEL_PENDING',updated_at=? WHERE id=?",
+            (iso_now(), order["id"]),
+        )
+        try:
+            response = await self.client.cancel_order(str(order["exchange_order_id"]))
+        except KalshiTradingError:
+            await self.reconcile()
+            raise
+        self._audit(
+            "CANCEL_REQUESTED", response,
+            client_order_id=order.get("client_order_id"),
+            exchange_order_id=str(order["exchange_order_id"]),
+            ticker=order.get("ticker"),
+        )
+        await self.reconcile()
+        return response
+
+    async def reconcile(self) -> dict[str, Any]:
+        if self.client is None:
+            self._update_mode_state(
+                connected=False, authenticated=False, reconciled=False,
+                reconciliation_required=True,
+                last_error="Credentials are not configured.",
+            )
+            return self.readiness()
+        try:
+            balance, orders, fills, positions, settlements = await asyncio.gather(
+                self.client.balance(), self.client.orders(), self.client.fills(),
+                self.client.positions(), self.client.settlements(),
+            )
+        except (KalshiTradingError, ValueError) as exc:
+            self._update_mode_state(
+                connected=False,
+                authenticated=False if getattr(exc, "status_code", None) in {401, 403} else None,
+                reconciled=False,
+                reconciliation_required=True,
+                last_error=str(exc),
+            )
+            self.disarm("Reconciliation failed.")
+            raise
+        observed_at = iso_now()
+        available = _dollars(balance, "balance_dollars", "balance")
+        portfolio_value = _number(balance.get("portfolio_value")) / 100.0
+        self.db.execute(
+            """
+            INSERT INTO broker_account_snapshots(
+                mode,observed_at,available_balance,portfolio_value,allocated_capital,raw_json
+            ) VALUES (?,?,?,?,?,?)
+            """,
+            (self.mode, observed_at, available, portfolio_value, self.allocated_capital(), _safe_json(balance)),
+        )
+        remote_orders = list(orders.get("orders") or [])
+        remote_fills = list(fills.get("fills") or [])
+        remote_positions = list(positions.get("market_positions") or positions.get("positions") or [])
+        remote_settlements = list(settlements.get("settlements") or [])
+        for order in remote_orders:
+            self._upsert_order(order)
+        for fill in remote_fills:
+            self._upsert_fill(fill)
+        self._replace_positions(remote_positions)
+        for settlement in remote_settlements:
+            self._upsert_settlement(settlement)
+        # Resolve crash-interrupted and ambiguous submissions by persistent client ID.
+        interrupted = self.db.fetch_all(
+            "SELECT * FROM broker_order_intents WHERE mode=? AND status='INTENT_CREATED'",
+            (self.mode,),
+        )
+        for intent in interrupted:
+            self._set_intent(
+                str(intent["client_order_id"]),
+                "REJECTED",
+                error="The app stopped before this intent was submitted.",
+            )
+        ambiguous = self.db.fetch_all(
+            """
+            SELECT * FROM broker_order_intents
+            WHERE mode=? AND status IN ('SUBMITTING','RECONCILIATION_REQUIRED')
+            """,
+            (self.mode,),
+        )
+        by_client = {
+            str(order.get("client_order_id") or ""): order for order in remote_orders
+        }
+        for intent in ambiguous:
+            remote = by_client.get(str(intent["client_order_id"]))
+            if remote:
+                self._set_intent(
+                    str(intent["client_order_id"]),
+                    self._order_status(remote),
+                    exchange_order_id=str(remote.get("order_id") or "") or None,
+                    error=None,
+                )
+            elif intent.get("status") == "SUBMITTING":
+                self._set_intent(
+                    str(intent["client_order_id"]),
+                    "RECONCILIATION_REQUIRED",
+                    error="Submission outcome remains unknown.",
+                )
+        unresolved = self.db.fetch_one(
+            """
+            SELECT COUNT(*) AS count FROM broker_order_intents
+            WHERE mode=? AND status='RECONCILIATION_REQUIRED'
+            """,
+            (self.mode,),
+        ) or {}
+        reconciliation_required = int(unresolved.get("count") or 0) > 0
+        self._update_mode_state(
+            connected=True,
+            authenticated=True,
+            reconciled=not reconciliation_required,
+            reconciliation_required=reconciliation_required,
+            last_reconciled_at=observed_at,
+            last_error=(
+                "An order submission still requires reconciliation."
+                if reconciliation_required else None
+            ),
+        )
+        self._last_connection_at = time.monotonic()
+        self._audit(
+            "RECONCILED",
+            {
+                "orders": len(remote_orders),
+                "fills": len(remote_fills),
+                "positions": len(remote_positions),
+                "settlements": len(remote_settlements),
+                "unresolved_submissions": int(unresolved.get("count") or 0),
+            },
+        )
+        return self.portfolio()
+
+    async def kill(self) -> dict[str, Any]:
+        self.disarm("Kill switch activated.")
+        self._update_mode_state(kill_switch=True)
+        orders = self.db.fetch_all(
+            "SELECT exchange_order_id FROM broker_orders WHERE mode=? AND status IN ('ACKNOWLEDGED','RESTING','PARTIALLY_FILLED')",
+            (self.mode,),
+        )
+        canceled = 0
+        errors: list[str] = []
+        for order in orders:
+            try:
+                await self.cancel(str(order["exchange_order_id"]))
+                canceled += 1
+            except (ValueError, KalshiTradingError) as exc:
+                errors.append(str(exc))
+        self._audit("KILL_SWITCH", {"cancel_attempts": len(orders), "canceled": canceled, "errors": errors})
+        return {"mode": self.mode, "active": True, "canceled": canceled, "errors": errors}
+
+    def release_kill_switch(self) -> dict[str, Any]:
+        self._update_mode_state(kill_switch=False)
+        self._audit("KILL_SWITCH_RELEASED", {})
+        return self.readiness()
+
+    def strategy_results(self) -> dict[str, dict[str, Any]]:
+        fills = self.db.fetch_all(
+            "SELECT * FROM broker_fills WHERE mode=? ORDER BY filled_at ASC", (self.mode,)
+        )
+        settlements = {
+            (str(row.get("ticker")), str(row.get("side"))): row
+            for row in self.db.fetch_all(
+                "SELECT * FROM broker_settlements WHERE mode=?", (self.mode,)
+            )
+        }
+        result: dict[str, dict[str, Any]] = {}
+        for strategy in ("STANDARD_EDGE", "EARLY_THRESHOLD", "LATE_CONVICTION", "SWING"):
+            rows = [row for row in fills if row.get("strategy") == strategy]
+            buys = [row for row in rows if row.get("action") == "BUY"]
+            groups: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
+            for row in rows:
+                groups[(str(row.get("ticker")), str(row.get("side")))].append(row)
+            realized = 0.0
+            deployed = 0.0
+            completed = 0
+            wins = 0
+            holding_seconds: list[float] = []
+            exit_counts: dict[str, int] = defaultdict(int)
+            exit_value = 0.0
+            exit_contracts = 0.0
+            open_contracts = 0.0
+            settlement_fees = 0.0
+            for key, group_rows in groups.items():
+                lots: deque[list[Any]] = deque()
+                group_realized = 0.0
+                first_entry_at = None
+                last_exit_at = None
+                group_exit_sources: set[str] = set()
+                for row in group_rows:
+                    quantity = max(0.0, _number(row.get("contracts")))
+                    if quantity <= 0:
+                        continue
+                    price = _number(row.get("price"))
+                    fee = _number(row.get("fee"))
+                    timestamp = parse_time(row.get("filled_at"))
+                    if row.get("action") == "BUY":
+                        first_entry_at = first_entry_at or timestamp
+                        lots.append([quantity, price + fee / quantity])
+                        continue
+                    remaining = quantity
+                    matched = 0.0
+                    matched_cost = 0.0
+                    while remaining > 1e-9 and lots:
+                        lot = lots[0]
+                        take = min(remaining, float(lot[0]))
+                        matched += take
+                        matched_cost += take * float(lot[1])
+                        lot[0] = float(lot[0]) - take
+                        remaining -= take
+                        if float(lot[0]) <= 1e-9:
+                            lots.popleft()
+                    if matched <= 0:
+                        continue
+                    allocated_fee = fee * matched / quantity
+                    net_proceeds = matched * price - allocated_fee
+                    group_realized += net_proceeds - matched_cost
+                    deployed += matched_cost
+                    exit_value += matched * price
+                    exit_contracts += matched
+                    last_exit_at = timestamp or last_exit_at
+                    group_exit_sources.add(str(row.get("source") or "exit").upper())
+                remaining_contracts = sum(float(lot[0]) for lot in lots)
+                settlement = settlements.get(key)
+                if settlement and remaining_contracts > 1e-9:
+                    won = bool(settlement.get("position_won"))
+                    payout_price = 1.0 if won else 0.0
+                    remaining_cost = sum(float(lot[0]) * float(lot[1]) for lot in lots)
+                    fee = _number(settlement.get("fees"))
+                    group_realized += remaining_contracts * payout_price - remaining_cost - fee
+                    deployed += remaining_cost
+                    exit_value += remaining_contracts * payout_price
+                    exit_contracts += remaining_contracts
+                    settlement_fees += fee
+                    group_exit_sources.add("SETTLEMENT")
+                    last_exit_at = parse_time(settlement.get("settled_at")) or last_exit_at
+                    lots.clear()
+                    remaining_contracts = 0.0
+                open_contracts += remaining_contracts
+                realized += group_realized
+                if group_rows and remaining_contracts <= 1e-9 and any(
+                    row.get("action") == "BUY" for row in group_rows
+                ):
+                    completed += 1
+                    wins += int(group_realized > 0)
+                    if first_entry_at and last_exit_at:
+                        holding_seconds.append(
+                            max(0.0, (last_exit_at - first_entry_at).total_seconds())
+                        )
+                    for source in group_exit_sources or {"SETTLEMENT"}:
+                        exit_counts[source] += 1
+            entry_contracts = sum(_number(row.get("contracts")) for row in buys)
+            entry_value = sum(
+                _number(row.get("contracts")) * _number(row.get("price"))
+                for row in buys
+            )
+            target_exits = exit_counts.get("SWING_TARGET", 0)
+            result[strategy] = {
+                "entries": len(
+                    {
+                        row.get("client_order_id") or row.get("fill_id")
+                        for row in buys
+                    }
+                ),
+                "completed_trades": completed,
+                "settled_trades": completed,
+                "wins": wins,
+                "win_rate": wins / completed if completed else None,
+                "realized_pnl": realized,
+                "actual_fees": (
+                    sum(_number(row.get("fee")) for row in rows) + settlement_fees
+                ),
+                "average_entry_price": (
+                    entry_value / entry_contracts if entry_contracts else None
+                ),
+                "average_exit_price": (
+                    exit_value / exit_contracts if exit_contracts else None
+                ),
+                "average_holding_seconds": (
+                    sum(holding_seconds) / len(holding_seconds)
+                    if holding_seconds else None
+                ),
+                "return_on_deployed_capital": (
+                    realized / deployed if deployed else None
+                ),
+                "target_hit_rate": (
+                    target_exits / completed if completed else None
+                ),
+                "exit_counts": dict(exit_counts),
+                "open_contracts": open_contracts,
+            }
+        return result
+
+    def _order_status(self, order: dict[str, Any]) -> str:
+        raw = str(order.get("status") or "").lower().replace(" ", "_")
+        remaining = _number(order.get("remaining_count_fp") or order.get("remaining_count"))
+        filled = _number(order.get("fill_count_fp") or order.get("fill_count"))
+        if raw in {"canceled", "cancelled"}:
+            return "CANCELED"
+        if raw in {"rejected"}:
+            return "REJECTED"
+        if raw in {"expired"}:
+            return "EXPIRED"
+        if raw in {"executed", "filled"} or (filled > 0 and remaining <= 0):
+            return "FILLED"
+        if filled > 0 and remaining > 0:
+            return "PARTIALLY_FILLED"
+        return "RESTING"
+
+    def _semantic_order(self, order: dict[str, Any]) -> tuple[str, str, float]:
+        intent = None
+        client_id = str(order.get("client_order_id") or "")
+        exchange_id = str(order.get("order_id") or order.get("exchange_order_id") or "")
+        if client_id:
+            intent = self.db.fetch_one(
+                "SELECT side,action,limit_price FROM broker_order_intents WHERE mode=? AND client_order_id=?",
+                (self.mode, client_id),
+            )
+        if not intent and exchange_id:
+            intent = self.db.fetch_one(
+                "SELECT side,action,limit_price FROM broker_order_intents WHERE mode=? AND exchange_order_id=?",
+                (self.mode, exchange_id),
+            )
+        if intent:
+            return str(intent["side"]), str(intent["action"]), _number(intent["limit_price"])
+        outcome = str(order.get("outcome_side") or "").upper()
+        action = str(order.get("action") or "").upper()
+        if outcome in {"YES", "NO"} and action in {"BUY", "SELL"}:
+            direct_price = order.get(
+                "yes_price_dollars" if outcome == "YES" else "no_price_dollars"
+            )
+            outcome_price = _number(
+                order.get("outcome_price") or direct_price
+            )
+            if direct_price in (None, "") and not order.get("outcome_price"):
+                book_price = _number(
+                    order.get("price")
+                    or order.get("price_dollars")
+                    or order.get("yes_price_dollars")
+                )
+                outcome_price = 1.0 - book_price if outcome == "NO" else book_price
+            return outcome, action, round(outcome_price, 4)
+        legacy_outcome = str(order.get("side") or "").upper()
+        if legacy_outcome in {"YES", "NO"} and action in {"BUY", "SELL"}:
+            direct_price = order.get(
+                "yes_price_dollars"
+                if legacy_outcome == "YES" else "no_price_dollars"
+            )
+            return legacy_outcome, action, round(_number(direct_price), 4)
+        book_side = str(order.get("book_side") or order.get("side") or "bid")
+        book_price = _number(
+            order.get("price") or order.get("price_dollars") or order.get("yes_price_dollars")
+        )
+        return book_to_outcome(book_side, book_price, reduce_only=bool(order.get("reduce_only")))
+
+    def _upsert_order(self, order: dict[str, Any]) -> None:
+        exchange_id = str(order.get("order_id") or order.get("exchange_order_id") or "")
+        if not exchange_id:
+            return
+        previous = self.db.fetch_one(
+            "SELECT status FROM broker_orders WHERE mode=? AND exchange_order_id=?",
+            (self.mode, exchange_id),
+        )
+        side, action, limit_price = self._semantic_order(order)
+        client_id = str(order.get("client_order_id") or "") or None
+        intent = self.db.fetch_one(
+            "SELECT strategy,source FROM broker_order_intents WHERE mode=? AND client_order_id=?",
+            (self.mode, client_id),
+        ) if client_id else None
+        requested = _number(
+            order.get("requested_contracts")
+            or order.get("initial_count_fp")
+            or order.get("count_fp")
+            or order.get("count")
+        )
+        filled = _number(
+            order.get("filled_contracts") or order.get("fill_count_fp") or order.get("fill_count")
+        )
+        remaining = _number(
+            order.get("remaining_contracts") or order.get("remaining_count_fp") or order.get("remaining_count"),
+            max(0.0, requested - filled),
+        )
+        status = self._order_status(order) if str(order.get("status") or "").upper() not in OPEN_ORDER_STATES | FINAL_ORDER_STATES else str(order["status"]).upper()
+        updated_at = str(order.get("last_update_time") or order.get("updated_at") or iso_now())
+        self.db.execute(
+            """
+            INSERT INTO broker_orders(
+                mode,exchange_order_id,client_order_id,ticker,side,action,status,
+                requested_contracts,filled_contracts,remaining_contracts,limit_price,
+                average_fill_price,fees,strategy,source,created_at,updated_at,raw_json
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(mode,exchange_order_id) DO UPDATE SET
+                client_order_id=excluded.client_order_id,ticker=excluded.ticker,
+                side=excluded.side,action=excluded.action,status=excluded.status,
+                requested_contracts=excluded.requested_contracts,
+                filled_contracts=excluded.filled_contracts,
+                remaining_contracts=excluded.remaining_contracts,
+                limit_price=excluded.limit_price,average_fill_price=excluded.average_fill_price,
+                fees=excluded.fees,strategy=COALESCE(excluded.strategy,broker_orders.strategy),
+                source=COALESCE(excluded.source,broker_orders.source),
+                updated_at=excluded.updated_at,raw_json=excluded.raw_json
+            """,
+            (
+                self.mode, exchange_id, client_id, str(order.get("ticker") or ""),
+                side, action, status, requested, filled, remaining, limit_price,
+                _number(order.get("average_fill_price") or order.get("avg_price")) or None,
+                _number(order.get("fees") or order.get("fee"))
+                or (
+                    _number(order.get("taker_fees_dollars"))
+                    + _number(order.get("maker_fees_dollars"))
+                ),
+                order.get("strategy") or (intent or {}).get("strategy"),
+                order.get("source") or (intent or {}).get("source"),
+                str(order.get("created_time") or order.get("created_at") or iso_now()),
+                updated_at, _safe_json(order),
+            ),
+        )
+        if client_id:
+            self._set_intent(client_id, status, exchange_order_id=exchange_id)
+        if not previous or previous.get("status") != status:
+            self._audit(
+                "ORDER_STATE_CHANGED",
+                {"from": (previous or {}).get("status"), "to": status},
+                client_order_id=client_id,
+                exchange_order_id=exchange_id,
+                ticker=str(order.get("ticker") or ""),
+            )
+
+    def _upsert_fill(self, fill: dict[str, Any]) -> None:
+        fill_id = str(fill.get("fill_id") or fill.get("trade_id") or "")
+        if not fill_id:
+            return
+        already_recorded = self.db.fetch_one(
+            "SELECT id FROM broker_fills WHERE mode=? AND fill_id=?",
+            (self.mode, fill_id),
+        ) is not None
+        exchange_id = str(fill.get("order_id") or "") or None
+        order = self.db.fetch_one(
+            "SELECT * FROM broker_orders WHERE mode=? AND exchange_order_id=?",
+            (self.mode, exchange_id),
+        ) if exchange_id else None
+        client_id = str(fill.get("client_order_id") or (order or {}).get("client_order_id") or "") or None
+        if order:
+            side, action, price = str(order["side"]), str(order["action"]), _number(order["limit_price"])
+        else:
+            side, action, price = self._semantic_order(fill)
+        direct_price = fill.get(
+            "yes_price_dollars" if side == "YES" else "no_price_dollars"
+        )
+        if direct_price not in (None, ""):
+            fill_price = _number(direct_price, price)
+        else:
+            book_price = _number(
+                fill.get("price")
+                or fill.get("price_dollars")
+                or fill.get("yes_price_dollars"),
+                price,
+            )
+            fill_price = 1.0 - book_price if side == "NO" else book_price
+        contracts = _number(fill.get("count_fp") or fill.get("count") or fill.get("contracts"))
+        fee = _number(
+            fill.get("fee_cost_dollars")
+            or fill.get("fee_cost")
+            or fill.get("fee")
+            or fill.get("fees")
+        )
+        intent = self.db.fetch_one(
+            "SELECT strategy,source FROM broker_order_intents WHERE mode=? AND client_order_id=?",
+            (self.mode, client_id),
+        ) if client_id else None
+        self.db.execute(
+            """
+            INSERT OR IGNORE INTO broker_fills(
+                mode,fill_id,exchange_order_id,client_order_id,ticker,side,action,
+                contracts,price,fee,strategy,source,filled_at,raw_json
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                self.mode, fill_id, exchange_id, client_id,
+                str(fill.get("ticker") or (order or {}).get("ticker") or ""),
+                side, action, contracts, fill_price, fee,
+                (intent or {}).get("strategy") or (order or {}).get("strategy"),
+                (intent or {}).get("source") or (order or {}).get("source"),
+                str(fill.get("created_time") or fill.get("filled_at") or iso_now()),
+                _safe_json(fill),
+            ),
+        )
+        if exchange_id:
+            fill_rows = self.db.fetch_all(
+                "SELECT contracts,price,fee FROM broker_fills WHERE mode=? AND exchange_order_id=?",
+                (self.mode, exchange_id),
+            )
+            order_row = self.db.fetch_one(
+                "SELECT requested_contracts FROM broker_orders WHERE mode=? AND exchange_order_id=?",
+                (self.mode, exchange_id),
+            ) or {}
+            requested = _number(order_row.get("requested_contracts"))
+            aggregate = fill_aggregate(fill_rows, requested)
+            status = str(aggregate["status"])
+            self.db.execute(
+                """
+                UPDATE broker_orders SET filled_contracts=?,remaining_contracts=?,
+                    average_fill_price=?,fees=?,status=?,updated_at=?
+                WHERE mode=? AND exchange_order_id=?
+                """,
+                (
+                    aggregate["filled_contracts"], aggregate["remaining_contracts"],
+                    aggregate["average_fill_price"], aggregate["fees"], status, iso_now(),
+                    self.mode, exchange_id,
+                ),
+            )
+            if client_id:
+                self._set_intent(client_id, status, exchange_order_id=exchange_id)
+        if not already_recorded:
+            self._audit(
+                "FILL_RECORDED",
+                {
+                    "fill_id": fill_id,
+                    "side": side,
+                    "action": action,
+                    "contracts": contracts,
+                    "price": fill_price,
+                    "fee": fee,
+                },
+                client_order_id=client_id,
+                exchange_order_id=exchange_id,
+                ticker=str(fill.get("ticker") or (order or {}).get("ticker") or ""),
+            )
+
+    def _replace_positions(self, positions: list[dict[str, Any]]) -> None:
+        active: set[tuple[str, str]] = set()
+        for position in positions:
+            signed = _number(position.get("position_fp") or position.get("position"))
+            ticker = str(position.get("ticker") or position.get("market_ticker") or "")
+            if abs(signed) < 1e-9:
+                if ticker:
+                    self.db.execute(
+                        """
+                        UPDATE broker_positions SET contracts=0,market_exposure=0,
+                            realized_pnl=?,fees=?,updated_at=?,status='closed'
+                        WHERE mode=? AND ticker=? AND status='open'
+                        """,
+                        (
+                            _number(
+                                position.get("realized_pnl_dollars")
+                                or position.get("realized_pnl")
+                            ),
+                            _number(
+                                position.get("fees_paid_dollars")
+                                or position.get("fees_paid")
+                            ),
+                            str(position.get("last_updated_ts") or iso_now()),
+                            self.mode,
+                            ticker,
+                        ),
+                    )
+                continue
+            side = "YES" if signed > 0 else "NO"
+            contracts = abs(signed)
+            active.add((ticker, side))
+            existing = self.db.fetch_one(
+                "SELECT * FROM broker_positions WHERE mode=? AND ticker=? AND side=?",
+                (self.mode, ticker, side),
+            ) or {}
+            exposure = abs(_number(
+                position.get("market_exposure_dollars") or position.get("market_exposure")
+            ))
+            average_price = exposure / contracts if contracts else None
+            self.db.execute(
+                """
+                INSERT INTO broker_positions(
+                    mode,ticker,side,contracts,average_price,market_exposure,realized_pnl,
+                    fees,strategy,source,stop_loss_price,target_exit_price,
+                    fallback_exit_mode,fallback_exit_seconds,opened_at,updated_at,status
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(mode,ticker,side) DO UPDATE SET
+                    contracts=excluded.contracts,average_price=excluded.average_price,
+                    market_exposure=excluded.market_exposure,realized_pnl=excluded.realized_pnl,
+                    fees=excluded.fees,updated_at=excluded.updated_at,status='open'
+                """,
+                (
+                    self.mode, ticker, side, contracts, average_price, exposure,
+                    _number(position.get("realized_pnl_dollars") or position.get("realized_pnl")),
+                    _number(position.get("fees_paid_dollars") or position.get("fees_paid")),
+                    existing.get("strategy"), existing.get("source"), existing.get("stop_loss_price"),
+                    existing.get("target_exit_price"), existing.get("fallback_exit_mode"),
+                    existing.get("fallback_exit_seconds"), existing.get("opened_at") or iso_now(),
+                    str(position.get("last_updated_ts") or iso_now()), "open",
+                ),
+            )
+        existing_rows = self.db.fetch_all(
+            "SELECT ticker,side FROM broker_positions WHERE mode=? AND status='open'", (self.mode,)
+        )
+        for row in existing_rows:
+            key = (str(row["ticker"]), str(row["side"]))
+            if key not in active:
+                self.db.execute(
+                    "UPDATE broker_positions SET status='closed',contracts=0,updated_at=? WHERE mode=? AND ticker=? AND side=?",
+                    (iso_now(), self.mode, *key),
+                )
+
+    def _upsert_settlement(self, settlement: dict[str, Any]) -> None:
+        ticker = str(settlement.get("ticker") or settlement.get("market_ticker") or "")
+        if not ticker:
+            return
+        previous_settlement = self.db.fetch_one(
+            "SELECT * FROM broker_settlements WHERE mode=? AND ticker=?",
+            (self.mode, ticker),
+        )
+        position = self.db.fetch_one(
+            "SELECT * FROM broker_positions WHERE mode=? AND ticker=? ORDER BY updated_at DESC LIMIT 1",
+            (self.mode, ticker),
+        ) or {}
+        market_result = str(
+            settlement.get("market_result") or settlement.get("result") or ""
+        ).upper() or None
+        yes_count = _number(settlement.get("yes_count_fp") or settlement.get("yes_count"))
+        no_count = _number(settlement.get("no_count_fp") or settlement.get("no_count"))
+        side = str(position.get("side") or "") or (
+            "YES" if yes_count > 0 else "NO" if no_count > 0 else None
+        )
+        position_won = None
+        if side in {"YES", "NO"} and market_result in {"YES", "NO"}:
+            position_won = int(side == market_result)
+        fee = _number(
+            settlement.get("fee_cost_dollars")
+            or settlement.get("fee_cost")
+            or settlement.get("fees_paid_dollars")
+        )
+        revenue = (
+            _number(settlement.get("revenue_dollars"))
+            if settlement.get("revenue_dollars") not in (None, "")
+            else _number(settlement.get("revenue")) / 100.0
+        )
+        cost = _number(
+            settlement.get("yes_total_cost_dollars")
+            if side == "YES" else settlement.get("no_total_cost_dollars")
+        )
+        realized = (
+            _number(settlement.get("realized_pnl_dollars"))
+            if settlement.get("realized_pnl_dollars") not in (None, "")
+            else revenue - cost - fee
+        )
+        self.db.execute(
+            """
+            INSERT INTO broker_settlements(
+                mode,ticker,side,settled_at,market_result,position_won,realized_pnl,fees,raw_json
+            ) VALUES (?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(mode,ticker) DO UPDATE SET
+                side=excluded.side,settled_at=excluded.settled_at,
+                market_result=excluded.market_result,position_won=excluded.position_won,
+                realized_pnl=excluded.realized_pnl,fees=excluded.fees,raw_json=excluded.raw_json
+            """,
+            (
+                self.mode, ticker, side,
+                str(settlement.get("settled_time") or settlement.get("settled_at") or iso_now()),
+                market_result, position_won, realized,
+                fee,
+                _safe_json(settlement),
+            ),
+        )
+        self.db.execute(
+            """
+            UPDATE broker_positions SET market_result=?,position_won=?,realized_pnl=?,
+                status='settled',updated_at=? WHERE mode=? AND ticker=?
+            """,
+            (market_result, position_won, realized, iso_now(), self.mode, ticker),
+        )
+        self.db.execute(
+            """
+            UPDATE broker_order_intents SET status='SETTLED',updated_at=?
+            WHERE mode=? AND ticker=? AND action='BUY' AND status='FILLED'
+            """,
+            (iso_now(), self.mode, ticker),
+        )
+        self.db.execute(
+            """
+            UPDATE broker_orders SET status='SETTLED',updated_at=?
+            WHERE mode=? AND ticker=? AND action='BUY' AND status='FILLED'
+            """,
+            (iso_now(), self.mode, ticker),
+        )
+        if not previous_settlement or any(
+            previous_settlement.get(key) != value
+            for key, value in {
+                "side": side,
+                "market_result": market_result,
+                "position_won": position_won,
+                "realized_pnl": realized,
+                "fees": fee,
+            }.items()
+        ):
+            self._audit(
+                "SETTLEMENT_RECORDED",
+                {
+                    "side": side,
+                    "market_result": market_result,
+                    "position_won": position_won,
+                    "realized_pnl": realized,
+                    "fees": fee,
+                },
+                ticker=ticker,
+            )
+
+    def _set_intent(
+        self,
+        client_order_id: str,
+        status: str,
+        *,
+        exchange_order_id: str | None = None,
+        error: str | None = None,
+    ) -> None:
+        previous = self.db.fetch_one(
+            "SELECT status,ticker,exchange_order_id FROM broker_order_intents WHERE mode=? AND client_order_id=?",
+            (self.mode, client_order_id),
+        )
+        self.db.execute(
+            """
+            UPDATE broker_order_intents SET status=?,exchange_order_id=COALESCE(?,exchange_order_id),
+                error=?,updated_at=? WHERE mode=? AND client_order_id=?
+            """,
+            (status, exchange_order_id, error, iso_now(), self.mode, client_order_id),
+        )
+        if previous and previous.get("status") != status:
+            self._audit(
+                "INTENT_STATE_CHANGED",
+                {
+                    "from": previous.get("status"),
+                    "to": status,
+                    "error": error,
+                },
+                client_order_id=client_order_id,
+                exchange_order_id=(
+                    exchange_order_id or previous.get("exchange_order_id")
+                ),
+                ticker=previous.get("ticker"),
+            )
+
+    def _update_mode_state(self, **updates: Any) -> None:
+        allowed = {
+            "connected", "authenticated", "reconciled", "reconciliation_required",
+            "demo_verified_at", "limits_reviewed_at", "kill_switch",
+            "last_reconciled_at", "last_error",
+        }
+        cleaned = {key: value for key, value in updates.items() if key in allowed}
+        if not cleaned:
+            return
+        assignments = ",".join(f"{key}=?" for key in cleaned)
+        self.db.execute(
+            f"UPDATE broker_mode_state SET {assignments},updated_at=? WHERE mode=?",
+            (*cleaned.values(), iso_now(), self.mode),
+        )
+
+    def _audit(
+        self,
+        event_type: str,
+        detail: dict[str, Any],
+        *,
+        intent: OrderIntent | None = None,
+        client_order_id: str | None = None,
+        exchange_order_id: str | None = None,
+        ticker: str | None = None,
+    ) -> None:
+        self.db.execute(
+            """
+            INSERT INTO broker_audit_events(
+                mode,created_at,event_type,client_order_id,exchange_order_id,ticker,detail_json
+            ) VALUES (?,?,?,?,?,?,?)
+            """,
+            (
+                self.mode, iso_now(), event_type,
+                client_order_id or (intent.client_order_id if intent else None),
+                exchange_order_id,
+                ticker or (intent.ticker if intent else None),
+                _safe_json(detail),
+            ),
+        )
+
+
+class KalshiDemoBroker(KalshiBroker):
+    def __init__(self, db: Database, client: KalshiTradingClient | None = None):
+        super().__init__("DEMO", db, client)
+
+
+class KalshiLiveBroker(KalshiBroker):
+    def __init__(self, db: Database, client: KalshiTradingClient | None = None):
+        super().__init__("LIVE", db, client)

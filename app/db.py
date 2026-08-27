@@ -392,6 +392,170 @@ MIGRATIONS: list[tuple[int, str]] = [
         ALTER TABLE paper_entries ADD COLUMN strategy_metadata_json TEXT;
         """,
     ),
+    (
+        11,
+        """
+        CREATE TABLE broker_order_intents (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            mode TEXT NOT NULL CHECK(mode IN ('DEMO','LIVE')),
+            client_order_id TEXT NOT NULL,
+            ticker TEXT NOT NULL,
+            side TEXT NOT NULL CHECK(side IN ('YES','NO')),
+            action TEXT NOT NULL CHECK(action IN ('BUY','SELL')),
+            requested_contracts INTEGER NOT NULL,
+            limit_price REAL NOT NULL,
+            status TEXT NOT NULL,
+            strategy TEXT NOT NULL,
+            source TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            exchange_order_id TEXT,
+            stop_loss_price REAL,
+            target_exit_price REAL,
+            fallback_exit_mode TEXT,
+            fallback_exit_seconds REAL,
+            cancel_deadline_at TEXT,
+            decision_snapshot_json TEXT NOT NULL DEFAULT '{}',
+            risk_snapshot_json TEXT NOT NULL DEFAULT '{}',
+            error TEXT,
+            UNIQUE(mode, client_order_id)
+        );
+        CREATE INDEX idx_broker_intents_mode_status
+            ON broker_order_intents(mode, status, created_at);
+        CREATE INDEX idx_broker_intents_market
+            ON broker_order_intents(mode, ticker, strategy);
+
+        CREATE TABLE broker_orders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            mode TEXT NOT NULL CHECK(mode IN ('DEMO','LIVE')),
+            exchange_order_id TEXT NOT NULL,
+            client_order_id TEXT,
+            ticker TEXT NOT NULL,
+            side TEXT NOT NULL CHECK(side IN ('YES','NO')),
+            action TEXT NOT NULL CHECK(action IN ('BUY','SELL')),
+            status TEXT NOT NULL,
+            requested_contracts REAL NOT NULL DEFAULT 0,
+            filled_contracts REAL NOT NULL DEFAULT 0,
+            remaining_contracts REAL NOT NULL DEFAULT 0,
+            limit_price REAL,
+            average_fill_price REAL,
+            fees REAL NOT NULL DEFAULT 0,
+            strategy TEXT,
+            source TEXT,
+            created_at TEXT,
+            updated_at TEXT NOT NULL,
+            raw_json TEXT NOT NULL DEFAULT '{}',
+            UNIQUE(mode, exchange_order_id)
+        );
+        CREATE INDEX idx_broker_orders_mode_status
+            ON broker_orders(mode, status, updated_at);
+
+        CREATE TABLE broker_fills (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            mode TEXT NOT NULL CHECK(mode IN ('DEMO','LIVE')),
+            fill_id TEXT NOT NULL,
+            exchange_order_id TEXT,
+            client_order_id TEXT,
+            ticker TEXT NOT NULL,
+            side TEXT NOT NULL CHECK(side IN ('YES','NO')),
+            action TEXT NOT NULL CHECK(action IN ('BUY','SELL')),
+            contracts REAL NOT NULL,
+            price REAL NOT NULL,
+            fee REAL NOT NULL DEFAULT 0,
+            strategy TEXT,
+            source TEXT,
+            filled_at TEXT NOT NULL,
+            raw_json TEXT NOT NULL DEFAULT '{}',
+            UNIQUE(mode, fill_id)
+        );
+        CREATE INDEX idx_broker_fills_mode_time
+            ON broker_fills(mode, filled_at);
+
+        CREATE TABLE broker_positions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            mode TEXT NOT NULL CHECK(mode IN ('DEMO','LIVE')),
+            ticker TEXT NOT NULL,
+            side TEXT NOT NULL CHECK(side IN ('YES','NO')),
+            contracts REAL NOT NULL,
+            average_price REAL,
+            market_exposure REAL NOT NULL DEFAULT 0,
+            realized_pnl REAL NOT NULL DEFAULT 0,
+            fees REAL NOT NULL DEFAULT 0,
+            strategy TEXT,
+            source TEXT,
+            stop_loss_price REAL,
+            target_exit_price REAL,
+            fallback_exit_mode TEXT,
+            fallback_exit_seconds REAL,
+            opened_at TEXT,
+            updated_at TEXT NOT NULL,
+            market_result TEXT,
+            position_won INTEGER,
+            status TEXT NOT NULL DEFAULT 'open',
+            UNIQUE(mode, ticker, side)
+        );
+        CREATE INDEX idx_broker_positions_mode_status
+            ON broker_positions(mode, status, updated_at);
+
+        CREATE TABLE broker_account_snapshots (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            mode TEXT NOT NULL CHECK(mode IN ('DEMO','LIVE')),
+            observed_at TEXT NOT NULL,
+            available_balance REAL NOT NULL,
+            portfolio_value REAL NOT NULL,
+            allocated_capital REAL NOT NULL DEFAULT 0,
+            raw_json TEXT NOT NULL DEFAULT '{}'
+        );
+        CREATE INDEX idx_broker_accounts_mode_time
+            ON broker_account_snapshots(mode, observed_at);
+
+        CREATE TABLE broker_settlements (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            mode TEXT NOT NULL CHECK(mode IN ('DEMO','LIVE')),
+            ticker TEXT NOT NULL,
+            side TEXT,
+            settled_at TEXT NOT NULL,
+            market_result TEXT,
+            position_won INTEGER,
+            realized_pnl REAL,
+            fees REAL NOT NULL DEFAULT 0,
+            raw_json TEXT NOT NULL DEFAULT '{}',
+            UNIQUE(mode, ticker)
+        );
+        CREATE INDEX idx_broker_settlements_mode_time
+            ON broker_settlements(mode, settled_at);
+
+        CREATE TABLE broker_mode_state (
+            mode TEXT PRIMARY KEY CHECK(mode IN ('DEMO','LIVE')),
+            connected INTEGER NOT NULL DEFAULT 0,
+            authenticated INTEGER NOT NULL DEFAULT 0,
+            reconciled INTEGER NOT NULL DEFAULT 0,
+            reconciliation_required INTEGER NOT NULL DEFAULT 1,
+            demo_verified_at TEXT,
+            limits_reviewed_at TEXT,
+            kill_switch INTEGER NOT NULL DEFAULT 0,
+            last_reconciled_at TEXT,
+            last_error TEXT,
+            updated_at TEXT NOT NULL
+        );
+        INSERT OR IGNORE INTO broker_mode_state(mode,updated_at) VALUES
+            ('DEMO', strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+            ('LIVE', strftime('%Y-%m-%dT%H:%M:%fZ', 'now'));
+
+        CREATE TABLE broker_audit_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            mode TEXT NOT NULL CHECK(mode IN ('DEMO','LIVE')),
+            created_at TEXT NOT NULL,
+            event_type TEXT NOT NULL,
+            client_order_id TEXT,
+            exchange_order_id TEXT,
+            ticker TEXT,
+            detail_json TEXT NOT NULL DEFAULT '{}'
+        );
+        CREATE INDEX idx_broker_audit_mode_time
+            ON broker_audit_events(mode, created_at);
+        """,
+    ),
 ]
 
 

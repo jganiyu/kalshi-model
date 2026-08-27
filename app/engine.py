@@ -26,6 +26,7 @@ from app.domain import (
     settlement_probability,
 )
 from app.services.bootstrap import HistoricalBootstrapService
+from app.services.broker import KalshiBroker
 from app.services.decision import (
     Decision,
     make_decision,
@@ -48,6 +49,7 @@ from app.services.market_data import (
 from app.services.paper import PaperTradingService
 from app.services.streaming import BitcoinWebSocketFeeds, KalshiWebSocketFeed
 from app.services.training import ModelManager
+from app.services.trading import TradingCoordinator
 
 
 logger = logging.getLogger(__name__)
@@ -61,6 +63,7 @@ class AnalysisEngine:
         self.bitcoin: BitcoinCompositeFeed | None = None
         self.kalshi: KalshiPublicClient | None = None
         self.paper = PaperTradingService(db)
+        self.trading = TradingCoordinator(config, db, self.paper)
         self.models = ModelManager(db)
         self._benchmark_calibration: dict[str, Any] = {
             "sample_size": 0,
@@ -118,6 +121,7 @@ class AnalysisEngine:
         self.kalshi = KalshiPublicClient(
             self.http, self.config.kalshi_api_base, self.config.kalshi_series
         )
+        await self.trading.start(self.http)
         await self.collect_once()
         self._runner = asyncio.create_task(self._run_loop())
         bitcoin_streams = BitcoinWebSocketFeeds(
@@ -149,6 +153,7 @@ class AnalysisEngine:
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
+        await self.trading.stop()
         if self.http:
             await self.http.aclose()
 
@@ -307,10 +312,12 @@ class AnalysisEngine:
             "next": self._market_summary(next_market) if next_market else None,
             "notification": notification,
             "paper": self._portfolio_summary(),
+            "trading": self.trading.summary(),
             "calibration": self.calibration_summary(),
             "model": self.models.active(),
         }
         self._schedule_publish()
+        self.trading.schedule_process(current_payload)
 
     def subscribe(self) -> asyncio.Queue[None]:
         queue: asyncio.Queue[None] = asyncio.Queue(maxsize=1)
@@ -592,6 +599,15 @@ class AnalysisEngine:
     def _refresh_cached_dashboard(self, observed_at: str) -> None:
         if not (self._current_market and self._market_state and self._latest_btc):
             return
+        # Market lifecycle messages can replace the active contract with a shell
+        # before Kalshi publishes its threshold. Ignore queued quote refreshes until
+        # the REST poll has a complete, matching market again.
+        if (
+            market_strike(self._current_market) is None
+            or self._latest_btc.get("price") is None
+            or self._market_state.get("ticker") != self._current_market.get("ticker")
+        ):
+            return
         self.paper.process_open_orders(
             str(self._current_market["ticker"]), self._market_state
         )
@@ -611,8 +627,10 @@ class AnalysisEngine:
             "next": self._market_summary(self._next_market) if self._next_market else None,
             "notification": notification,
             "paper": self._portfolio_summary(),
+            "trading": self.trading.summary(),
         }
         self._schedule_publish()
+        self.trading.schedule_process(current)
 
     def _save_bitcoin(
         self, composite: CompositeQuote, observed_at: str, *, persist: bool = True
@@ -986,7 +1004,8 @@ class AnalysisEngine:
                 )
         variant_spread = max(variants) - min(variants) if len(variants) > 1 else 0.0
         calibration = self.calibration_summary()
-        portfolio = self.paper.portfolio()
+        trading_mode = self.trading.selected_mode
+        portfolio = self.trading.broker(trading_mode).portfolio()
         selected_side = str(settings.get("selected_side", "YES"))
         held_by_side = {
             side: sum(
@@ -1031,6 +1050,8 @@ class AnalysisEngine:
             )
             for side in ("YES", "NO")
         }
+        for side, assessment in assessments.items():
+            assessment["decision_confidence"] = decisions[side].confidence
         decision = decisions.get(selected_side, decisions["YES"])
         previous = self.db.fetch_one(
             "SELECT * FROM signal_snapshots WHERE ticker=? ORDER BY id DESC LIMIT 1",
@@ -1074,6 +1095,58 @@ class AnalysisEngine:
                     "signal_id": signal_id,
                 }
         threshold_state = self._threshold_state(str(market["ticker"]))
+        execution_kwargs: dict[str, Any] = {}
+        if trading_mode != "PAPER":
+            broker = self.trading.broker(trading_mode)
+            readiness = broker.readiness()
+            automatic_enabled = bool(
+                settings.get(f"{trading_mode.lower()}_automatic_trading_enabled", False)
+            ) and bool(readiness.get("automatic_armed"))
+            execution_risk_by_side = {
+                side: self.trading.preview_automatic_risk(
+                    strategy="STANDARD_EDGE",
+                    ticker=str(market["ticker"]),
+                    assessment=assessments[side],
+                    bankroll_fraction=float(decisions[side].suggested_fraction or 0.0),
+                    model_version=model_version,
+                    reason=decisions[side].explanation,
+                    stop_loss_cents=settings.get("default_stop_loss_cents"),
+                )
+                for side in ("YES", "NO")
+            }
+
+            def standard_entry_handler(
+                entry_ticker: str,
+                entry_decision: Decision,
+                entry_model_version: str,
+            ) -> bool:
+                side_assessment = assessments.get(str(entry_decision.side)) or {}
+                entered, _ = self.trading.submit_automatic(
+                    strategy="STANDARD_EDGE",
+                    ticker=entry_ticker,
+                    assessment=side_assessment,
+                    bankroll_fraction=float(entry_decision.suggested_fraction or 0.0),
+                    model_version=entry_model_version,
+                    reason=entry_decision.explanation,
+                    stop_loss_cents=settings.get("default_stop_loss_cents"),
+                )
+                return entered
+
+            execution_kwargs = {
+                "execution_mode": trading_mode,
+                "automatic_enabled": automatic_enabled,
+                "execution_block_reason": (
+                    None
+                    if readiness.get("ready_for_automatic")
+                    else readiness.get("automatic_blocker")
+                ),
+                "execution_risk_by_side": execution_risk_by_side,
+                "entry_exists_override": self.trading.has_automatic_entry(
+                    trading_mode, str(market["ticker"])
+                ),
+                "standard_entry_handler": standard_entry_handler,
+                "fixed_entry_handler": self.trading.submit_automatic,
+            }
         automatic_entry = self.paper.consider_strategies(
             ticker=str(market["ticker"]),
             assessments=assessments,
@@ -1087,6 +1160,7 @@ class AnalysisEngine:
             z_distance=baseline.z_distance,
             model_version=model_version,
             portfolio=portfolio,
+            **execution_kwargs,
         )
         summary = self._market_summary(market)
         summary.update(
@@ -1096,6 +1170,7 @@ class AnalysisEngine:
                 "model_probability": decision.model_probability,
                 "up_probability": probability,
                 "selected_side": selected_side,
+                "trading_mode": trading_mode,
                 "model_version": model_version,
                 "z_distance": baseline.z_distance,
                 "annualized_volatility": baseline.annualized_volatility,
@@ -1375,9 +1450,19 @@ class AnalysisEngine:
         restored_from_id: int | None = None,
     ) -> dict[str, Any]:
         async with self._update_lock:
+            live_limit_changed = any(
+                key.startswith("live_")
+                and key not in {"live_automatic_trading_enabled"}
+                for key in updates
+            )
             settings = self.db.update_settings(
                 updates, restored_from_id=restored_from_id
             )
+            if live_limit_changed:
+                live_broker = self.trading.broker("LIVE")
+                if isinstance(live_broker, KalshiBroker):
+                    live_broker.disarm("Live limits changed; review them before rearming.")
+                    live_broker._update_mode_state(limits_reviewed_at=None)
             self._refresh_cached_dashboard(iso_now())
             return settings
 

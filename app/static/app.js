@@ -19,6 +19,7 @@ const state = {
     stopInitialized: false, sideUpdating: false,
   },
   paperReset: { confirming: false, resetting: false, timer: null },
+  trading: { mode: "PAPER", pendingConfirmation: null, switching: false },
   calibration: { saved: null, defaults: null, dirty: false },
 };
 
@@ -87,6 +88,17 @@ function paperFee(price, contracts = 1) {
 
 function marketSideLabel(side) {
   return String(side).toUpperCase() === "YES" ? "Up" : "Down";
+}
+
+function selectedTrading(data = state.dashboard) {
+  const trading = data?.trading || {};
+  const mode = trading.selected_mode || state.trading.mode || "PAPER";
+  const selected = trading.selected || trading.modes?.[mode] || data?.paper || {};
+  return { mode, selected, modes: trading.modes || {} };
+}
+
+function modeLabel(mode) {
+  return mode === "LIVE" ? "Kalshi Live" : mode === "DEMO" ? "Kalshi Demo" : "Paper Trading";
 }
 
 function formatMarketLanguage(value) {
@@ -187,16 +199,16 @@ function renderOrderBook(outcome, orderbook) {
   ].join("");
 }
 
-function renderRecentPaperTrades(trades) {
+function renderRecentTrades(trades, mode = "PAPER") {
   const target = $("#recent-paper-trades");
   if (!target) return;
   target.innerHTML = trades?.length ? trades.map((trade) => `
-    <tr><td>${shortDate(trade.opened_at)}</td><td>${marketSideLabel(trade.side)}</td>
-    <td>${cents(trade.entry_price)}</td><td>${trade.contracts}</td>
+    <tr><td>${shortDate(trade.opened_at || trade.filled_at)}</td><td>${marketSideLabel(trade.side)}</td>
+    <td>${cents(trade.entry_price ?? trade.price)}</td><td>${trade.contracts}</td>
     <td>${String(trade.strategy || trade.source || "manual").replaceAll("_", " ")}</td>
-    <td class="${Number(trade.realized_pnl) > 0 ? "positive" : Number(trade.realized_pnl) < 0 ? "negative" : ""}">${String(trade.status || "open")}${trade.realized_pnl == null ? "" : ` · ${money(trade.realized_pnl)}`}</td>
+    <td class="${Number(trade.realized_pnl) > 0 ? "positive" : Number(trade.realized_pnl) < 0 ? "negative" : ""}">${String(trade.status || (mode === "PAPER" ? "open" : trade.action || "filled"))}${trade.realized_pnl == null ? "" : ` · ${money(trade.realized_pnl)}`}</td>
     <td>${trade.available_cash_after == null ? "—" : money(trade.available_cash_after)}</td></tr>
-  `).join("") : '<tr><td class="book-empty" colspan="7">No paper trades yet</td></tr>';
+  `).join("") : `<tr><td class="book-empty" colspan="7">No ${mode === "PAPER" ? "paper trades" : "fills"} yet</td></tr>`;
 }
 
 function renderTradeAssessment() {
@@ -298,6 +310,19 @@ function renderStandardEdgeHud(readiness) {
 
 function renderDashboard(data) {
   state.dashboard = data;
+  const trading = selectedTrading(data);
+  state.trading.mode = trading.mode;
+  document.documentElement.dataset.tradingMode = trading.mode.toLowerCase();
+  const liveArmed = Boolean(trading.modes?.LIVE?.readiness?.session_armed);
+  const liveIndicator = $("#live-armed-indicator");
+  liveIndicator.hidden = !liveArmed;
+  liveIndicator.textContent = trading.modes?.LIVE?.readiness?.automatic_armed
+    ? "LIVE AUTO ARMED" : "LIVE ARMED";
+  $$('[data-trading-mode]').forEach((button) => {
+    const active = button.dataset.tradingMode === trading.mode;
+    button.classList.toggle("active", active);
+    button.setAttribute("aria-pressed", String(active));
+  });
   const system = data.system || {};
   const current = data.current;
   const btc = data.btc || {};
@@ -324,7 +349,7 @@ function renderDashboard(data) {
     option.classList.toggle("active", option.dataset.signalOption === position);
   });
   const paperPermission = $("#paper-permission");
-  const paper = data.paper || {};
+  const paper = trading.selected || {};
   const automaticTradingEnabled = Boolean(paper.automatic_trading_enabled);
   const paperBlocked = automaticTradingEnabled && paper.automatic_trade_allowed === false;
   const automaticEntry = current?.automatic_entry || {};
@@ -348,11 +373,30 @@ function renderDashboard(data) {
             ? `Automatic trading on · ${swingReadiness.blocker}`
             : "Automatic trading on · waiting for entry window"
       : "Automatic trading off";
+  const modeName = modeLabel(trading.mode);
+  const readiness = paper.readiness || {};
+  $("#dashboard-trading-label").textContent = modeName.toUpperCase();
+  $("#dashboard-environment-badge").textContent = trading.mode === "PAPER"
+    ? "SIMULATED" : trading.mode;
+  $("#dashboard-environment-badge").classList.toggle("live", trading.mode === "LIVE");
+  $("#recent-trades-label").textContent = modeName.toUpperCase();
+  $("#recent-trades-badge").textContent = trading.mode === "PAPER" ? "SIMULATED" : trading.mode;
+  $("#recent-trades-badge").classList.toggle("live", trading.mode === "LIVE");
+  $("#dashboard-account-state").textContent = trading.mode === "PAPER"
+    ? "Paper account"
+    : readiness.authenticated
+      ? `${modeName} · ${readiness.session_armed ? "Armed" : "Disarmed"}`
+      : `${modeName} · Not connected`;
+  $("#dashboard-account-strip").classList.toggle("ready", trading.mode === "PAPER" || readiness.reconciled);
+  $("#dashboard-account-strip").classList.toggle("live", trading.mode === "LIVE");
+  $("#dashboard-allocation-state").textContent = `${money(paper.available_cash)} available · ${money(paper.remaining_allocation ?? paper.available_cash)} allocation`;
   paperPermission.hidden = false;
   paperPermission.classList.toggle("on", automaticTradingEnabled && !paperBlocked);
   paperPermission.classList.toggle("off", !automaticTradingEnabled);
   paperPermission.classList.toggle("paused", paperBlocked);
-  paperPermission.textContent = automaticTradingStatus;
+  paperPermission.textContent = trading.mode === "PAPER"
+    ? automaticTradingStatus
+    : readiness.blocker || automaticTradingStatus;
   paperPermission.title = automaticTradingStatus;
   $("#signal-explanation").textContent = forecast?.explanation || system.message || "Connecting to public feeds.";
   $("#up-probability").textContent = percent(forecast?.up_probability, 1);
@@ -385,12 +429,13 @@ function renderDashboard(data) {
   $("#spread").textContent = points(current?.spread);
   $("#open-interest").textContent = compact(current?.open_interest);
   $("#volume").textContent = compact(current?.volume);
-  const positions = (data.paper?.positions || []).filter((item) => item.ticker === current?.ticker);
+  const positions = (paper.positions || []).filter((item) => item.ticker === current?.ticker);
   $("#position-size").textContent = positions.length
     ? positions.map((item) => {
       const stops = (item.entries || []).filter((entry) => entry.stop_status === "active")
         .map((entry) => `${entry.contracts} @ ${cents(entry.stop_loss_price)}`);
-      return `${item.contracts} ${marketSideLabel(item.side)}${stops.length ? ` · stop ${stops.join(", ")}` : ""}`;
+      const directStop = item.stop_loss_price == null ? "" : ` · stop ${cents(item.stop_loss_price)}`;
+      return `${item.contracts} ${marketSideLabel(item.side)}${stops.length ? ` · stop ${stops.join(", ")}` : directStop}`;
     }).join(" · ")
     : "No position";
   const quality = current?.data_quality || { reliable: false, reason: "Waiting for market" };
@@ -414,7 +459,10 @@ function renderDashboard(data) {
   );
   renderTradeAssessment();
   renderOrderBook(state.paperOrder.side, current?.orderbook || {});
-  renderRecentPaperTrades(data.paper?.recent_paper_trades || []);
+  const recent = trading.mode === "PAPER"
+    ? data.paper?.recent_paper_trades || []
+    : (paper.fills || []).slice(0, 8);
+  renderRecentTrades(recent, trading.mode);
   renderPaperController();
   drawChart();
   if (data.notification?.signal_id && data.notification.signal_id !== state.lastNotification) {
@@ -430,19 +478,21 @@ function paperQuote(side = state.paperOrder.side, action = state.paperOrder.acti
 }
 
 function paperAvailableContracts(side = state.paperOrder.side) {
-  const paper = state.dashboard?.paper || {};
+  const paper = selectedTrading().selected || {};
   const ticker = state.dashboard?.current?.ticker;
   const held = (paper.positions || [])
     .filter((position) => position.ticker === ticker && position.side === side)
     .reduce((total, position) => total + Number(position.contracts || 0), 0);
   const reserved = (paper.open_orders || [])
     .filter((order) => order.ticker === ticker && order.side === side && order.action === "SELL")
-    .reduce((total, order) => total + Number(order.requested_contracts || 0), 0);
+    .reduce((total, order) => total + Number(
+      order.remaining_contracts ?? order.requested_contracts ?? 0
+    ), 0);
   return Math.max(0, held - reserved);
 }
 
 function paperOrderDraft() {
-  const paper = state.dashboard?.paper || {};
+  const { mode, selected: paper } = selectedTrading();
   const current = state.dashboard?.current;
   const bestPrice = paperQuote();
   const available = Number(paper.available_cash || 0);
@@ -486,7 +536,7 @@ function paperOrderDraft() {
   if (!error && state.paperOrder.action === "BUY" && orderValue > available + 0.000001) {
     error = "Order exceeds the remaining bankroll.";
   }
-  if (!error && state.paperOrder.action === "BUY" && paper.risk_controls_enabled) {
+  if (!error && mode === "PAPER" && state.paperOrder.action === "BUY" && paper.risk_controls_enabled) {
     const bankroll = Number(paper.current_bankroll || 0);
     if (Number(paper.session_drawdown_pct || 0) >= Number(paper.max_session_drawdown_pct || 0)) {
       error = "The session drawdown limit is active.";
@@ -518,11 +568,19 @@ function paperOrderDraft() {
       error = "Stop-loss must be 0 (off) or between 1 and 99 cents.";
     }
   }
+  if (!error && mode !== "PAPER") {
+    const readiness = paper.readiness || {};
+    if (!readiness.ready_for_manual) error = readiness.blocker || `${modeLabel(mode)} is not armed.`;
+    else if (state.paperOrder.action === "BUY" && orderValue > Number(paper.remaining_allocation || 0) + 0.000001) {
+      error = "Order exceeds the remaining allocation.";
+    }
+  }
   return { available, bestPrice, contracts, orderValue, requestedValue, error };
 }
 
 function renderOpenPaperOrders() {
-  const orders = state.dashboard?.paper?.open_orders || [];
+  const { mode, selected } = selectedTrading();
+  const orders = selected?.open_orders || [];
   const panel = $("#open-paper-orders");
   panel.hidden = orders.length === 0;
   $("#open-order-count").textContent = orders.length;
@@ -530,13 +588,14 @@ function renderOpenPaperOrders() {
     <div class="open-order-row">
       <span><strong>${order.action} ${marketSideLabel(order.side).toUpperCase()}</strong><small>${order.requested_contracts} at ${cents(order.limit_price)}</small></span>
       ${order.stop_loss_price == null ? "" : `<small>Stop ${cents(order.stop_loss_price)}</small>`}
-      <button type="button" data-cancel-paper-order="${order.id}" aria-label="Cancel ${marketSideLabel(order.side)} limit order">Cancel</button>
+      <button type="button" data-cancel-paper-order="${order.id}" data-exchange-order-id="${order.exchange_order_id || ""}" aria-label="Cancel ${marketSideLabel(order.side)} limit order">Cancel</button>
     </div>
   `).join("");
 }
 
 function renderPaperController() {
   const current = state.dashboard?.current;
+  const { mode, selected: portfolio } = selectedTrading();
   const action = state.paperOrder.action;
   $$('[data-paper-action]').forEach((button) => button.classList.toggle("active", button.dataset.paperAction === action));
   $$('[data-paper-side]').forEach((button) => button.classList.toggle("active", button.dataset.paperSide === state.paperOrder.side));
@@ -569,6 +628,9 @@ function renderPaperController() {
   submit.dataset.side = state.paperOrder.side.toLowerCase();
   submit.dataset.action = action.toLowerCase();
   submit.disabled = Boolean(draft.error) || draft.contracts < 1 || state.paperOrder.submitting || !current;
+  submit.classList.toggle("live", mode === "LIVE");
+  $("#paper-limit-toggle").closest("label").querySelector("span").textContent = mode === "PAPER" ? "Limit order" : "Custom limit";
+  $("#paper-bankroll").textContent = money(portfolio?.available_cash);
   renderOpenPaperOrders();
 }
 
@@ -589,6 +651,30 @@ async function submitPaperOrder() {
     payload.stop_loss_cents = Number($("#paper-stop-loss").value);
   }
   try {
+    const { mode } = selectedTrading();
+    if (mode !== "PAPER") {
+      const preview = await api(`/api/trading/${mode}/orders/preview`, {
+        method: "POST", body: JSON.stringify(payload),
+      });
+      state.trading.pendingConfirmation = preview;
+      $("#confirmation-environment").textContent = `${preview.environment} ORDER REVIEW`;
+      $("#confirmation-details").innerHTML = [
+        ["Account", preview.account], ["Market", preview.market],
+        ["Order", `${preview.action} ${preview.quantity} ${preview.contract}`],
+        ["Worst price", cents(preview.limit_price)],
+        ["Maximum exposure", money(preview.maximum_cash_exposure)],
+        ["Estimated fees", money(preview.estimated_fees, 4)],
+        ["Slippage", cents(preview.slippage_allowance)],
+        ["Stop-loss", typeof preview.stop_loss === "number" ? cents(preview.stop_loss) : preview.stop_loss],
+        ["Profit take", typeof preview.global_profit_take === "number" ? cents(preview.global_profit_take) : preview.global_profit_take],
+        ["Remaining allocation", money(preview.remaining_allocation)],
+        ["Risk review", preview.risk?.passed ? "Passed" : preview.risk?.primary_blocker || "Blocked"],
+      ].map(([label, value]) => `<div><dt>${label}</dt><dd>${value}</dd></div>`).join("");
+      $("#confirm-exchange-order").disabled = !preview.risk?.passed;
+      $("#trade-confirmation").classList.toggle("live", mode === "LIVE");
+      $("#trade-confirmation").showModal();
+      return;
+    }
     const result = await api("/api/paper/orders", { method: "POST", body: JSON.stringify(payload) });
     const status = result.order?.status === "filled" ? "filled" : "placed";
     showToast(`Paper order ${status}`, `${result.order.action} ${result.order.requested_contracts} ${marketSideLabel(result.order.side)} contract${result.order.requested_contracts === 1 ? "" : "s"}.`);
@@ -607,10 +693,42 @@ async function submitPaperOrder() {
   }
 }
 
+async function confirmExchangeOrder() {
+  const preview = state.trading.pendingConfirmation;
+  if (!preview) return;
+  const button = $("#confirm-exchange-order");
+  button.disabled = true;
+  try {
+    const result = await api(`/api/trading/${preview.environment}/orders/confirm`, {
+      method: "POST",
+      body: JSON.stringify({ confirmation_token: preview.confirmation_token }),
+    });
+    $("#trade-confirmation").close();
+    state.trading.pendingConfirmation = null;
+    showToast(`${preview.environment} order submitted`, `${preview.action} ${preview.quantity} ${preview.contract} at no worse than ${cents(preview.limit_price)}.`);
+    $("#paper-dollars").value = "";
+    $("#paper-contracts").value = "";
+    $("#paper-limit-price").value = "";
+    await refreshDashboard();
+    if (state.activePage === "paper") await loadPaper();
+    return result;
+  } catch (error) {
+    showToast("Order not submitted", error.message);
+  } finally {
+    button.disabled = !state.trading.pendingConfirmation?.risk?.passed;
+  }
+}
+
 async function cancelPaperOrder(orderId) {
   try {
-    await api(`/api/paper/orders/${orderId}`, { method: "DELETE" });
-    showToast("Limit order canceled", "Reserved paper bankroll or contracts are available again.");
+    const { mode } = selectedTrading();
+    const selector = `[data-cancel-paper-order="${orderId}"]`;
+    const exchangeOrderId = $(selector)?.dataset.exchangeOrderId;
+    const path = mode === "PAPER"
+      ? `/api/paper/orders/${orderId}`
+      : `/api/trading/${mode}/orders/${exchangeOrderId || orderId}`;
+    await api(path, { method: "DELETE" });
+    showToast("Limit order canceled", "Reserved funds or contracts are available again after reconciliation.");
     await refreshDashboard();
   } catch (error) { showToast("Unable to cancel order", error.message); }
 }
@@ -622,6 +740,87 @@ function updateSelectedSide(side) {
   renderPaperController();
   renderTradeAssessment();
   renderOrderBook(side, state.dashboard?.current?.orderbook || {});
+}
+
+async function selectTradingMode(mode) {
+  if (state.trading.switching || mode === state.trading.mode) return;
+  state.trading.switching = true;
+  try {
+    await api("/api/trading/mode", {
+      method: "PUT", body: JSON.stringify({ mode }),
+    });
+    state.trading.mode = mode;
+    state.paperOrder.stopInitialized = false;
+    await refreshDashboard();
+    if (state.activePage === "paper") await loadPaper();
+  } catch (error) {
+    showToast("Trading mode unchanged", error.message);
+  } finally {
+    state.trading.switching = false;
+  }
+}
+
+async function reconcileSelectedTrading() {
+  const { mode } = selectedTrading();
+  if (mode === "PAPER") return;
+  try {
+    await api(`/api/trading/${mode}/reconcile`, { method: "POST" });
+    await refreshDashboard();
+    await loadPaper();
+    showToast(`${modeLabel(mode)} reconciled`, "Balances, positions, orders, and fills are synchronized.");
+  } catch (error) { showToast("Reconciliation failed", error.message); }
+}
+
+async function armSelectedTrading() {
+  const { mode, selected } = selectedTrading();
+  if (mode === "PAPER") return;
+  if (selected?.readiness?.session_armed) {
+    await api(`/api/trading/${mode}/disarm`, { method: "POST" });
+    await refreshDashboard();
+    await loadPaper();
+    return;
+  }
+  const phrase = mode === "LIVE" ? "ARM LIVE TRADING" : "ARM DEMO TRADING";
+  const confirmation = window.prompt(`Type ${phrase} to arm this session.`);
+  if (confirmation == null) return;
+  try {
+    await api(`/api/trading/${mode}/arm`, {
+      method: "POST", body: JSON.stringify({ confirmation, automatic: false }),
+    });
+    await refreshDashboard();
+    await loadPaper();
+    showToast(`${modeLabel(mode)} armed`, "Manual limit orders are now authorized for this session.");
+  } catch (error) { showToast("Session not armed", error.message); }
+}
+
+async function killSelectedTrading() {
+  const { mode, selected } = selectedTrading();
+  if (mode === "PAPER") return;
+  try {
+    const release = Boolean(selected?.readiness?.kill_switch);
+    await api(`/api/trading/${mode}/kill${release ? "/release" : ""}`, { method: "POST" });
+    await refreshDashboard();
+    await loadPaper();
+    showToast(
+      release ? `${modeLabel(mode)} kill switch released` : `${modeLabel(mode)} kill switch active`,
+      release ? "The session remains disarmed." : "New submissions are blocked and resting-order cancellations were attempted.",
+    );
+  } catch (error) { showToast("Kill switch failed", error.message); }
+}
+
+async function toggleAutomaticTrading(event) {
+  const { mode } = selectedTrading();
+  if (mode === "PAPER") return;
+  try {
+    await api(`/api/trading/${mode}/automatic`, {
+      method: "PUT", body: JSON.stringify({ enabled: event.target.checked }),
+    });
+    await refreshDashboard();
+    await loadPaper();
+  } catch (error) {
+    event.target.checked = !event.target.checked;
+    showToast("Automatic trading unchanged", error.message);
+  }
 }
 
 function updateCountdown() {
@@ -954,13 +1153,13 @@ function statCard(label, value, detail = "", className = "") {
 
 const calibrationGroups = [
   ["Decision Rules", [
-    { id: "buy_edge", label: "Buy edge", unit: "%", min: 0, max: 50, step: .5, scale: 100, tip: "Minimum model advantage over the executable ask after fees and slippage. Default: 5%." },
-    { id: "minimum_buy_probability", label: "Minimum Buy win chance", unit: "%", min: 50, max: 99, step: 1, scale: 100, tip: "Minimum estimated chance of paying $1 required for a Buy signal. Lower-probability positive-edge contracts are marked Speculative. Default: 55%." },
+    { id: "buy_edge", label: "Buy edge", unit: "%", min: 0, max: 50, step: .5, scale: 100, tip: "Minimum model advantage over the executable ask after fees and slippage. Default: 10%." },
+    { id: "minimum_buy_probability", label: "Minimum Buy win chance", unit: "%", min: 50, max: 99, step: 1, scale: 100, tip: "Minimum estimated chance of paying $1 required for a Buy signal. Lower-probability positive-edge contracts are marked Speculative. Default: 65%." },
     { id: "sell_edge", label: "Sell edge", unit: "%", min: 0, max: 50, step: .5, scale: 100, tip: "Minimum executable-bid advantage over model value after costs. Default: 3%." },
     { id: "hold_buffer", label: "Hold buffer", unit: "%", min: 0, max: 10, step: .1, scale: 100, tip: "Extra dead band added to Buy and Sell thresholds to reduce churn. Default: 0.5%." },
-    { id: "slippage_cents", label: "Slippage allowance", unit: "cents", min: 0, max: 10, step: .1, tip: "Price movement assumed between signal and simulated execution. Default: 0.5 cents." },
-    { id: "confidence_moderate_edge", label: "Moderate edge strength", unit: "%", min: 0, max: 50, step: .5, scale: 100, tip: "Minimum net edge for a Moderate Edge label. Default: 8%." },
-    { id: "confidence_high_edge", label: "High edge strength", unit: "%", min: 0, max: 50, step: .5, scale: 100, tip: "Minimum net edge for a High Edge label. Default: 12%." },
+    { id: "slippage_cents", label: "Slippage allowance", unit: "cents", min: 0, max: 10, step: .1, tip: "Price movement reserved between decision and execution in every mode. Default: 0.5 cents." },
+    { id: "confidence_moderate_edge", label: "Moderate edge strength", unit: "%", min: 0, max: 50, step: .5, scale: 100, tip: "Minimum net edge for a Moderate Edge label. Default: 6%." },
+    { id: "confidence_high_edge", label: "High edge strength", unit: "%", min: 0, max: 50, step: .5, scale: 100, tip: "Minimum net edge for a High Edge label. Default: 10%." },
     { id: "confidence_moderate_max_spread", label: "Moderate max spread", unit: "%", min: 0, max: 50, step: .5, scale: 100, tip: "Widest contract spread allowed for Moderate edge strength. Default: 3%." },
     { id: "confidence_high_max_spread", label: "High max spread", unit: "%", min: 0, max: 50, step: .5, scale: 100, tip: "Widest contract spread allowed for High edge strength. Default: 2%." },
     { id: "confidence_moderate_max_variant_spread", label: "Moderate model dispersion", unit: "%", min: 0, max: 100, step: 1, scale: 100, tip: "Maximum model-variant spread allowed for Moderate edge strength. Default: 7%." },
@@ -969,28 +1168,28 @@ const calibrationGroups = [
     { id: "confidence_high_max_calibration_error", label: "High max calibration error", unit: "%", min: 0, max: 100, step: .5, scale: 100, tip: "Largest calibration error compatible with High edge strength. Default: 7%." },
   ]],
   ["Automatic Entry", [
-    { id: "paper_trading_enabled", label: "Automatic paper trading", type: "toggle", tip: "Enables simulated entries only; no real Kalshi order is ever placed. Default: off." },
-    { id: "automatic_entry_window_minutes", label: "Entry window", unit: "minutes", min: .25, max: 15, step: .25, tip: "Automatic confirmation can arm only this close to market end. Default: final 5 minutes." },
-    { id: "automatic_confirmation_seconds", label: "Confirmation period", unit: "seconds", min: 1, max: 120, step: 1, tip: "Rolling elapsed-time window used to confirm Buy signals. Default: 10 seconds." },
-    { id: "automatic_buy_duration_pct", label: "Required Buy duration", unit: "%", min: 50, max: 100, step: 1, scale: 100, tip: "Share of the confirmation period that must be spent in Buy. Default: 70%." },
-    { id: "automatic_min_confidence", label: "Minimum edge strength", type: "select", options: ["Low", "Moderate", "High"], tip: "Lowest edge-strength label allowed for an automatic entry. Speculative trade assessments never enter automatically. Default: High." },
+    { id: "paper_trading_enabled", label: "Automatic paper trading", type: "toggle", tip: "Enables simulated Paper entries. Demo and Live each require their own switch and runtime arming. Default: on." },
+    { id: "automatic_entry_window_minutes", label: "Entry window", unit: "minutes", min: .25, max: 15, step: .25, tip: "Automatic confirmation can arm only this close to market end. Default: final 15 minutes." },
+    { id: "automatic_confirmation_seconds", label: "Confirmation period", unit: "seconds", min: 1, max: 120, step: 1, tip: "Rolling elapsed-time window used to confirm Buy signals. Default: 5 seconds." },
+    { id: "automatic_buy_duration_pct", label: "Required Buy duration", unit: "%", min: 50, max: 100, step: 1, scale: 100, tip: "Share of the confirmation period that must be spent in Buy. Default: 50%." },
+    { id: "automatic_min_confidence", label: "Minimum edge strength", type: "select", options: ["Low", "Moderate", "High"], tip: "Lowest edge-strength label allowed for an automatic entry. Speculative assessments never enter automatically. Default: Moderate." },
   ]],
   ["Early Threshold", [
-    { id: "early_threshold_enabled", label: "Early threshold strategy", type: "toggle", tip: "Allows a small paper entry when the next threshold arrived before the market opened and remains favorable after activation. Default: on." },
+    { id: "early_threshold_enabled", label: "Early threshold strategy", type: "toggle", tip: "Allows a small automatic entry when a pre-open threshold remains favorable after activation. Default: on." },
     { id: "early_bankroll_pct", label: "Bankroll allocation", unit: "% bankroll", min: 0, max: 100, step: 1, scale: 100, tip: "Target allocation before the global trade and position caps are applied. Default: 3%." },
     { id: "early_min_probability", label: "Minimum win chance", unit: "%", min: 50, max: 99, step: 1, scale: 100, tip: "Minimum estimated chance for the side being bought. Default: 65%." },
     { id: "early_min_net_ev", label: "Minimum Buy EV", unit: "cents", min: 0, max: 25, step: .1, scale: 100, tip: "Minimum value per contract after the executable ask, fee, and slippage. Default: 0.5 cents." },
-    { id: "early_entry_window_seconds", label: "Opening window", unit: "seconds", min: 1, max: 300, step: 1, tip: "Time after activation in which the early strategy may enter. Default: 30 seconds." },
+    { id: "early_entry_window_seconds", label: "Opening window", unit: "seconds", min: 1, max: 300, step: 1, tip: "Time after activation in which the early strategy may enter. Default: 60 seconds." },
     { id: "early_threshold_stability_seconds", label: "Threshold stability", unit: "seconds", min: 0, max: 120, step: .5, tip: "How long the pre-open threshold must remain unchanged. Default: 1 second." },
     { id: "early_confirmation_seconds", label: "Quote confirmation", unit: "seconds", min: 0, max: 120, step: .5, tip: "Minimum time and one fresh quote required before entry. Default: 2 seconds." },
-    { id: "early_max_spread", label: "Maximum spread", unit: "%", min: 0, max: 50, step: .5, scale: 100, tip: "Widest accepted spread for an early entry. Default: 5%." },
+    { id: "early_max_spread", label: "Maximum spread", unit: "%", min: 0, max: 50, step: .5, scale: 100, tip: "Widest accepted spread for an early entry. Default: 20%." },
     { id: "early_min_liquidity_contracts", label: "Minimum liquidity", unit: "contracts", min: 1, max: 1000000, step: 1, integer: true, tip: "Minimum contracts available at the selected ask. Default: 1 contract." },
   ]],
   ["Late Conviction", [
-    { id: "late_conviction_enabled", label: "Late conviction strategy", type: "toggle", tip: "Allows a small paper entry near expiration when one outcome is highly likely and Buy EV remains positive. Default: on." },
+    { id: "late_conviction_enabled", label: "Late conviction strategy", type: "toggle", tip: "Allows a small automatic entry near expiration when one outcome is highly likely and Buy EV remains positive. Default: on." },
     { id: "late_bankroll_pct", label: "Bankroll allocation", unit: "% bankroll", min: 0, max: 100, step: 1, scale: 100, tip: "Target allocation before the global trade and position caps are applied. Default: 3%." },
-    { id: "late_max_seconds_remaining", label: "Maximum time remaining", unit: "seconds", min: 1, max: 900, step: 1, tip: "Latest phase in which the strategy may begin evaluating an entry. Default: 90 seconds." },
-    { id: "late_min_probability", label: "Minimum win chance", unit: "%", min: 50, max: 99, step: 1, scale: 100, tip: "Minimum estimated chance for the side being bought. Default: 85%." },
+    { id: "late_max_seconds_remaining", label: "Maximum time remaining", unit: "seconds", min: 1, max: 900, step: 1, tip: "Latest phase in which the strategy may begin evaluating an entry. Default: 120 seconds." },
+    { id: "late_min_probability", label: "Minimum win chance", unit: "%", min: 50, max: 99, step: 1, scale: 100, tip: "Minimum estimated chance for the side being bought. Default: 79%." },
     { id: "late_min_net_ev", label: "Minimum Buy EV", unit: "cents", min: 0, max: 25, step: .1, scale: 100, tip: "Minimum value per contract after the executable ask, fee, and slippage. Default: 0.5 cents." },
     { id: "late_confirmation_seconds", label: "Confirmation period", unit: "seconds", min: 0, max: 120, step: .5, tip: "How long the late conditions must remain valid. Default: 3 seconds." },
     { id: "late_min_settlement_coverage", label: "Settlement coverage", unit: "%", min: 0, max: 100, step: 5, scale: 100, tip: "Minimum share of the final settlement window already observed. Default: 80%." },
@@ -1014,16 +1213,16 @@ const calibrationGroups = [
   ]],
   ["Stops and Exits", [
     { id: "default_stop_loss_cents", label: "Default stop-loss", unit: "cents", min: 0, max: 99, step: 1, nullable: true, tip: "Optional absolute bid trigger prefilled on new Buy drafts. Use 0 or leave blank to turn it off; existing stops never change." },
-    { id: "global_profit_take_enabled", label: "Global profit take", type: "toggle", tip: "Closes any open paper position when its executable bid reaches the configured level. Default: on." },
-    { id: "global_profit_take_price", label: "Profit-take bid", unit: "cents", min: 1, max: 99, step: 1, scale: 100, tip: "Executable bid that triggers a profit-taking exit for every paper strategy and manual trade. Default: 99 cents." },
+    { id: "global_profit_take_enabled", label: "Global profit take", type: "toggle", tip: "Closes open positions in Paper, Demo, or Live when the executable bid reaches the configured level. Default: on." },
+    { id: "global_profit_take_price", label: "Profit-take bid", unit: "cents", min: 1, max: 99, step: 1, scale: 100, tip: "Executable bid that triggers an exit for every strategy and manual trade. Demo and Live require the app to stay connected. Default: 99 cents." },
   ]],
   ["Position Sizing and Risk", [
     { id: "starting_bankroll", label: "Starting bankroll", unit: "dollars", min: 1, max: 100000000, step: 100, tip: "Paper capital used for sizing and performance. Default: $1,000." },
     { id: "risk_controls_enabled", label: "Risk controls", type: "toggle", tip: "Enforces position, trade-risk, and drawdown limits. Default: on." },
     { id: "fractional_kelly", label: "Kelly sizing", unit: "% Kelly", min: 0, max: 100, step: 5, scale: 100, tip: "Fraction of full Kelly used for suggested sizing. Default: 25%." },
     { id: "max_position_pct", label: "Maximum position", unit: "% bankroll", min: 0, max: 100, step: 1, scale: 100, tip: "Maximum paper capital committed to one outcome. Default: 5% of bankroll." },
-    { id: "max_risk_per_trade_pct", label: "Maximum risk per trade", unit: "% bankroll", min: 0, max: 100, step: 1, scale: 100, tip: "Maximum paper capital allowed in a single entry. Default: 3% of bankroll." },
-    { id: "max_session_drawdown_pct", label: "Session drawdown", unit: "%", min: 0, max: 100, step: 1, scale: 100, tip: "Drawdown that pauses automatic execution without hiding signals. Default: 10%." },
+    { id: "max_risk_per_trade_pct", label: "Maximum risk per trade", unit: "% bankroll", min: 0, max: 100, step: 1, scale: 100, tip: "Shared ceiling on capital allowed in one entry. Default: 5% of bankroll." },
+    { id: "max_session_drawdown_pct", label: "Session drawdown", unit: "%", min: 0, max: 100, step: 1, scale: 100, tip: "Paper drawdown that pauses automatic execution without hiding signals. Default: 50%." },
     { id: "minimum_liquidity_contracts", label: "Minimum liquidity", unit: "contracts", min: 1, max: 1000000, step: 1, integer: true, tip: "Minimum contracts available at the selected ask for a Buy. Default: 1 contract." },
   ]],
   ["Data Quality", [
@@ -1048,6 +1247,25 @@ const calibrationGroups = [
     { id: "initial_retrain_settlements", label: "Initial retraining phase", unit: "settlements", min: 0, max: 10000, step: 1, integer: true, tip: "Early settlements that trigger a retraining check each time. Default: first 20." },
   ]],
 ];
+
+for (const [mode, label] of [["demo", "Demo"], ["live", "Live"]]) {
+  calibrationGroups.push([`${label} Execution Limits`, [
+    { id: `${mode}_automatic_trading_enabled`, label: `Automatic ${label} trading`, type: "toggle", tip: "Enables automatic submissions only while the environment is authenticated, reconciled, and deliberately armed." },
+    { id: `${mode}_bankroll_cap_pct`, label: "Bankroll allocation cap", unit: "% funds", min: 0, max: 100, step: 1, scale: 100, tip: "Eligible account funds available to all strategies. Default: 100%." },
+    { id: `${mode}_max_total_allocated_capital`, label: "Maximum allocated capital", unit: "dollars", min: 0, max: 100000000, step: 10, tip: "Hard dollar ceiling across positions, resting buys, and pending intents." },
+    { id: `${mode}_max_amount_per_order`, label: "Maximum per order", unit: "dollars", min: 0, max: 100000000, step: 10, tip: "Hard cash-exposure ceiling for one order." },
+    { id: `${mode}_max_exposure_per_market`, label: "Maximum per market", unit: "dollars", min: 0, max: 100000000, step: 10, tip: "Hard exposure ceiling for one market." },
+    { id: `${mode}_max_total_open_exposure`, label: "Maximum open exposure", unit: "dollars", min: 0, max: 100000000, step: 10, tip: "Hard exposure ceiling across all open markets." },
+    { id: `${mode}_max_open_orders`, label: "Maximum open orders", unit: "orders", min: 0, max: 10000, step: 1, integer: true, tip: "Maximum number of resting or partially filled orders." },
+    { id: `${mode}_max_daily_loss`, label: "Maximum daily loss", unit: "dollars", min: 0, max: 100000000, step: 10, tip: "Daily realized and unrealized equity loss that blocks new exposure." },
+    { id: `${mode}_max_daily_order_count`, label: "Maximum daily orders", unit: "orders", min: 0, max: 1000000, step: 1, integer: true, tip: "Maximum submitted order intents per UTC day." },
+    { id: `${mode}_max_entry_price`, label: "Maximum entry price", unit: "cents", min: 1, max: 99, step: 1, scale: 100, tip: "Highest outcome price allowed for new exposure." },
+    { id: `${mode}_max_spread`, label: "Maximum spread", unit: "cents", min: 0, max: 99, step: 1, scale: 100, tip: "Hard spread ceiling independent of strategy settings." },
+    { id: `${mode}_min_liquidity`, label: "Minimum liquidity", unit: "contracts", min: 0, max: 1000000, step: 1, integer: true, tip: "Hard minimum at the selected executable quote." },
+    { id: `${mode}_min_data_quality`, label: "Minimum data quality", type: "select", options: ["Low", "Moderate", "High"], tip: "Hard data-quality floor independent of strategy settings." },
+    { id: `${mode}_entry_timeout_seconds`, label: "Entry remainder timeout", unit: "seconds", min: 1, max: 300, step: 1, integer: true, tip: "Automatic unfilled remainders are canceled after this duration." },
+  ]]);
+}
 
 const calibrationControlMap = new Map(calibrationGroups.flatMap(([, controls]) => controls.map((control) => [control.id, control])));
 
@@ -1132,6 +1350,8 @@ function renderCalibrationResults(data) {
     compactCalibrationStat("Cal. error", percent(summary.calibration_error, 1), "predicted vs actual"),
   ].join("");
   const strategyResults = data.strategy_results || {};
+  const exchangeResults = data.mode && data.mode !== "PAPER";
+  $("#strategy-results-subtitle").textContent = `${modeLabel(data.mode || "PAPER")} performance`;
   const strategyLabels = {
     EARLY_THRESHOLD: "Early threshold",
     STANDARD_EDGE: "Standard edge",
@@ -1140,10 +1360,12 @@ function renderCalibrationResults(data) {
   };
   $("#strategy-results").innerHTML = Object.entries(strategyLabels).map(([key, label]) => {
     const result = strategyResults[key] || {};
-    const detail = key === "SWING"
+    const detail = exchangeResults
+      ? `${result.entries || 0} entries · ${result.completed_trades || 0} completed · avg ${cents(result.average_entry_price)} → ${cents(result.average_exit_price)} · ${money(result.actual_fees || 0, 4)} fees`
+      : key === "SWING"
       ? `${result.entries || 0} entries · ${result.completed_trades || 0} completed · avg ${cents(result.average_entry_price)} → ${cents(result.average_exit_price)} · ${result.average_holding_seconds == null ? "--" : `${Math.round(result.average_holding_seconds)}s`} held · ${percent(result.return_on_deployed_capital, 1)} return`
       : `${result.entries || 0} entries · ${result.settled_trades || 0} settled · avg ${percent(result.average_entry_probability, 1)} at ${cents(result.average_entry_price)} · EV ${result.average_entry_ev == null ? "--" : money(result.average_entry_ev, 3)}`;
-    const rate = key === "SWING"
+    const rate = key === "SWING" && !exchangeResults
       ? `${percent(result.target_hit_rate, 1)} target`
       : `${percent(result.win_rate, 1)} wins`;
     return `<div class="strategy-result-row">
@@ -1208,23 +1430,65 @@ async function restoreConfiguration(snapshotId) {
 }
 
 async function loadPaper() {
-  const data = await api("/api/paper");
+  const trading = await api("/api/trading");
+  const mode = trading.selected_mode || "PAPER";
+  const data = trading.selected || {};
+  state.trading.mode = mode;
+  if (state.dashboard) state.dashboard.trading = trading;
+  const readiness = data.readiness || {};
+  $("#trading-page-title").textContent = modeLabel(mode);
+  $("#trading-page-kicker").textContent = mode === "PAPER" ? "FORWARD TEST" : "KALSHI ACCOUNT";
+  $("#trading-page-badge").textContent = mode === "PAPER" ? "SIMULATED ONLY" : mode;
+  $("#trading-page-badge").classList.toggle("live", mode === "LIVE");
+  $("#reset-paper-round").hidden = mode !== "PAPER";
+  $("#exchange-actions").hidden = mode === "PAPER";
+  $("#position-section").hidden = mode === "PAPER";
+  $("#trading-command-status").textContent = mode === "PAPER"
+    ? "Paper is ready. No exchange order is placed."
+    : readiness.blocker || `${modeLabel(mode)} is reconciled and ${readiness.session_armed ? "armed" : "disarmed"}.`;
+  $("#trading-command-status").classList.toggle("blocked", mode !== "PAPER" && !readiness.ready_for_manual);
+  $("#arm-trading").textContent = readiness.session_armed ? "Disarm session" : "Arm session";
+  $("#kill-trading").textContent = readiness.kill_switch ? "Release kill switch" : "Kill switch";
+  $("#automatic-trading-toggle").checked = Boolean(readiness.automatic_armed);
+  $("#automatic-trading-toggle").disabled = !readiness.session_armed || readiness.kill_switch;
+  $$('[data-trading-mode]').forEach((button) => button.classList.toggle("active", button.dataset.tradingMode === mode));
   const pnlClass = data.realized_pnl > 0 ? "positive" : data.realized_pnl < 0 ? "negative" : "";
-  $("#paper-stats").innerHTML = [
-    statCard("Current bankroll", money(data.current_bankroll), `Started ${money(data.starting_bankroll)}`),
-    statCard("Realized P&L", money(data.realized_pnl), percent(data.realized_return_pct), pnlClass),
-    statCard("Record", `${data.wins}–${data.losses}`, `${data.open_positions} open`),
-    statCard("Average edge", points(data.average_edge), "At entry"),
-    statCard("Maximum drawdown", percent(data.max_drawdown_pct), "Settled equity"),
-  ].join("");
-  const trades = data.trades || [];
+  $("#paper-stats").innerHTML = mode === "PAPER" ? [
+      statCard("Current bankroll", money(data.current_bankroll), `Started ${money(data.starting_bankroll)}`),
+      statCard("Realized P&L", money(data.realized_pnl), percent(data.realized_return_pct), pnlClass),
+      statCard("Record", `${data.wins}–${data.losses}`, `${data.open_positions} open`),
+      statCard("Average edge", points(data.average_edge), "At entry"),
+      statCard("Maximum drawdown", percent(data.max_drawdown_pct), "Settled equity"),
+    ].join("") : [
+      statCard("Available", money(data.available_cash), readiness.authenticated ? "Kalshi account" : "Not authenticated"),
+      statCard("Portfolio value", money(data.portfolio_value), `${data.open_positions || 0} open positions`),
+      statCard("Allocated", money(data.allocated_capital), `${money(data.remaining_allocation)} remaining`),
+      statCard("Resting orders", data.open_order_count || 0, `${money(data.allocation_cap)} cap`),
+      statCard("Actual fees", money(data.actual_fees, 4), "Confirmed fills"),
+    ].join("");
+  const trades = mode === "PAPER" ? data.trades || [] : data.fills || [];
   $("#trade-table").innerHTML = trades.length ? trades.map((trade) => `
-    <tr><td>${shortDate(trade.opened_at)}</td><td>${trade.ticker}</td><td>${marketSideLabel(trade.side)}</td>
-    <td>${percent(trade.entry_price, 1)}</td><td>${trade.contracts}</td><td>${String(trade.strategy || trade.source || "automatic").replaceAll("_", " ").toUpperCase()}${(trade.entries || []).some((entry) => entry.stop_status === "active") ? " · STOP ACTIVE" : ""}</td><td>${points(trade.edge)}</td>
-    <td><span class="status-pill ${trade.status}">${trade.status.toUpperCase()}</span></td>
+    <tr><td>${shortDate(trade.opened_at || trade.filled_at)}</td><td>${trade.ticker}</td><td>${marketSideLabel(trade.side)}</td>
+    <td>${cents(trade.entry_price ?? trade.price)}</td><td>${trade.contracts}</td><td>${String(trade.strategy || trade.source || "automatic").replaceAll("_", " ").toUpperCase()}${(trade.entries || []).some((entry) => entry.stop_status === "active") ? " · STOP ACTIVE" : ""}</td><td>${mode === "PAPER" ? points(trade.edge) : "—"}</td>
+    <td><span class="status-pill ${String(trade.status || "filled").toLowerCase()}">${String(trade.status || trade.action || "FILLED").toUpperCase()}</span></td>
     <td class="${Number(trade.realized_pnl) > 0 ? "positive" : Number(trade.realized_pnl) < 0 ? "negative" : ""}">${trade.realized_pnl == null ? "--" : money(trade.realized_pnl)}</td>
     <td>${trade.available_cash_after == null ? "—" : money(trade.available_cash_after)}</td></tr>
-  `).join("") : '<tr><td colspan="10" class="empty-state">No paper trades yet.</td></tr>';
+  `).join("") : `<tr><td colspan="10" class="empty-state">No ${mode === "PAPER" ? "paper trades" : "confirmed fills"} yet.</td></tr>`;
+  if (mode !== "PAPER") {
+    const profitTake = data.profit_take_state || {};
+    const stopState = data.stop_loss_state || {};
+    $("#protection-warning").textContent = `${stopState.warning || "Stop-loss execution requires the Kalshi Model to remain running and connected."} ${profitTake.warning || "Profit taking requires an armed, reconciled connection."}`;
+    $("#position-table").innerHTML = (data.positions || []).length ? data.positions.map((position) => `
+      <tr><td>${position.ticker}</td><td>${marketSideLabel(position.side)}</td><td>${position.contracts}</td>
+      <td>${money(position.market_exposure)}</td><td>${position.stop_loss_price == null ? "Off" : cents(position.stop_loss_price)}</td>
+      <td>${profitTake.enabled === false ? "Off" : cents(profitTake.trigger_price ?? .99)}</td><td>${String(position.status).toUpperCase()}</td></tr>
+    `).join("") : '<tr><td colspan="7" class="empty-state">No open positions.</td></tr>';
+    $("#exchange-order-table").innerHTML = (data.orders || []).length ? data.orders.map((order) => `
+      <tr><td>${shortDate(order.updated_at)}</td><td>${order.ticker}</td><td>${marketSideLabel(order.side)}</td><td>${order.action}</td>
+      <td>${order.filled_contracts}</td><td>${order.remaining_contracts}</td><td>${cents(order.limit_price)}</td><td>${order.status}</td>
+      <td>${["ACKNOWLEDGED", "RESTING", "PARTIALLY_FILLED"].includes(order.status) ? `<button class="table-action" data-cancel-exchange-order="${order.exchange_order_id}">Cancel</button>` : ""}</td></tr>
+    `).join("") : '<tr><td colspan="9" class="empty-state">No exchange orders.</td></tr>';
+  }
 }
 
 function setPaperResetState({ confirming = false, resetting = false } = {}) {
@@ -1272,13 +1536,92 @@ async function resetPaperRound() {
 const percentSettingIds = ["min_edge", "fractional_kelly", "max_position_pct", "max_risk_per_trade_pct", "max_session_drawdown_pct"];
 
 async function loadSettings() {
-  const [database, credentials] = await Promise.all([
+  const [database, credentials, demoCredentials, liveCredentials] = await Promise.all([
     api("/api/database"), api("/api/credentials"),
+    api("/api/trading/credentials/DEMO"), api("/api/trading/credentials/LIVE"),
   ]);
   $("#database-path").textContent = database.path;
   $("#database-counts").innerHTML = Object.entries(database.counts).map(([key, value]) => `<span>${key.replaceAll("_", " ")}: ${value}</span>`).join("");
   renderCredentialStatus(credentials);
+  renderTradingCredentialStatus(demoCredentials);
+  renderTradingCredentialStatus(liveCredentials);
   syncThemeButtons();
+}
+
+function renderTradingCredentialStatus(credentials) {
+  const mode = credentials.mode;
+  const stateLabel = $(`[data-trading-credential-state="${mode}"]`);
+  stateLabel.textContent = credentials.configured
+    ? credentials.source === "environment" ? "Configured in .env" : "Configured"
+    : "Not configured";
+  stateLabel.classList.toggle("configured", credentials.configured);
+  const keyInput = $(`[data-trading-key-id="${mode}"]`);
+  keyInput.value = "";
+  keyInput.placeholder = credentials.key_id_hint ? `Saved as ${credentials.key_id_hint}` : `${mode} API Key ID`;
+  const remove = $(`[data-remove-trading-credentials="${mode}"]`);
+  remove.disabled = !credentials.local_credentials_saved;
+}
+
+async function saveTradingCredentials(event) {
+  event.preventDefault();
+  const mode = event.currentTarget.dataset.tradingCredentialForm;
+  const keyId = $(`[data-trading-key-id="${mode}"]`).value.trim();
+  const fileInput = $(`[data-trading-key-file="${mode}"]`);
+  const file = fileInput.files?.[0];
+  const panel = $(`[data-trading-credential-result="${mode}"]`);
+  panel.hidden = false;
+  if (!keyId || !file) {
+    panel.textContent = `Enter the ${mode} Key ID and choose its private key file.`;
+    return;
+  }
+  try {
+    panel.textContent = "Validating, saving, and reconciling…";
+    const credentials = await api(`/api/trading/credentials/${mode}`, {
+      method: "POST", body: JSON.stringify({ key_id: keyId, private_key: await file.text() }),
+    });
+    fileInput.value = "";
+    renderTradingCredentialStatus(credentials);
+    panel.textContent = credentials.readiness?.reconciled
+      ? `${modeLabel(mode)} credentials saved and reconciled.`
+      : `${modeLabel(mode)} credentials saved. ${credentials.readiness?.last_error || "Reconcile before arming."}`;
+    await refreshDashboard();
+  } catch (error) { panel.textContent = error.message; }
+}
+
+async function removeTradingCredentials(mode) {
+  const panel = $(`[data-trading-credential-result="${mode}"]`);
+  panel.hidden = false;
+  try {
+    const credentials = await api(`/api/trading/credentials/${mode}`, { method: "DELETE" });
+    renderTradingCredentialStatus(credentials);
+    panel.textContent = `${modeLabel(mode)} credentials removed and the session disarmed.`;
+    await refreshDashboard();
+  } catch (error) { panel.textContent = error.message; }
+}
+
+async function verifyDemoTrading() {
+  const phrase = window.prompt('Type VERIFY DEMO TRADING to create, acknowledge, cancel, and reconcile a one-contract Demo order.');
+  if (phrase == null) return;
+  const panel = $('[data-trading-credential-result="DEMO"]');
+  panel.hidden = false;
+  panel.textContent = "Running Demo verification…";
+  try {
+    const result = await api("/api/trading/demo/verify", {
+      method: "POST", body: JSON.stringify({ confirmation: phrase }),
+    });
+    panel.textContent = result.verified
+      ? "Demo verification passed. Live arming is now eligible after reviewing Live limits."
+      : "Demo verification did not complete.";
+    await refreshDashboard();
+  } catch (error) { panel.textContent = error.message; }
+}
+
+async function markLiveLimitsReviewed() {
+  try {
+    await api("/api/trading/live/limits-reviewed", { method: "POST" });
+    showToast("Live limits reviewed", "Live arming still requires successful Demo verification and deliberate session confirmation.");
+    await refreshDashboard();
+  } catch (error) { showToast("Limits not marked reviewed", error.message); }
 }
 
 function renderCredentialStatus(credentials) {
@@ -1437,6 +1780,7 @@ async function switchPage(page) {
 
 function bindEvents() {
   $$("[data-page]").forEach((button) => button.addEventListener("click", () => switchPage(button.dataset.page)));
+  $$("[data-trading-mode]").forEach((button) => button.addEventListener("click", () => selectTradingMode(button.dataset.tradingMode)));
   $$("[data-window]").forEach((button) => button.addEventListener("click", async () => {
     state.chartWindow = Number(button.dataset.window);
     resetChartAxis();
@@ -1446,6 +1790,10 @@ function bindEvents() {
   }));
   $("#credential-form").addEventListener("submit", saveKalshiCredentials);
   $("#remove-credentials").addEventListener("click", removeKalshiCredentials);
+  $$("[data-trading-credential-form]").forEach((form) => form.addEventListener("submit", saveTradingCredentials));
+  $$("[data-remove-trading-credentials]").forEach((button) => button.addEventListener("click", () => removeTradingCredentials(button.dataset.removeTradingCredentials)));
+  $("[data-verify-demo]").addEventListener("click", verifyDemoTrading);
+  $("[data-review-live-limits]").addEventListener("click", markLiveLimitsReviewed);
   $("#kalshi-private-key").addEventListener("change", (event) => {
     const file = event.target.files?.[0];
     $("#credential-file-name").textContent = file
@@ -1475,9 +1823,25 @@ function bindEvents() {
     $(selector).addEventListener("input", renderPaperController);
   });
   $("#paper-submit").addEventListener("click", submitPaperOrder);
+  $("#confirm-exchange-order").addEventListener("click", confirmExchangeOrder);
+  $("#trade-confirmation").addEventListener("close", () => { state.trading.pendingConfirmation = null; });
+  $("#reconcile-trading").addEventListener("click", reconcileSelectedTrading);
+  $("#arm-trading").addEventListener("click", armSelectedTrading);
+  $("#kill-trading").addEventListener("click", killSelectedTrading);
+  $("#automatic-trading-toggle").addEventListener("change", toggleAutomaticTrading);
   $("#open-order-list").addEventListener("click", (event) => {
     const button = event.target.closest("[data-cancel-paper-order]");
     if (button) cancelPaperOrder(Number(button.dataset.cancelPaperOrder));
+  });
+  $("#exchange-order-table").addEventListener("click", async (event) => {
+    const button = event.target.closest("[data-cancel-exchange-order]");
+    if (!button) return;
+    const { mode } = selectedTrading();
+    try {
+      await api(`/api/trading/${mode}/orders/${button.dataset.cancelExchangeOrder}`, { method: "DELETE" });
+      await refreshDashboard();
+      await loadPaper();
+    } catch (error) { showToast("Unable to cancel order", error.message); }
   });
   $("#calibration-controls").addEventListener("input", markCalibrationDirty);
   $("#calibration-controls").addEventListener("change", markCalibrationDirty);
