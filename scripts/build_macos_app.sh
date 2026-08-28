@@ -48,6 +48,7 @@ fi
   --hidden-import "app.main" \
   --add-data "app/templates:app/templates" \
   --add-data "app/static:app/static" \
+  --add-data "app/mobile_static:app/mobile_static" \
   app/__main__.py
 
 APP_BUNDLE="dist/Kalshi Model.app"

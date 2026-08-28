@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="light dark">
+  <meta name="theme-color" content="#f7f7f5" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#171716" media="(prefers-color-scheme: dark)">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="default">
+  <meta name="apple-mobile-web-app-title" content="Kalshi Monitor">
+  <title>Kalshi Monitor</title>
+  <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="apple-touch-icon" href="/icon-180.png">
+  <link rel="stylesheet" href="/assets/mobile.css">
+  <script src="/assets/mobile.js" defer></script>
+</head>
+<body>
+  <main class="mobile-shell">
+    <header class="app-header">
+      <div>
+        <p class="eyebrow">KALSHI MODEL</p>
+        <h1>Monitor</h1>
+      </div>
+      <label class="theme-switch" title="Switch between light and dark mode">
+        <span>Light</span>
+        <input id="theme-toggle" type="checkbox" aria-label="Use dark mode">
+        <i aria-hidden="true"></i>
+        <span>Dark</span>
+      </label>
+    </header>
+
+    <section class="connection-strip" aria-live="polite">
+      <div><i id="connection-dot"></i><strong id="connection-state">Connecting</strong></div>
+      <div><span id="environment">Paper</span><time id="last-updated">Waiting for data</time></div>
+    </section>
+
+    <section class="market-strip" aria-label="Current market">
+      <div><span>TO BEAT</span><strong id="market-to-beat">--</strong></div>
+      <div><span>BTC PROXY</span><strong id="market-btc-proxy">--</strong></div>
+      <div><span>KALSHI TIMER</span><strong id="market-timer">--:--</strong></div>
+    </section>
+
+    <section class="hud" aria-labelledby="hud-title">
+      <div class="hud-heading">
+        <div><p class="eyebrow" id="hud-title">STANDARD EDGE</p><h2 id="hud-side">--</h2></div>
+        <strong class="hud-status" id="hud-status">Watching</strong>
+      </div>
+
+      <div class="metric">
+        <div><span>Win chance</span><strong id="probability-value">--</strong></div>
+        <div class="track"><i id="probability-progress"></i></div>
+      </div>
+      <div class="metric">
+        <div><span>Net EV</span><strong id="ev-value">--</strong></div>
+        <div class="track"><i id="ev-progress"></i></div>
+      </div>
+      <div class="metric">
+        <div><span>Confirmation</span><strong id="confirmation-value">Locked</strong></div>
+        <div class="track"><i id="confirmation-progress"></i></div>
+      </div>
+
+      <div class="gates" aria-label="Entry gates">
+        <div class="gate" id="gate-spread"><i></i><span>Spread<small>--</small></span></div>
+        <div class="gate" id="gate-liquidity"><i></i><span>Liquidity<small>--</small></span></div>
+        <div class="gate" id="gate-data"><i></i><span>Data<small>--</small></span></div>
+        <div class="gate" id="gate-quality"><i></i><span>Quality<small>--</small></span></div>
+        <div class="gate" id="gate-risk"><i></i><span>Risk<small>--</small></span></div>
+      </div>
+      <p class="blocker" id="hud-blocker">Waiting for live trade data.</p>
+    </section>
+
+    <section class="trades" aria-labelledby="trades-title">
+      <div class="section-heading"><div><p class="eyebrow" id="trades-label">PAPER</p><h2 id="trades-title">Recent trades</h2></div><span>Latest 10</span></div>
+      <div class="trade-list" id="trade-list">
+        <p class="empty">Waiting for trades.</p>
+      </div>
+    </section>
+  </main>
+</body>
+</html>

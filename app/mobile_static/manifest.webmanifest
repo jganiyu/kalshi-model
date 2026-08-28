@@ -1,0 +1,14 @@
+{
+  "name": "Kalshi Model Monitor",
+  "short_name": "Kalshi Monitor",
+  "description": "Read-only Standard Edge readiness and recent trade monitoring.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#f7f7f5",
+  "theme_color": "#f7f7f5",
+  "icons": [
+    {"src": "/icon-180.png", "sizes": "180x180", "type": "image/png"},
+    {"src": "/icon-1024.png", "sizes": "1024x1024", "type": "image/png", "purpose": "any maskable"}
+  ]
+}

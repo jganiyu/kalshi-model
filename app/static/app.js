@@ -1603,16 +1603,95 @@ async function resetPaperRound() {
 const percentSettingIds = ["min_edge", "fractional_kelly", "max_position_pct", "max_risk_per_trade_pct", "max_session_drawdown_pct"];
 
 async function loadSettings() {
-  const [database, credentials, demoCredentials, liveCredentials] = await Promise.all([
+  const [database, credentials, demoCredentials, liveCredentials, mobileMonitor] = await Promise.all([
     api("/api/database"), api("/api/credentials"),
     api("/api/trading/credentials/DEMO"), api("/api/trading/credentials/LIVE"),
+    api("/api/mobile-monitor"),
   ]);
   $("#database-path").textContent = database.path;
   $("#database-counts").innerHTML = Object.entries(database.counts).map(([key, value]) => `<span>${key.replaceAll("_", " ")}: ${value}</span>`).join("");
   renderCredentialStatus(credentials);
   renderTradingCredentialStatus(demoCredentials);
   renderTradingCredentialStatus(liveCredentials);
+  renderMobileMonitor(mobileMonitor);
   syncThemeButtons();
+}
+
+function renderMobileMonitor(monitor) {
+  const enabled = Boolean(monitor?.enabled);
+  $("#mobile-monitor-enabled").checked = enabled;
+  $("#mobile-monitor-status").textContent = enabled ? "Enabled" : "Disabled";
+  $("#mobile-monitor-status").classList.toggle("configured", enabled);
+  $("#mobile-monitor-port").textContent = monitor?.port ?? "--";
+  $("#mobile-monitor-local-status").textContent = enabled ? "Running · read only" : "Disabled";
+  $("#mobile-monitor-local-url").value = monitor?.local_url || "";
+  $("#mobile-monitor-private-url").value = monitor?.private_url || "";
+  $("#mobile-monitor-tailscale-command").textContent = monitor?.tailscale_command || "--";
+  $("#copy-mobile-monitor-url").disabled = !monitor?.private_url;
+}
+
+async function updateMobileMonitor(event) {
+  const input = event.currentTarget;
+  const result = $("#mobile-monitor-result");
+  input.disabled = true;
+  result.hidden = false;
+  result.textContent = input.checked ? "Enabling the read-only monitor..." : "Disabling the mobile monitor...";
+  try {
+    const monitor = await api("/api/mobile-monitor", {
+      method: "PUT", body: JSON.stringify({ enabled: input.checked }),
+    });
+    renderMobileMonitor(monitor);
+    result.textContent = monitor.enabled
+      ? "Mobile Monitor is running. Configure Tailscale Serve for private iPhone access."
+      : "Mobile Monitor is disabled.";
+  } catch (error) {
+    input.checked = !input.checked;
+    result.textContent = error.message;
+  } finally {
+    input.disabled = false;
+  }
+}
+
+async function copyMobileMonitorUrl() {
+  const value = $("#mobile-monitor-private-url").value;
+  if (!value) return;
+  try {
+    await navigator.clipboard.writeText(value);
+    showToast("Private URL copied", "Open it in Safari on your Tailscale-connected iPhone.");
+  } catch (_) {
+    $("#mobile-monitor-private-url").select();
+    showToast("Select and copy the URL", "Clipboard access was unavailable.");
+  }
+}
+
+async function copyMobileMonitorCommand() {
+  const value = $("#mobile-monitor-tailscale-command").textContent.trim();
+  if (!value) return;
+  try {
+    await navigator.clipboard.writeText(value);
+    showToast("Tailscale command copied", "Paste it into Terminal and press Return.");
+  } catch (_) {
+    showToast("Unable to copy command", "Select the command and copy it manually.");
+  }
+}
+
+async function refreshMobileMonitorUrl() {
+  const button = $("#refresh-mobile-monitor-url");
+  const result = $("#mobile-monitor-result");
+  button.disabled = true;
+  result.hidden = false;
+  result.textContent = "Checking Tailscale Serve...";
+  try {
+    const monitor = await api("/api/mobile-monitor");
+    renderMobileMonitor(monitor);
+    result.textContent = monitor.private_url
+      ? "Private Tailscale URL found. Open it on your iPhone."
+      : "No private URL found yet. The successful command prints the private https://…ts.net URL in Terminal; you can use it there or retry Refresh.";
+  } catch (error) {
+    result.textContent = error.message;
+  } finally {
+    button.disabled = false;
+  }
 }
 
 function renderTradingCredentialStatus(credentials) {
@@ -1871,6 +1950,10 @@ function bindEvents() {
   $("#reset-paper-round").addEventListener("click", resetPaperRound);
   $("#run-bootstrap").addEventListener("click", runBootstrap);
   $("#backup-database").addEventListener("click", backupDatabase);
+  $("#mobile-monitor-enabled").addEventListener("change", updateMobileMonitor);
+  $("#copy-mobile-monitor-url").addEventListener("click", copyMobileMonitorUrl);
+  $("#copy-mobile-monitor-command").addEventListener("click", copyMobileMonitorCommand);
+  $("#refresh-mobile-monitor-url").addEventListener("click", refreshMobileMonitorUrl);
   $$('[data-paper-action]').forEach((button) => button.addEventListener("click", () => {
     state.paperOrder.action = button.dataset.paperAction;
     renderPaperController();

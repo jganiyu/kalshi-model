@@ -25,6 +25,7 @@ from app.services.credentials import (
 from app.services.broker import KalshiBroker, normalize_mode
 from app.services.kalshi_trading import KalshiTradingError
 from app.services.training import report_rows
+from app.mobile import create_mobile_app, mobile_status
 
 
 config = AppConfig()
@@ -41,6 +42,12 @@ asset_digest = hashlib.sha256()
 for asset_name in ("styles.css", "app.js"):
     asset_digest.update((static_root / asset_name).read_bytes())
 asset_version = asset_digest.hexdigest()[:12]
+mobile_runtime_port = config.mobile_port
+
+
+def set_mobile_runtime_port(port: int) -> None:
+    global mobile_runtime_port
+    mobile_runtime_port = port
 
 
 @asynccontextmanager
@@ -58,6 +65,7 @@ app = FastAPI(
     lifespan=lifespan,
 )
 app.mount("/static", StaticFiles(directory=static_root), name="static")
+mobile_app = create_mobile_app(engine, db, lambda: mobile_runtime_port)
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -394,6 +402,20 @@ async def get_default_settings() -> dict[str, Any]:
     return DEFAULT_SETTINGS
 
 
+@app.get("/api/mobile-monitor")
+async def get_mobile_monitor() -> dict[str, Any]:
+    return mobile_status(db, mobile_runtime_port)
+
+
+@app.put("/api/mobile-monitor")
+async def update_mobile_monitor(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    enabled = payload.get("enabled")
+    if not isinstance(enabled, bool):
+        raise HTTPException(status_code=422, detail="enabled must be true or false")
+    await engine.apply_settings({"mobile_monitor_enabled": enabled})
+    return mobile_status(db, mobile_runtime_port)
+
+
 def credential_status() -> dict[str, Any]:
     active = engine.config
     key_path = active.kalshi_private_key_path
@@ -577,6 +599,7 @@ def clean_settings_payload(payload: dict[str, Any]) -> dict[str, Any]:
             "paper_trading_enabled", "risk_controls_enabled",
             "early_threshold_enabled", "late_conviction_enabled", "swing_enabled",
             "global_profit_take_enabled",
+            "mobile_monitor_enabled",
             "demo_automatic_trading_enabled", "live_automatic_trading_enabled",
         }:
             if not isinstance(value, bool):

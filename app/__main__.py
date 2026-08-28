@@ -41,9 +41,15 @@ def find_available_port(host: str, preferred_port: int, search_limit: int = 100)
 
 
 class LocalAppServer:
-    def __init__(self, host: str, port: int):
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        app_target: str = "app.main:app",
+        thread_name: str = "kalshi-model-server",
+    ):
         uvicorn_config = uvicorn.Config(
-            "app.main:app",
+            app_target,
             host=host,
             port=port,
             log_level="warning",
@@ -52,7 +58,7 @@ class LocalAppServer:
         self.server = uvicorn.Server(uvicorn_config)
         self.thread = threading.Thread(
             target=self.server.run,
-            name="kalshi-model-server",
+            name=thread_name,
             daemon=True,
         )
 
@@ -86,12 +92,27 @@ def _load_webview() -> Any:
 def run_native_app(config: AppConfig, port: int) -> None:
     webview = _load_webview()
     server = LocalAppServer(config.host, port)
+    mobile_server: LocalAppServer | None = None
     storage_path = credential_directory() / "webview"
     storage_path.mkdir(parents=True, exist_ok=True)
     url = f"http://{config.host}:{port}"
 
     server.start()
     try:
+        mobile_preferred = int(getattr(config, "mobile_port", 8767))
+        if mobile_preferred == port:
+            mobile_preferred += 1
+        mobile_port = find_available_port("127.0.0.1", mobile_preferred)
+        from app.main import set_mobile_runtime_port
+
+        set_mobile_runtime_port(mobile_port)
+        mobile_server = LocalAppServer(
+            "127.0.0.1",
+            mobile_port,
+            "app.main:mobile_app",
+            "kalshi-model-mobile-monitor",
+        )
+        mobile_server.start()
         webview.settings["OPEN_EXTERNAL_LINKS_IN_BROWSER"] = True
         webview.create_window(
             "Kalshi Model",
@@ -108,13 +129,30 @@ def run_native_app(config: AppConfig, port: int) -> None:
             storage_path=str(storage_path),
         )
     finally:
+        if mobile_server is not None:
+            mobile_server.stop()
         server.stop()
 
 
 def run_browser_app(config: AppConfig, port: int) -> None:
+    mobile_preferred = config.mobile_port + 1 if config.mobile_port == port else config.mobile_port
+    mobile_port = find_available_port("127.0.0.1", mobile_preferred)
+    from app.main import set_mobile_runtime_port
+
+    set_mobile_runtime_port(mobile_port)
+    mobile_server = LocalAppServer(
+        "127.0.0.1",
+        mobile_port,
+        "app.main:mobile_app",
+        "kalshi-model-mobile-monitor",
+    )
+    mobile_server.start()
     if config.open_browser:
         threading.Timer(1.5, lambda: webbrowser.open(f"http://{config.host}:{port}")).start()
-    uvicorn.run("app.main:app", host=config.host, port=port, log_level="info")
+    try:
+        uvicorn.run("app.main:app", host=config.host, port=port, log_level="info")
+    finally:
+        mobile_server.stop()
 
 
 def main() -> None:

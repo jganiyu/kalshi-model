@@ -625,6 +625,12 @@ td { padding: 12px 16px; border-top: 1px solid var(--line); white-space: nowrap;
 .toggle-row i::after { position: absolute; top: 2px; left: 2px; width: 18px; height: 18px; border-radius: 50%; background: #fff; box-shadow: 0 1px 2px rgba(0, 0, 0, 0.18); content: ""; transition: transform 0.18s ease; }
 .toggle-row input:checked + i { background: var(--green); }
 .toggle-row input:checked + i::after { transform: translateX(16px); }
+.mobile-monitor-details { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 1px; margin: 0 0 14px; overflow: hidden; border: 1px solid var(--line); border-radius: 6px; background: var(--line); }
+.mobile-monitor-details > div { display: flex; align-items: center; justify-content: space-between; gap: 14px; min-width: 0; padding: 12px; background: var(--surface-soft); font-size: 10px; }
+.mobile-monitor-details span { color: var(--muted); }
+.mobile-monitor-guide { display: grid; gap: 8px; margin-top: 14px; color: var(--muted); font-size: 10px; line-height: 1.45; }
+.mobile-monitor-guide code { display: block; overflow-wrap: anywhere; padding: 10px 12px; border-radius: 5px; background: var(--surface-soft); color: var(--ink); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+.mobile-monitor-guide a { width: fit-content; color: var(--green); }
 .connection-row, .appearance-row { display: flex; justify-content: space-between; align-items: center; gap: 20px; padding: 14px 0; border-top: 1px solid var(--line); color: var(--muted); font-size: 11px; }
 .connection-row strong { color: var(--ink); text-align: right; }
 .theme-picker button { min-width: 66px; }

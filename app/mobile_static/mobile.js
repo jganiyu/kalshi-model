@@ -1,0 +1,216 @@
+const $ = (selector) => document.querySelector(selector);
+const themeMedia = window.matchMedia("(prefers-color-scheme: dark)");
+const storedTheme = localStorage.getItem("kalshi-mobile-theme-v1");
+let followsSystemTheme = !storedTheme;
+let reconnectDelay = 1000;
+let socket;
+let timerDeadline = null;
+
+function applyTheme(theme) {
+  const dark = theme === "dark";
+  document.documentElement.dataset.theme = dark ? "dark" : "light";
+  $("#theme-toggle").checked = dark;
+}
+
+applyTheme(storedTheme || (themeMedia.matches ? "dark" : "light"));
+
+$("#theme-toggle").addEventListener("change", (event) => {
+  const theme = event.target.checked ? "dark" : "light";
+  followsSystemTheme = false;
+  localStorage.setItem("kalshi-mobile-theme-v1", theme);
+  applyTheme(theme);
+});
+
+themeMedia.addEventListener("change", (event) => {
+  if (followsSystemTheme) applyTheme(event.matches ? "dark" : "light");
+});
+
+function percent(value, digits = 1) {
+  return value == null || !Number.isFinite(Number(value))
+    ? "--"
+    : `${(Number(value) * 100).toFixed(digits)}%`;
+}
+
+function cents(value, digits = 1) {
+  return value == null || !Number.isFinite(Number(value))
+    ? "--"
+    : `${(Number(value) * 100).toFixed(digits)}¢`;
+}
+
+function money(value) {
+  return value == null || !Number.isFinite(Number(value))
+    ? "—"
+    : new Intl.NumberFormat("en-US", { style: "currency", currency: "USD" }).format(Number(value));
+}
+
+function price(value) {
+  return value == null || !Number.isFinite(Number(value))
+    ? "--"
+    : new Intl.NumberFormat("en-US", { style: "currency", currency: "USD", minimumFractionDigits: 2 }).format(Number(value));
+}
+
+function updateTimer() {
+  if (timerDeadline == null) {
+    $("#market-timer").textContent = "--:--";
+    return;
+  }
+  const remaining = Math.max(0, Math.floor((timerDeadline - Date.now()) / 1000));
+  const minutes = Math.floor(remaining / 60);
+  $("#market-timer").textContent = `${String(minutes).padStart(2, "0")}:${String(remaining % 60).padStart(2, "0")}`;
+}
+
+function compact(value) {
+  return value == null || !Number.isFinite(Number(value))
+    ? "--"
+    : new Intl.NumberFormat("en-US", { notation: "compact", maximumFractionDigits: 1 }).format(Number(value));
+}
+
+function sideLabel(side) {
+  return String(side || "").toUpperCase() === "YES" ? "Up" : String(side || "").toUpperCase() === "NO" ? "Down" : "--";
+}
+
+function escapeHtml(value) {
+  return String(value ?? "").replace(/[&<>'"]/g, (character) => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", "'": "&#39;", '"': "&quot;",
+  })[character]);
+}
+
+function timeLabel(value) {
+  if (!value) return "--";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "--";
+  return new Intl.DateTimeFormat("en-US", { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" }).format(date);
+}
+
+function setConnection(status) {
+  const strip = $(".connection-strip");
+  strip.dataset.state = status.toLowerCase();
+  $("#connection-state").textContent = status;
+}
+
+function setProgress(selector, metric = {}) {
+  const progress = Math.max(0, Math.min(1, Number(metric.progress || 0)));
+  const bar = $(selector);
+  bar.style.width = `${(progress * 100).toFixed(1)}%`;
+  bar.classList.toggle("passed", Boolean(metric.passed));
+}
+
+function setGate(selector, gate = {}, label) {
+  const element = $(selector);
+  element.classList.toggle("pass", Boolean(gate.passed));
+  element.title = gate.detail || "";
+  element.querySelector("small").textContent = label;
+}
+
+function renderHud(readiness) {
+  const metrics = readiness?.metrics || {};
+  const probability = metrics.probability || {};
+  const ev = metrics.net_ev || {};
+  const confirmation = metrics.confirmation || {};
+  const gates = readiness?.gates || {};
+  const status = String(readiness?.status || "WATCHING").toLowerCase();
+  $("#hud-side").textContent = sideLabel(readiness?.side);
+  $("#hud-status").textContent = status.charAt(0).toUpperCase() + status.slice(1);
+  $("#hud-status").dataset.status = status;
+  $("#probability-value").textContent = probability.current == null
+    ? `-- / ${percent(probability.required, 0)}`
+    : `${percent(probability.current)} / ${percent(probability.required, 0)}`;
+  $("#ev-value").textContent = ev.current == null
+    ? `-- / ${cents(ev.required)}`
+    : `${cents(ev.current)} / ${cents(ev.required)}`;
+  $("#confirmation-value").textContent = confirmation.locked
+    ? "Locked"
+    : `${Number(confirmation.current_seconds || 0).toFixed(1)} / ${Number(confirmation.required_seconds || 0).toFixed(0)}s`;
+  setProgress("#probability-progress", probability);
+  setProgress("#ev-progress", ev);
+  setProgress("#confirmation-progress", confirmation);
+
+  const spread = gates.spread || {};
+  const spreadLabel = spread.current == null ? "--" : spread.required == null
+    ? cents(spread.current) : `${cents(spread.current)} / ${cents(spread.required)}`;
+  const liquidity = gates.liquidity || {};
+  const liquidityLabel = liquidity.current == null ? "--" : `${compact(liquidity.current)} / ${compact(liquidity.required)}`;
+  const quality = gates.quality || {};
+  setGate("#gate-spread", spread, spreadLabel);
+  setGate("#gate-liquidity", liquidity, liquidityLabel);
+  setGate("#gate-data", gates.data, gates.data?.passed ? "Fresh" : "Blocked");
+  setGate("#gate-quality", quality, quality.current == null ? "--" : `${quality.current} / ${quality.required || "--"}`);
+  setGate("#gate-risk", gates.risk, gates.risk?.passed ? "Clear" : "Blocked");
+  $("#hud-blocker").textContent = readiness?.blocker || "Waiting for live trade data.";
+}
+
+function tradeResult(trade) {
+  const status = String(trade.status || trade.action || "Open");
+  return trade.realized_pnl == null ? status : `${status} · ${money(trade.realized_pnl)}`;
+}
+
+function renderTrades(trades, mode) {
+  const target = $("#trade-list");
+  if (!trades?.length) {
+    target.innerHTML = `<p class="empty">No ${mode === "PAPER" ? "paper trades" : "fills"} yet.</p>`;
+    return;
+  }
+  target.innerHTML = trades.slice(0, 10).map((trade) => {
+    const pnlClass = Number(trade.realized_pnl) > 0 ? "positive" : Number(trade.realized_pnl) < 0 ? "negative" : "";
+    const strategy = String(trade.strategy || trade.source || "Manual").replaceAll("_", " ");
+    return `<article class="trade">
+      <div class="trade-head"><strong>${escapeHtml(sideLabel(trade.side))} · ${escapeHtml(strategy)}</strong><time>${escapeHtml(timeLabel(trade.activity_at || trade.opened_at || trade.filled_at))}</time></div>
+      <div class="trade-grid">
+        <div><span>Price</span><b>${escapeHtml(cents(trade.entry_price ?? trade.price))}</b></div>
+        <div><span>Quantity</span><b>${escapeHtml(compact(trade.contracts))}</b></div>
+        <div><span>Strategy</span><b>${escapeHtml(strategy)}</b></div>
+        <div><span>Result / P&amp;L</span><b class="${pnlClass}">${escapeHtml(tradeResult(trade))}</b></div>
+        <div><span>Available after</span><b>${escapeHtml(money(trade.available_cash_after))}</b></div>
+      </div>
+    </article>`;
+  }).join("");
+}
+
+function render(data) {
+  const mode = String(data?.mode || "PAPER").toUpperCase();
+  $("#environment").textContent = mode === "LIVE" ? "Live" : mode === "DEMO" ? "Demo" : "Paper";
+  $("#trades-label").textContent = mode;
+  $("#last-updated").textContent = data?.updated_at ? `Updated ${timeLabel(data.updated_at)}` : "Waiting for data";
+  $("#market-to-beat").textContent = price(data?.market?.to_beat);
+  $("#market-btc-proxy").textContent = price(data?.market?.btc_proxy);
+  const remaining = Number(data?.market?.time_remaining_seconds);
+  timerDeadline = Number.isFinite(remaining) ? Date.now() + Math.max(0, remaining) * 1000 : null;
+  updateTimer();
+  renderHud(data?.readiness);
+  renderTrades(data?.recent_trades || [], mode);
+}
+
+function connect() {
+  if (!navigator.onLine) {
+    setConnection("Offline");
+    return;
+  }
+  setConnection(socket ? "Reconnecting" : "Connecting");
+  const protocol = location.protocol === "https:" ? "wss:" : "ws:";
+  socket = new WebSocket(`${protocol}//${location.host}/ws/live`);
+  socket.addEventListener("open", () => {
+    reconnectDelay = 1000;
+    setConnection("Live");
+  });
+  socket.addEventListener("message", (event) => {
+    const message = JSON.parse(event.data);
+    if (message.type === "snapshot") render(message.data);
+  });
+  socket.addEventListener("close", () => {
+    setConnection(navigator.onLine ? "Reconnecting" : "Offline");
+    const delay = reconnectDelay;
+    reconnectDelay = Math.min(reconnectDelay * 2, 15000);
+    window.setTimeout(connect, delay);
+  });
+  socket.addEventListener("error", () => socket.close());
+}
+
+window.addEventListener("online", () => {
+  reconnectDelay = 1000;
+  if (!socket || socket.readyState >= WebSocket.CLOSING) connect();
+});
+window.addEventListener("offline", () => setConnection("Offline"));
+
+if ("serviceWorker" in navigator) navigator.serviceWorker.register("/service-worker.js");
+window.setInterval(updateTimer, 250);
+connect();

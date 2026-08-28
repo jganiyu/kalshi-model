@@ -65,6 +65,7 @@ class AppConfig:
     kalshi_credentials_source: str = field(default_factory=credential_source)
     host: str = os.getenv("KALSHI_MODEL_HOST", "127.0.0.1")
     port: int = int(os.getenv("KALSHI_MODEL_PORT", "8765"))
+    mobile_port: int = int(os.getenv("KALSHI_MODEL_MOBILE_PORT", "8767"))
     poll_seconds: float = max(2.0, float(os.getenv("KALSHI_MODEL_POLL_SECONDS", "5")))
     live_update_seconds: float = max(
         0.1, float(os.getenv("KALSHI_MODEL_LIVE_UPDATE_SECONDS", "0.1"))
@@ -75,6 +76,7 @@ class AppConfig:
 
 
 DEFAULT_SETTINGS: dict[str, object] = {
+    "mobile_monitor_enabled": False,
     "starting_bankroll": 1000.0,
     "paper_trading_enabled": True,
     "risk_controls_enabled": True,

@@ -20,6 +20,7 @@ A local macOS research and trading app for Kalshi's 15-minute Bitcoin Up or Down
 - **Dashboard:** Live BTC proxy, outcome forecast, Standard Edge HUD, order book, positions, and manual controls.
 - **BTC proxy:** Median Coinbase, Kraken, and Bitstamp price with learned BRTI uncertainty.
 - **Three modes:** Paper, isolated Kalshi Demo, and deliberately armed Kalshi Live.
+- **Mobile Monitor:** Read-only HUD, market metrics, and recent trades on iPhone through Tailscale.
 - **Strategies:** Standard Edge, Early Threshold, Late Conviction, and Swing.
 - **Calibration:** Tune strategies, exits, allocation, and mode-specific hard limits.
 - **Local data:** Settings, evidence, trades, snapshots, reports, and backups stay in SQLite on your Mac.
@@ -124,13 +125,23 @@ Calibration compares predicted probabilities with settled outcomes and reports e
 
 - **Paper:** Local simulated fills and bankroll; no Kalshi order is sent.
 - **Demo:** Kalshi's test exchange is the source of truth for balance, orders, partial fills, fees, positions, and settlement.
-- **Live:** Real funds. Demo verification, reviewed limits, typed session arming, and a separate Automatic switch are required.
+- **Live:** Real funds. Demo verification, reviewed limits, two-click session arming, and a separate Automatic switch are required.
 
 Demo and Live default to a 100% eligible-funds cap, but strategy sizing and hard limits still keep individual orders smaller. Positions, resting buys, pending intents, fees, and reserved exposure all count against the cap.
 
 All exchange orders are price-limited and may fill partially. A kill switch blocks new submissions and attempts to cancel resting orders. After a restart or disconnect, the app reconciles with Kalshi and requires rearming.
 
 Stop-losses and the global profit take are app-managed in Demo and Live. They work only while the app is running, connected, authenticated, reconciled, and armed; execution is not guaranteed.
+
+## Mobile Monitor
+
+The read-only iPhone view shows To Beat, BTC Proxy, the Kalshi timer, Standard Edge readiness, and the latest 10 trades for the environment selected on the Mac.
+
+1. Install Tailscale on the Mac and iPhone, then enable **Settings → Mobile Monitor**.
+2. Click **Copy command**, paste it into Terminal, and press Return. The app uses the full CLI command required by Mac App Store installations.
+3. Terminal prints the private `https://…ts.net` address. Click **Refresh private URL**, open it in iPhone Safari, then choose **Share → Add to Home Screen → Open as Web App**.
+
+The monitor has no trading controls and exposes only a dedicated read-only port. The Mac must remain awake, running, and connected. See [Tailscale Serve setup](https://tailscale.com/docs/features/tailscale-serve).
 
 ## Download
 

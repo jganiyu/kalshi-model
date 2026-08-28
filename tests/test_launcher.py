@@ -43,8 +43,8 @@ def test_native_app_opens_window_and_stops_server(
     calls: list[tuple[str, object]] = []
 
     class FakeServer:
-        def __init__(self, host: str, port: int):
-            calls.append(("server", (host, port)))
+        def __init__(self, host: str, port: int, *args: object):
+            calls.append(("server", (host, port, *args)))
 
         def start(self) -> None:
             calls.append(("start", None))
@@ -64,6 +64,7 @@ def test_native_app_opens_window_and_stops_server(
             calls.append(("webview", kwargs))
 
     monkeypatch.setattr(launcher, "LocalAppServer", FakeServer)
+    monkeypatch.setattr(launcher, "find_available_port", lambda *_args: 8767)
     monkeypatch.setattr(launcher, "_load_webview", lambda: FakeWebview)
     monkeypatch.setattr(launcher, "credential_directory", lambda: tmp_path)
 
@@ -72,9 +73,14 @@ def test_native_app_opens_window_and_stops_server(
     assert calls[0] == ("server", ("127.0.0.1", 8765))
     assert calls[1] == ("start", None)
     assert calls[-1] == ("stop", None)
-    assert calls[2][0] == "window"
-    assert calls[2][1][0:2] == ("Kalshi Model", "http://127.0.0.1:8765")
-    assert calls[3] == (
+    assert calls[2] == (
+        "server",
+        ("127.0.0.1", 8767, "app.main:mobile_app", "kalshi-model-mobile-monitor"),
+    )
+    assert calls[3] == ("start", None)
+    assert calls[4][0] == "window"
+    assert calls[4][1][0:2] == ("Kalshi Model", "http://127.0.0.1:8765")
+    assert calls[5] == (
         "webview",
         {
             "gui": "cocoa",
@@ -90,7 +96,7 @@ def test_native_app_stops_server_when_window_fails(
     stopped = False
 
     class FakeServer:
-        def __init__(self, _host: str, _port: int):
+        def __init__(self, _host: str, _port: int, *_args: object):
             pass
 
         def start(self) -> None:
@@ -108,6 +114,7 @@ def test_native_app_stops_server_when_window_fails(
             raise RuntimeError("window failed")
 
     monkeypatch.setattr(launcher, "LocalAppServer", FakeServer)
+    monkeypatch.setattr(launcher, "find_available_port", lambda *_args: 8767)
     monkeypatch.setattr(launcher, "_load_webview", lambda: FailingWebview)
     monkeypatch.setattr(launcher, "credential_directory", lambda: tmp_path)
 

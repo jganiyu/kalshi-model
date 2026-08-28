@@ -398,6 +398,33 @@
               </form>
             </div>
           </section>
+          <section class="settings-section wide mobile-monitor-section">
+            <div class="section-heading">
+              <div><h3>Mobile Monitor</h3><p>Read-only HUD and recent trades for your iPhone.</p></div>
+              <strong class="credential-state" id="mobile-monitor-status">Disabled</strong>
+            </div>
+            <label class="toggle-row" for="mobile-monitor-enabled">
+              <span><strong>Enable mobile monitoring</strong><small>Starts the dedicated read-only local surface.</small></span>
+              <input id="mobile-monitor-enabled" type="checkbox"><i aria-hidden="true"></i>
+            </label>
+            <div class="mobile-monitor-details">
+              <div><span>Read-only port</span><strong id="mobile-monitor-port">--</strong></div>
+              <div><span>Local status</span><strong id="mobile-monitor-local-status">Disabled</strong></div>
+            </div>
+            <label class="credential-field" for="mobile-monitor-local-url"><span>Local URL</span><input id="mobile-monitor-local-url" type="text" readonly placeholder="Enable Mobile Monitor"></label>
+            <label class="credential-field" for="mobile-monitor-private-url"><span>Private Tailscale URL, when available</span><input id="mobile-monitor-private-url" type="text" readonly placeholder="Run Tailscale Serve first"></label>
+            <div class="button-row"><button class="secondary-button" id="refresh-mobile-monitor-url" type="button">Refresh private URL</button><button class="secondary-button" id="copy-mobile-monitor-url" type="button" disabled>Copy private URL</button></div>
+            <div class="mobile-monitor-guide">
+              <p>1. Open and sign in to Tailscale on this Mac and iPhone.</p>
+              <p>2. Copy this command, paste it into Terminal, and press Return:</p>
+              <code id="mobile-monitor-tailscale-command">TAILSCALE_BE_CLI=1 /Applications/Tailscale.app/Contents/MacOS/Tailscale serve --bg http://127.0.0.1:8767</code>
+              <div class="button-row"><button class="secondary-button" id="copy-mobile-monitor-command" type="button">Copy command</button></div>
+              <p>3. Terminal prints <code>Available within your tailnet: https://…ts.net</code>. Click <strong>Refresh private URL</strong> above to show it here. Open that HTTPS URL in Safari, then choose <strong>Share → Add to Home Screen → Open as Web App</strong>.</p>
+              <a href="https://tailscale.com/docs/features/tailscale-serve" target="_blank" rel="noopener noreferrer">Tailscale Serve setup</a>
+            </div>
+            <p class="risk-warning">The Mac must remain awake, running, connected, and signed in to Tailscale.</p>
+            <div id="mobile-monitor-result" class="inline-result" role="status" aria-live="polite" hidden></div>
+          </section>
           <section class="settings-section wide">
             <div class="section-heading"><div><h3>Local database</h3><p id="database-path">Loading</p></div><div class="button-row"><button class="secondary-button" id="run-bootstrap">Refresh history</button><button class="secondary-button" id="backup-database">Create backup</button></div></div>
             <div class="database-counts" id="database-counts"></div>

@@ -1557,7 +1557,7 @@ class AnalysisEngine:
                 "realized_pnl": trade.get("realized_pnl"),
                 "available_cash_after": trade.get("available_cash_after"),
             }
-            for trade in portfolio.get("trades", [])[:8]
+            for trade in portfolio.get("trades", [])[:10]
         ]
         return summary
 
