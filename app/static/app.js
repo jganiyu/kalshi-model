@@ -1531,7 +1531,7 @@ async function loadPaper() {
       statCard("Portfolio value", money(data.portfolio_value), `${data.open_positions || 0} open positions`),
       statCard("Allocated", money(data.allocated_capital), `${money(data.remaining_allocation)} remaining`),
       statCard("Resting orders", data.open_order_count || 0, `${money(data.allocation_cap)} cap`),
-      statCard("Actual fees", money(data.actual_fees, 4), "Confirmed fills"),
+      statCard("Actual fees", money(data.actual_fees, 4), "Account fill history"),
     ].join("");
   const trades = mode === "PAPER" ? data.trades || [] : data.ledger || [];
   $("#trade-table").innerHTML = trades.length ? trades.map((trade) => `

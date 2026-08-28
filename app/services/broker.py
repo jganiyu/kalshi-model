@@ -464,7 +464,7 @@ class KalshiBroker(Broker):
             (self.mode,),
         )
         settlements = {
-            (str(row.get("ticker")), str(row.get("side"))): row
+            str(row.get("ticker")): row
             for row in self.db.fetch_all(
                 "SELECT * FROM broker_settlements WHERE mode=?", (self.mode,)
             )
@@ -519,15 +519,26 @@ class KalshiBroker(Broker):
                     last_exit = row
 
             remaining_contracts = sum(lot[0] for lot in lots)
-            settlement = settlements.get(key)
+            settlement = settlements.get(key[0])
+            settlement_result = str(
+                (settlement or {}).get("market_result") or ""
+            ).upper()
             latest_buy = buys[-1]
             status = "OPEN"
             realized_pnl: float | None = None
             activity_at = latest_buy.get("filled_at")
             available_after = latest_buy.get("available_cash_after")
-            if settlement:
+            position_won: int | None = None
+            if (
+                settlement and remaining_contracts > 1e-9
+                and settlement_result in {"YES", "NO"}
+            ):
+                position_won = int(key[1] == settlement_result)
+                remaining_cost = sum(lot[0] * lot[1] for lot in lots)
+                payout = remaining_contracts if position_won else 0.0
+                realized += payout - remaining_cost
                 status = "SETTLED"
-                realized_pnl = _number(settlement.get("realized_pnl"))
+                realized_pnl = realized
                 activity_at = settlement.get("settled_at")
                 available_after = settlement.get("available_cash_after")
             elif remaining_contracts <= 1e-9:
@@ -547,6 +558,14 @@ class KalshiBroker(Broker):
                 str(row.get("strategy")) for row in buys if row.get("strategy")
             }
             sources = {str(row.get("source")) for row in buys if row.get("source")}
+            strategy = (
+                next(iter(strategies)) if len(strategies) == 1
+                else "MIXED" if strategies else "EXTERNAL"
+            )
+            source = (
+                next(iter(sources)) if len(sources) == 1
+                else "mixed" if sources else "external"
+            )
             ledger.append(
                 {
                     "ticker": key[0],
@@ -555,13 +574,13 @@ class KalshiBroker(Broker):
                     "activity_at": activity_at,
                     "price": entry_value / total_contracts,
                     "contracts": total_contracts,
-                    "strategy": next(iter(strategies)) if len(strategies) == 1 else "MIXED",
-                    "source": next(iter(sources)) if len(sources) == 1 else "mixed",
+                    "strategy": strategy,
+                    "source": source,
                     "status": status,
                     "realized_pnl": realized_pnl,
                     "available_cash_after": available_after,
                     "market_result": (settlement or {}).get("market_result"),
-                    "position_won": (settlement or {}).get("position_won"),
+                    "position_won": position_won,
                 }
             )
         return sorted(
@@ -1247,7 +1266,7 @@ class KalshiBroker(Broker):
             "SELECT * FROM broker_fills WHERE mode=? ORDER BY filled_at ASC", (self.mode,)
         )
         settlements = {
-            (str(row.get("ticker")), str(row.get("side"))): row
+            str(row.get("ticker")): row
             for row in self.db.fetch_all(
                 "SELECT * FROM broker_settlements WHERE mode=?", (self.mode,)
             )
@@ -1268,7 +1287,6 @@ class KalshiBroker(Broker):
             exit_value = 0.0
             exit_contracts = 0.0
             open_contracts = 0.0
-            settlement_fees = 0.0
             for key, group_rows in groups.items():
                 lots: deque[list[Any]] = deque()
                 group_realized = 0.0
@@ -1309,17 +1327,21 @@ class KalshiBroker(Broker):
                     last_exit_at = timestamp or last_exit_at
                     group_exit_sources.add(str(row.get("source") or "exit").upper())
                 remaining_contracts = sum(float(lot[0]) for lot in lots)
-                settlement = settlements.get(key)
-                if settlement and remaining_contracts > 1e-9:
-                    won = bool(settlement.get("position_won"))
+                settlement = settlements.get(key[0])
+                market_result = str(
+                    (settlement or {}).get("market_result") or ""
+                ).upper()
+                if (
+                    settlement and remaining_contracts > 1e-9
+                    and market_result in {"YES", "NO"}
+                ):
+                    won = key[1] == market_result
                     payout_price = 1.0 if won else 0.0
                     remaining_cost = sum(float(lot[0]) * float(lot[1]) for lot in lots)
-                    fee = _number(settlement.get("fees"))
-                    group_realized += remaining_contracts * payout_price - remaining_cost - fee
+                    group_realized += remaining_contracts * payout_price - remaining_cost
                     deployed += remaining_cost
                     exit_value += remaining_contracts * payout_price
                     exit_contracts += remaining_contracts
-                    settlement_fees += fee
                     group_exit_sources.add("SETTLEMENT")
                     last_exit_at = parse_time(settlement.get("settled_at")) or last_exit_at
                     lots.clear()
@@ -1355,9 +1377,7 @@ class KalshiBroker(Broker):
                 "wins": wins,
                 "win_rate": wins / completed if completed else None,
                 "realized_pnl": realized,
-                "actual_fees": (
-                    sum(_number(row.get("fee")) for row in rows) + settlement_fees
-                ),
+                "actual_fees": sum(_number(row.get("fee")) for row in rows),
                 "average_entry_price": (
                     entry_value / entry_contracts if entry_contracts else None
                 ),
@@ -1411,13 +1431,13 @@ class KalshiBroker(Broker):
             )
         if intent:
             return str(intent["side"]), str(intent["action"]), _number(intent["limit_price"])
-        outcome = str(order.get("outcome_side") or "").upper()
         action = str(order.get("action") or "").upper()
-        if outcome in {"YES", "NO"} and action in {"BUY", "SELL"}:
+        legacy_side = str(order.get("side") or "").upper()
+        if legacy_side in {"YES", "NO"} and action in {"BUY", "SELL"}:
             direct_price = order.get(
-                "yes_price_dollars" if outcome == "YES" else "no_price_dollars"
+                "yes_price_dollars" if legacy_side == "YES" else "no_price_dollars"
             )
-            outcome_price = _number(
+            contract_price = _number(
                 order.get("outcome_price") or direct_price
             )
             if direct_price in (None, "") and not order.get("outcome_price"):
@@ -1426,15 +1446,21 @@ class KalshiBroker(Broker):
                     or order.get("price_dollars")
                     or order.get("yes_price_dollars")
                 )
-                outcome_price = 1.0 - book_price if outcome == "NO" else book_price
-            return outcome, action, round(outcome_price, 4)
-        legacy_outcome = str(order.get("side") or "").upper()
-        if legacy_outcome in {"YES", "NO"} and action in {"BUY", "SELL"}:
+                contract_price = (
+                    1.0 - book_price if legacy_side == "NO" else book_price
+                )
+            return legacy_side, action, round(contract_price, 4)
+        outcome = str(order.get("outcome_side") or "").upper()
+        if outcome in {"YES", "NO"} and action in {"BUY", "SELL"}:
+            contract_side = (
+                outcome if action == "BUY"
+                else "NO" if outcome == "YES" else "YES"
+            )
             direct_price = order.get(
                 "yes_price_dollars"
-                if legacy_outcome == "YES" else "no_price_dollars"
+                if contract_side == "YES" else "no_price_dollars"
             )
-            return legacy_outcome, action, round(_number(direct_price), 4)
+            return contract_side, action, round(_number(direct_price), 4)
         book_side = str(order.get("book_side") or order.get("side") or "bid")
         book_price = _number(
             order.get("price") or order.get("price_dollars") or order.get("yes_price_dollars")
@@ -1560,11 +1586,22 @@ class KalshiBroker(Broker):
         ) if client_id else None
         self.db.execute(
             """
-            INSERT OR IGNORE INTO broker_fills(
+            INSERT INTO broker_fills(
                 mode,fill_id,exchange_order_id,client_order_id,ticker,side,action,
                 contracts,price,fee,strategy,source,filled_at,raw_json,
                 available_cash_after
             ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(mode,fill_id) DO UPDATE SET
+                exchange_order_id=excluded.exchange_order_id,
+                client_order_id=COALESCE(excluded.client_order_id,broker_fills.client_order_id),
+                ticker=excluded.ticker,side=excluded.side,action=excluded.action,
+                contracts=excluded.contracts,price=excluded.price,fee=excluded.fee,
+                strategy=COALESCE(excluded.strategy,broker_fills.strategy),
+                source=COALESCE(excluded.source,broker_fills.source),
+                filled_at=excluded.filled_at,raw_json=excluded.raw_json,
+                available_cash_after=COALESCE(
+                    excluded.available_cash_after,broker_fills.available_cash_after
+                )
             """,
             (
                 self.mode, fill_id, exchange_id, client_id,
@@ -1590,12 +1627,26 @@ class KalshiBroker(Broker):
                 (self.mode, exchange_id),
             )
             order_row = self.db.fetch_one(
-                "SELECT requested_contracts FROM broker_orders WHERE mode=? AND exchange_order_id=?",
+                """
+                SELECT requested_contracts,remaining_contracts,status,updated_at
+                FROM broker_orders WHERE mode=? AND exchange_order_id=?
+                """,
                 (self.mode, exchange_id),
             ) or {}
             requested = _number(order_row.get("requested_contracts"))
             aggregate = fill_aggregate(fill_rows, requested)
-            status = str(aggregate["status"])
+            authoritative_status = str(order_row.get("status") or "")
+            terminal = authoritative_status in FINAL_ORDER_STATES
+            status = authoritative_status if terminal else str(aggregate["status"])
+            remaining_contracts = (
+                _number(order_row.get("remaining_contracts"))
+                if terminal else aggregate["remaining_contracts"]
+            )
+            order_updated_at = (
+                order_row.get("updated_at")
+                if terminal
+                else fill.get("created_time") or fill.get("filled_at") or iso_now()
+            )
             self.db.execute(
                 """
                 UPDATE broker_orders SET filled_contracts=?,remaining_contracts=?,
@@ -1603,8 +1654,9 @@ class KalshiBroker(Broker):
                 WHERE mode=? AND exchange_order_id=?
                 """,
                 (
-                    aggregate["filled_contracts"], aggregate["remaining_contracts"],
-                    aggregate["average_fill_price"], aggregate["fees"], status, iso_now(),
+                    aggregate["filled_contracts"], remaining_contracts,
+                    aggregate["average_fill_price"], aggregate["fees"], status,
+                    order_updated_at,
                     self.mode, exchange_id,
                 ),
             )
@@ -1718,11 +1770,12 @@ class KalshiBroker(Broker):
         market_result = str(
             settlement.get("market_result") or settlement.get("result") or ""
         ).upper() or None
-        yes_count = _number(settlement.get("yes_count_fp") or settlement.get("yes_count"))
-        no_count = _number(settlement.get("no_count_fp") or settlement.get("no_count"))
-        side = str(position.get("side") or "") or (
-            "YES" if yes_count > 0 else "NO" if no_count > 0 else None
+        settled_at = str(
+            settlement.get("settled_time")
+            or settlement.get("settled_at")
+            or iso_now()
         )
+        side = str(position.get("side") or "") or None
         position_won = None
         if side in {"YES", "NO"} and market_result in {"YES", "NO"}:
             position_won = int(side == market_result)
@@ -1740,10 +1793,11 @@ class KalshiBroker(Broker):
             settlement.get("yes_total_cost_dollars")
             if side == "YES" else settlement.get("no_total_cost_dollars")
         )
+        explicit_realized = settlement.get("realized_pnl_dollars")
         realized = (
             _number(settlement.get("realized_pnl_dollars"))
-            if settlement.get("realized_pnl_dollars") not in (None, "")
-            else revenue - cost - fee
+            if explicit_realized not in (None, "")
+            else revenue - cost - fee if side in {"YES", "NO"} else None
         )
         self.db.execute(
             """
@@ -1762,7 +1816,7 @@ class KalshiBroker(Broker):
             """,
             (
                 self.mode, ticker, side,
-                str(settlement.get("settled_time") or settlement.get("settled_at") or iso_now()),
+                settled_at,
                 market_result, position_won, realized,
                 fee, _safe_json(settlement), available_cash_after,
             ),
@@ -1772,21 +1826,21 @@ class KalshiBroker(Broker):
             UPDATE broker_positions SET market_result=?,position_won=?,realized_pnl=?,
                 status='settled',updated_at=? WHERE mode=? AND ticker=?
             """,
-            (market_result, position_won, realized, iso_now(), self.mode, ticker),
+            (market_result, position_won, realized, settled_at, self.mode, ticker),
         )
         self.db.execute(
             """
             UPDATE broker_order_intents SET status='SETTLED',updated_at=?
             WHERE mode=? AND ticker=? AND action='BUY' AND status='FILLED'
             """,
-            (iso_now(), self.mode, ticker),
+            (settled_at, self.mode, ticker),
         )
         self.db.execute(
             """
-            UPDATE broker_orders SET status='SETTLED',updated_at=?
+            UPDATE broker_orders SET status='SETTLED',remaining_contracts=0,updated_at=?
             WHERE mode=? AND ticker=? AND action='BUY' AND status='FILLED'
             """,
-            (iso_now(), self.mode, ticker),
+            (settled_at, self.mode, ticker),
         )
         if not previous_settlement or any(
             previous_settlement.get(key) != value

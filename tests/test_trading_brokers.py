@@ -966,6 +966,109 @@ def test_fill_aggregate_supports_partial_exit_without_double_counting() -> None:
     assert first["remaining_contracts"] == pytest.approx(3)
 
 
+@run_async
+async def test_reconcile_preserves_authoritative_canceled_partial_order(
+    tmp_path: Path,
+) -> None:
+    db = make_db(tmp_path)
+    client = FakeTradingClient()
+    client.remote_orders = [{
+        "order_id": "canceled-partial", "ticker": "OLD", "action": "buy",
+        "side": "yes", "outcome_side": "yes", "book_side": "bid",
+        "status": "canceled", "initial_count_fp": "10.00",
+        "fill_count_fp": "4.00", "remaining_count_fp": "0.00",
+        "yes_price_dollars": "0.4000", "no_price_dollars": "0.6000",
+        "last_update_time": "2026-08-01T00:00:00Z",
+    }]
+    client.remote_fills = [{
+        "fill_id": "partial-fill", "order_id": "canceled-partial",
+        "ticker": "OLD", "action": "buy", "side": "yes",
+        "outcome_side": "yes", "book_side": "bid", "count_fp": "4.00",
+        "yes_price_dollars": "0.4000", "no_price_dollars": "0.6000",
+    }]
+    broker = KalshiBroker("LIVE", db, client)  # type: ignore[arg-type]
+
+    portfolio = await broker.reconcile()
+
+    order = db.fetch_one(
+        "SELECT * FROM broker_orders WHERE exchange_order_id='canceled-partial'"
+    )
+    assert order and order["status"] == "CANCELED"
+    assert order["remaining_contracts"] == pytest.approx(0)
+    assert order["updated_at"] == "2026-08-01T00:00:00Z"
+    assert portfolio["open_order_count"] == 0
+    assert portfolio["allocated_capital"] == pytest.approx(0)
+
+
+@run_async
+async def test_reconcile_pairs_external_closing_fill_with_original_contract_side(
+    tmp_path: Path,
+) -> None:
+    db = make_db(tmp_path)
+    client = FakeTradingClient()
+    client.remote_orders = [
+        {
+            "order_id": "entry", "ticker": "ROUND-TRIP", "action": "buy",
+            "side": "yes", "outcome_side": "yes", "book_side": "bid",
+            "status": "executed", "initial_count_fp": "10.00",
+            "fill_count_fp": "10.00", "remaining_count_fp": "0.00",
+            "yes_price_dollars": "0.1500", "no_price_dollars": "0.8500",
+            "created_time": "2026-08-01T00:00:00Z",
+            "last_update_time": "2026-08-01T00:01:00Z",
+        },
+        {
+            "order_id": "exit", "ticker": "ROUND-TRIP", "action": "sell",
+            "side": "yes", "outcome_side": "no", "book_side": "ask",
+            "status": "executed", "initial_count_fp": "10.00",
+            "fill_count_fp": "10.00", "remaining_count_fp": "0.00",
+            "yes_price_dollars": "0.1100", "no_price_dollars": "0.8900",
+            "created_time": "2026-08-02T00:00:00Z",
+            "last_update_time": "2026-08-02T00:01:00Z",
+        },
+    ]
+    client.remote_fills = [
+        {
+            "fill_id": "entry-fill", "order_id": "entry", "ticker": "ROUND-TRIP",
+            "action": "buy", "side": "yes", "outcome_side": "yes",
+            "book_side": "bid", "count_fp": "10.00",
+            "yes_price_dollars": "0.1500", "no_price_dollars": "0.8500",
+            "fee_cost_dollars": "0.0100", "created_time": "2026-08-01T00:00:00Z",
+        },
+        {
+            "fill_id": "exit-fill", "order_id": "exit", "ticker": "ROUND-TRIP",
+            "action": "sell", "side": "yes", "outcome_side": "no",
+            "book_side": "ask", "count_fp": "10.00",
+            "yes_price_dollars": "0.1100", "no_price_dollars": "0.8900",
+            "fee_cost_dollars": "0.0200", "created_time": "2026-08-02T00:00:00Z",
+        },
+    ]
+    client.remote_settlements = [{
+        "ticker": "ROUND-TRIP", "market_result": "no",
+        "yes_count_fp": "10.00", "no_count_fp": "10.00",
+        "settled_time": "2026-08-03T00:00:00Z",
+    }]
+    broker = KalshiBroker("LIVE", db, client)  # type: ignore[arg-type]
+
+    await broker.reconcile()
+    ledger = broker.trade_ledger()
+
+    assert len(ledger) == 1
+    assert ledger[0]["side"] == "YES"
+    assert ledger[0]["status"] == "CLOSED"
+    assert ledger[0]["strategy"] == "EXTERNAL"
+    assert ledger[0]["source"] == "external"
+    assert ledger[0]["realized_pnl"] == pytest.approx(-0.43)
+    assert ledger[0]["position_won"] is None
+    entry = db.fetch_one(
+        "SELECT updated_at FROM broker_orders WHERE exchange_order_id='entry'"
+    )
+    exit_order = db.fetch_one(
+        "SELECT updated_at FROM broker_orders WHERE exchange_order_id='exit'"
+    )
+    assert entry and entry["updated_at"] == "2026-08-03T00:00:00Z"
+    assert exit_order and exit_order["updated_at"] == "2026-08-02T00:01:00Z"
+
+
 def test_exchange_strategy_ledger_counts_winning_down_settlement(tmp_path: Path) -> None:
     db = make_db(tmp_path)
     broker = KalshiBroker("DEMO", db, FakeTradingClient())  # type: ignore[arg-type]
@@ -984,7 +1087,7 @@ def test_exchange_strategy_ledger_counts_winning_down_settlement(tmp_path: Path)
         """
         INSERT INTO broker_settlements(
             mode,ticker,side,settled_at,market_result,position_won,realized_pnl,fees,raw_json
-        ) VALUES ('DEMO','DOWN-WIN','NO',?,'NO',1,7.98,0,'{}')
+        ) VALUES ('DEMO','DOWN-WIN','NO',?,'NO',1,7.98,.02,'{}')
         """,
         (now,),
     )
@@ -993,6 +1096,7 @@ def test_exchange_strategy_ledger_counts_winning_down_settlement(tmp_path: Path)
     assert result["wins"] == 1
     assert result["win_rate"] == pytest.approx(1.0)
     assert result["realized_pnl"] == pytest.approx(7.98)
+    assert result["actual_fees"] == pytest.approx(.02)
 
 
 def test_exchange_trade_ledger_aggregates_settlement_and_available_cash(
@@ -1017,7 +1121,7 @@ def test_exchange_trade_ledger_aggregates_settlement_and_available_cash(
         INSERT INTO broker_settlements(
             mode,ticker,side,settled_at,market_result,position_won,realized_pnl,
             fees,raw_json,available_cash_after
-        ) VALUES ('DEMO','SETTLED','NO','2026-08-28T04:00:18Z','YES',0,-1.095,
+        ) VALUES ('DEMO','SETTLED','YES','2026-08-28T04:00:18Z','YES',0,-1.095,
                   .035,'{}',98.905)
         """
     )
