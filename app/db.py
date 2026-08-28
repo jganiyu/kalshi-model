@@ -556,6 +556,37 @@ MIGRATIONS: list[tuple[int, str]] = [
             ON broker_audit_events(mode, created_at);
         """,
     ),
+    (
+        12,
+        """
+        ALTER TABLE broker_fills ADD COLUMN available_cash_after REAL;
+        ALTER TABLE broker_settlements ADD COLUMN available_cash_after REAL;
+
+        UPDATE broker_fills
+        SET available_cash_after = (
+            SELECT snapshot.available_balance
+            FROM broker_account_snapshots AS snapshot
+            WHERE snapshot.mode=broker_fills.mode
+              AND julianday(snapshot.observed_at) >= julianday(broker_fills.filled_at)
+              AND (julianday(snapshot.observed_at)-julianday(broker_fills.filled_at))*86400 <= 30
+            ORDER BY julianday(snapshot.observed_at) ASC, snapshot.id ASC
+            LIMIT 1
+        )
+        WHERE available_cash_after IS NULL;
+
+        UPDATE broker_settlements
+        SET available_cash_after = (
+            SELECT snapshot.available_balance
+            FROM broker_account_snapshots AS snapshot
+            WHERE snapshot.mode=broker_settlements.mode
+              AND julianday(snapshot.observed_at) >= julianday(broker_settlements.settled_at)
+              AND (julianday(snapshot.observed_at)-julianday(broker_settlements.settled_at))*86400 <= 30
+            ORDER BY julianday(snapshot.observed_at) ASC, snapshot.id ASC
+            LIMIT 1
+        )
+        WHERE available_cash_after IS NULL;
+        """,
+    ),
 ]
 
 

@@ -5,6 +5,7 @@ import base64
 import logging
 import os
 import time
+from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -26,6 +27,58 @@ class KalshiTradingError(RuntimeError):
 
 class AmbiguousSubmissionError(KalshiTradingError):
     """The request may have reached Kalshi and must be reconciled before retrying."""
+
+
+def normalize_order_price(
+    outcome_price: float,
+    action: str,
+    *,
+    side: str = "YES",
+    price_ranges: list[dict[str, Any]] | None = None,
+) -> float:
+    """Return a Kalshi-valid limit using the market's variable tick schedule."""
+    verb = str(action).upper()
+    outcome = str(side).upper()
+    if verb not in {"BUY", "SELL"} or outcome not in {"YES", "NO"}:
+        raise ValueError("Order side or action is invalid.")
+    price = Decimal(str(outcome_price))
+    if not price.is_finite() or not Decimal("0") < price < Decimal("1"):
+        raise ValueError("Limit price must be between 0 and 1 dollar.")
+    book_side = "bid" if (outcome == "YES") == (verb == "BUY") else "ask"
+    book_price = price if outcome == "YES" else Decimal("1") - price
+    ranges: list[tuple[Decimal, Decimal, Decimal]] = []
+    for raw in price_ranges or []:
+        try:
+            start = Decimal(str(raw.get("start")))
+            end = Decimal(str(raw.get("end")))
+            step = Decimal(str(raw.get("step")))
+        except Exception:
+            continue
+        if start.is_finite() and end.is_finite() and step > 0 and start < end:
+            ranges.append((start, end, step))
+    ranges.sort(key=lambda item: item[0])
+    if not ranges:
+        ranges = [(Decimal("0"), Decimal("1"), Decimal("0.01"))]
+    selected = ranges[-1]
+    for index, candidate in enumerate(ranges):
+        start, end, _ = candidate
+        if start <= book_price < end or (
+            index == len(ranges) - 1 and book_price == end
+        ):
+            selected = candidate
+            break
+    start, _, step = selected
+    steps = ((book_price - start) / step).to_integral_value(
+        rounding=ROUND_CEILING if book_side == "bid" else ROUND_FLOOR
+    )
+    rounded_book = start + steps * step
+    minimum = ranges[0][0] + ranges[0][2]
+    maximum = ranges[-1][1] - ranges[-1][2]
+    rounded_book = min(maximum, max(minimum, rounded_book))
+    rounded_outcome = (
+        rounded_book if outcome == "YES" else Decimal("1") - rounded_book
+    )
+    return float(rounded_outcome)
 
 
 def signed_headers(
@@ -62,8 +115,8 @@ def outcome_to_book(side: str, action: str, outcome_price: float) -> tuple[str, 
     verb = str(action).upper()
     if outcome not in {"YES", "NO"} or verb not in {"BUY", "SELL"}:
         raise ValueError("Order side and action are invalid.")
-    if not 0.01 <= float(outcome_price) <= 0.99:
-        raise ValueError("Limit price must be between 1 and 99 cents.")
+    if not 0 < float(outcome_price) < 1:
+        raise ValueError("Limit price must be between 0 and 1 dollar.")
     book_side = "bid" if (outcome == "YES") == (verb == "BUY") else "ask"
     book_price = float(outcome_price) if outcome == "YES" else 1.0 - float(outcome_price)
     return book_side, round(book_price, 4)
@@ -264,6 +317,7 @@ class KalshiTradingClient:
         reduce_only: bool = False,
         post_only: bool = False,
         live_authorized: bool = False,
+        price_ranges: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         if self.environment == "LIVE" and not live_authorized:
             raise KalshiTradingError("Live order submission is not armed.")
@@ -271,7 +325,10 @@ class KalshiTradingClient:
             raise KalshiTradingError("Production orders are disabled during tests.")
         if int(contracts) < 1:
             raise ValueError("Contracts must be a positive whole number.")
-        book_side, book_price = outcome_to_book(side, action, limit_price)
+        normalized_price = normalize_order_price(
+            limit_price, action, side=side, price_ranges=price_ranges
+        )
+        book_side, book_price = outcome_to_book(side, action, normalized_price)
         payload = {
             "ticker": ticker,
             "client_order_id": client_order_id,

@@ -642,6 +642,74 @@ def test_market_summary_preserves_exchange_routing_index(tmp_path: Path) -> None
     assert summary and summary["exchange_index"] == 2
 
 
+def test_demo_execution_state_uses_demo_book_without_live_fallback(
+    tmp_path: Path,
+) -> None:
+    class DemoPublicClient:
+        async def market(self, ticker: str) -> dict:
+            return {
+                "ticker": ticker,
+                "liquidity_dollars": "2.00",
+                "yes_bid_dollars": "0.0000",
+                "yes_ask_dollars": "1.0000",
+                "no_bid_dollars": "0.0000",
+                "no_ask_dollars": "1.0000",
+            }
+
+        async def orderbook(self, ticker: str) -> dict:
+            return {
+                "orderbook_fp": {
+                    "no_dollars": [["0.5000", "2"], ["0.7600", "6"]],
+                    "yes_dollars": [],
+                }
+            }
+
+    db = make_db(tmp_path)
+    db.update_settings({"trading_mode": "DEMO"})
+    engine = AnalysisEngine(AppConfig(database_path=db.path), db)
+    engine.kalshi_demo = DemoPublicClient()  # type: ignore[assignment]
+    market = {
+        "ticker": "KXBTC15M-DEMO",
+        "price_ranges": [{"start": "0.0000", "end": "1.0000", "step": "0.0100"}],
+    }
+    live_state = {
+        "ticker": market["ticker"],
+        "yes_bid": 0.32,
+        "yes_ask": 0.34,
+        "no_bid": 0.66,
+        "no_ask": 0.68,
+    }
+
+    state = asyncio.run(
+        engine._execution_state_for(
+            market, live_state, "2026-08-24T12:00:00+00:00"
+        )
+    )
+
+    assert state["execution_market_mode"] == "DEMO"
+    assert state["yes_bid"] is None
+    assert state["no_ask"] is None
+    assert state["no_bid"] == pytest.approx(0.76)
+    assert state["yes_ask"] == pytest.approx(0.24)
+
+
+def test_paper_execution_state_keeps_live_book(tmp_path: Path) -> None:
+    db = make_db(tmp_path)
+    engine = AnalysisEngine(AppConfig(database_path=db.path), db)
+    live_state = {"ticker": "KXBTC15M-LIVE", "yes_bid": 0.48, "yes_ask": 0.49}
+
+    state = asyncio.run(
+        engine._execution_state_for(
+            {"ticker": "KXBTC15M-LIVE"},
+            live_state,
+            "2026-08-24T12:00:00+00:00",
+        )
+    )
+
+    assert state["yes_ask"] == pytest.approx(0.49)
+    assert state["execution_market_mode"] == "LIVE"
+
+
 def test_lifecycle_created_event_records_early_threshold(tmp_path: Path) -> None:
     db = make_db(tmp_path)
     engine = AnalysisEngine(AppConfig(database_path=db.path), db)
@@ -721,6 +789,7 @@ def test_dashboard_markup_has_one_book_and_paper_trade_history() -> None:
     assert "up-orderbook-rows" not in markup
     assert "down-orderbook-rows" not in markup
     assert 'id="recent-paper-trades"' in markup
+    assert 'id="orderbook-environment-label"' in markup
     assert 'id="standard-edge-hud"' in markup
     assert 'id="standard-edge-confirmation-track"' in markup
     assert 'id="standard-edge-quality-gate"' in markup
@@ -731,4 +800,5 @@ def test_dashboard_markup_has_one_book_and_paper_trade_history() -> None:
     assert "v=0.4.1" not in markup
     assert "recent_paper_trades" in script
     assert "standard_edge_readiness" in script
+    assert 'current?.execution_market_mode || "LIVE"' in script
     assert 'api("/api/model-side"' not in script

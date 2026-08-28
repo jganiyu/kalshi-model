@@ -23,12 +23,28 @@ from app.services.broker import (
     normalize_mode,
 )
 from app.services.credentials import resolve_trading_credentials
-from app.services.kalshi_trading import KalshiTradingClient, KalshiTradingError
+from app.services.kalshi_trading import (
+    KalshiTradingClient,
+    KalshiTradingError,
+    normalize_order_price,
+)
 from app.services.paper import PaperTradingService
 from app.services.streaming import KalshiPrivateWebSocketFeed
 
 
 _USE_DEFAULT_STOP = object()
+
+
+def manual_market_quality(
+    current: dict[str, Any], assessment: dict[str, Any]
+) -> tuple[bool, str]:
+    """Keep feed reliability separate from immediate order-book executability."""
+    quality = current.get("data_quality")
+    if isinstance(quality, dict):
+        reliable = bool(quality.get("reliable"))
+    else:
+        reliable = bool(assessment.get("data_reliable"))
+    return reliable, "High" if reliable else "Low"
 
 
 def protective_exit_reason(
@@ -188,22 +204,7 @@ class TradingCoordinator:
                 broker.disarm("Private stream reconciliation failed.")
 
         async def on_status(_: str, connected: bool, error: str | None) -> None:
-            broker._update_mode_state(  # One controlled owner for connection state.
-                connected=connected,
-                reconciliation_required=True,
-                reconciled=False,
-                last_error=error,
-            )
-            if not connected:
-                broker.disarm("Private trading stream disconnected.")
-                return
-            # A new socket is not proof of complete state. REST must reconcile the
-            # account before either manual or automatic submissions are allowed.
-            broker.disarm("Private trading stream reconnected; session rearming is required.")
-            try:
-                await broker.reconcile()
-            except (KalshiTradingError, ValueError):
-                broker.disarm("Private stream reconciliation failed.")
+            await self._handle_private_stream_status(mode, connected, error)
 
         feed = KalshiPrivateWebSocketFeed(
             ws_url,
@@ -214,6 +215,42 @@ class TradingCoordinator:
             on_status,
         )
         self._private_streams[mode] = asyncio.create_task(feed.run())
+
+    async def _handle_private_stream_status(
+        self,
+        mode: str,
+        connected: bool,
+        error: str | None,
+    ) -> None:
+        broker = self.brokers[mode]
+        assert isinstance(broker, KalshiBroker)
+        broker._update_mode_state(  # One controlled owner for connection state.
+            connected=connected,
+            reconciliation_required=True,
+            reconciled=False,
+            last_error=error,
+        )
+        if not connected:
+            broker._audit(
+                "PRIVATE_STREAM_PAUSED",
+                {
+                    "reason": error or "Private trading stream disconnected.",
+                    "automatic_will_resume": broker.automatic_armed,
+                },
+            )
+            return
+        # A new socket is not proof of complete state. REST reconciliation keeps
+        # submissions blocked until the exchange account is authoritative again.
+        try:
+            await broker.reconcile()
+        except (KalshiTradingError, ValueError):
+            broker.disarm("Private stream reconciliation failed.")
+            return
+        if broker.session_armed:
+            broker._audit(
+                "PRIVATE_STREAM_RESUMED",
+                {"automatic_resumed": broker.automatic_armed},
+            )
 
     def _start_reconciliation_loop(self, mode: str) -> None:
         if mode in self._reconciliation_tasks:
@@ -387,15 +424,22 @@ class TradingCoordinator:
         assessment = (current.get("trade_assessments") or {}).get(side) or {}
         economics = assessment.get(action.lower()) or {}
         raw_limit = payload.get("limit_price_cents")
-        if raw_limit not in (None, ""):
+        custom_limit = raw_limit not in (None, "")
+        if custom_limit:
             try:
                 limit_price = float(raw_limit) / 100.0
             except (TypeError, ValueError) as exc:
                 raise ValueError("Enter a valid limit price in cents.") from exc
         else:
             limit_price = economics.get("executable_price")
-        if limit_price is None or not 0.01 <= float(limit_price) <= 0.99:
+        if limit_price is None or not 0 < float(limit_price) < 1:
             raise ValueError("An explicit worst acceptable price is required.")
+        limit_price = normalize_order_price(
+            float(limit_price),
+            action,
+            side=side,
+            price_ranges=assessment.get("price_ranges"),
+        )
         raw_contracts = payload.get("contracts")
         if raw_contracts not in (None, ""):
             try:
@@ -416,6 +460,7 @@ class TradingCoordinator:
                 raise ValueError("The amount is too small for one contract.")
         stop = payload.get("stop_loss_cents")
         stop_price = None if stop in (None, "", 0, "0") else float(stop) / 100
+        data_reliable, data_quality = manual_market_quality(current, assessment)
         intent = OrderIntent(
             mode=normalized,
             ticker=str(current.get("ticker") or ""),
@@ -425,19 +470,19 @@ class TradingCoordinator:
             limit_price=float(limit_price),
             strategy="MANUAL",
             source="manual",
+            price_ranges=assessment.get("price_ranges"),
             stop_loss_price=stop_price,
             decision_snapshot={
                 "forecast": current.get("forecast"),
                 "assessment": assessment,
                 "observed_at": current.get("observed_at"),
+                "custom_limit": custom_limit,
             },
             risk_snapshot={
-                "spread": assessment.get("spread"),
-                "liquidity": assessment.get("ask_size"),
-                "data_quality": (current.get("trade_decisions") or {}).get(side, {}).get("confidence"),
-                "data_reliable": bool(
-                    assessment.get("data_reliable") and assessment.get("trade_allowed")
-                ),
+                "spread": None if custom_limit else assessment.get("spread"),
+                "liquidity": None if custom_limit else assessment.get("ask_size"),
+                "data_quality": data_quality,
+                "data_reliable": data_reliable,
                 "market_open": str(current.get("status") or "").lower()
                 in {"active", "open"},
                 "exchange_index": current.get("exchange_index"),
@@ -445,12 +490,10 @@ class TradingCoordinator:
         )
         risk = broker.risk_check(
             intent,
-            spread=assessment.get("spread"),
-            liquidity=assessment.get("ask_size"),
-            data_quality=(current.get("trade_decisions") or {}).get(side, {}).get("confidence"),
-            data_reliable=bool(
-                assessment.get("data_reliable") and assessment.get("trade_allowed")
-            ),
+            spread=None if custom_limit else assessment.get("spread"),
+            liquidity=None if custom_limit else assessment.get("ask_size"),
+            data_quality=data_quality,
+            data_reliable=data_reliable,
             market_open=str(current.get("status") or "").lower() in {"active", "open"},
         )
         token = secrets.token_urlsafe(24)
@@ -496,18 +539,15 @@ class TradingCoordinator:
             if str(current.get("ticker") or "") != intent.ticker:
                 raise ValueError("The market changed. Review the order again.")
             assessment = (current.get("trade_assessments") or {}).get(intent.side) or {}
+            data_reliable, data_quality = manual_market_quality(current, assessment)
+            custom_limit = bool(intent.decision_snapshot.get("custom_limit"))
             intent = replace(
                 intent,
                 risk_snapshot={
-                    "spread": assessment.get("spread"),
-                    "liquidity": assessment.get("ask_size"),
-                    "data_quality": (current.get("trade_decisions") or {}).get(
-                        intent.side, {}
-                    ).get("confidence"),
-                    "data_reliable": bool(
-                        assessment.get("data_reliable")
-                        and assessment.get("trade_allowed")
-                    ),
+                    "spread": None if custom_limit else assessment.get("spread"),
+                    "liquidity": None if custom_limit else assessment.get("ask_size"),
+                    "data_quality": data_quality,
+                    "data_reliable": data_reliable,
                     "market_open": str(current.get("status") or "").lower()
                     in {"active", "open"},
                     "exchange_index": current.get("exchange_index"),
@@ -582,6 +622,12 @@ class TradingCoordinator:
             current_bankroll * effective,
             remaining_allocation,
         )
+        price = normalize_order_price(
+            float(price),
+            "BUY",
+            side=side,
+            price_ranges=assessment.get("price_ranges"),
+        )
         unit = float(price) + kalshi_fee(float(price))
         if (
             exchange_index is not None
@@ -617,6 +663,7 @@ class TradingCoordinator:
             limit_price=float(price),
             strategy=strategy,
             source="automatic",
+            price_ranges=assessment.get("price_ranges"),
             stop_loss_price=stop_price,
             target_exit_price=target_exit_price,
             fallback_exit_mode=fallback_exit_mode,
@@ -882,6 +929,7 @@ class TradingCoordinator:
                 limit_price=max(0.01, bid - slippage),
                 strategy=str(position.get("strategy") or "MANUAL"),
                 source=reason.lower(),
+                price_ranges=current.get("price_ranges"),
                 decision_snapshot={"trigger": reason, "executable_bid": bid, "priority": priority},
             )
             self._pending_exit_keys.add(pending_key)

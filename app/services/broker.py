@@ -18,6 +18,7 @@ from app.services.kalshi_trading import (
     KalshiTradingClient,
     KalshiTradingError,
     book_to_outcome,
+    normalize_order_price,
 )
 from app.services.paper import PaperTradingService
 
@@ -54,6 +55,7 @@ class OrderIntent:
     source: str
     client_order_id: str = field(default_factory=lambda: str(uuid.uuid4()))
     post_only: bool = False
+    price_ranges: list[dict[str, Any]] | None = None
     stop_loss_price: float | None = None
     target_exit_price: float | None = None
     fallback_exit_mode: str | None = None
@@ -74,8 +76,16 @@ class OrderIntent:
             raise ValueError("Choose Buy or Sell.")
         if isinstance(self.contracts, bool) or int(self.contracts) < 1:
             raise ValueError("Contracts must be a positive whole number.")
-        if not 0.01 <= float(self.limit_price) <= 0.99:
-            raise ValueError("Limit price must be between 1 and 99 cents.")
+        object.__setattr__(
+            self,
+            "limit_price",
+            normalize_order_price(
+                float(self.limit_price),
+                self.action,
+                side=self.side,
+                price_ranges=self.price_ranges,
+            ),
+        )
 
 
 class Broker(abc.ABC):
@@ -400,6 +410,7 @@ class KalshiBroker(Broker):
             "orders": orders,
             "open_orders": open_orders,
             "fills": fills,
+            "ledger": self.trade_ledger(),
             "intents": intents,
             "settlements": settlements,
             "open_positions": len(positions),
@@ -446,6 +457,118 @@ class KalshiBroker(Broker):
                 ),
             },
         }
+
+    def trade_ledger(self) -> list[dict[str, Any]]:
+        fills = self.db.fetch_all(
+            "SELECT * FROM broker_fills WHERE mode=? ORDER BY filled_at ASC,id ASC",
+            (self.mode,),
+        )
+        settlements = {
+            (str(row.get("ticker")), str(row.get("side"))): row
+            for row in self.db.fetch_all(
+                "SELECT * FROM broker_settlements WHERE mode=?", (self.mode,)
+            )
+        }
+        grouped: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
+        for fill in fills:
+            grouped[(str(fill.get("ticker")), str(fill.get("side")))].append(fill)
+
+        ledger: list[dict[str, Any]] = []
+        for key, rows in grouped.items():
+            buys = [row for row in rows if row.get("action") == "BUY"]
+            if not buys:
+                continue
+            total_contracts = sum(_number(row.get("contracts")) for row in buys)
+            if total_contracts <= 0:
+                continue
+            entry_value = sum(
+                _number(row.get("contracts")) * _number(row.get("price"))
+                for row in buys
+            )
+            lots: deque[list[float]] = deque()
+            realized = 0.0
+            last_exit: dict[str, Any] | None = None
+            for row in rows:
+                quantity = max(0.0, _number(row.get("contracts")))
+                if quantity <= 0:
+                    continue
+                fee = _number(row.get("fee"))
+                if row.get("action") == "BUY":
+                    lots.append(
+                        [quantity, _number(row.get("price")) + fee / quantity]
+                    )
+                    continue
+                remaining = quantity
+                matched_cost = 0.0
+                matched = 0.0
+                while remaining > 1e-9 and lots:
+                    lot = lots[0]
+                    take = min(remaining, lot[0])
+                    matched += take
+                    matched_cost += take * lot[1]
+                    lot[0] -= take
+                    remaining -= take
+                    if lot[0] <= 1e-9:
+                        lots.popleft()
+                if matched:
+                    realized += (
+                        matched * _number(row.get("price"))
+                        - fee * matched / quantity
+                        - matched_cost
+                    )
+                    last_exit = row
+
+            remaining_contracts = sum(lot[0] for lot in lots)
+            settlement = settlements.get(key)
+            latest_buy = buys[-1]
+            status = "OPEN"
+            realized_pnl: float | None = None
+            activity_at = latest_buy.get("filled_at")
+            available_after = latest_buy.get("available_cash_after")
+            if settlement:
+                status = "SETTLED"
+                realized_pnl = _number(settlement.get("realized_pnl"))
+                activity_at = settlement.get("settled_at")
+                available_after = settlement.get("available_cash_after")
+            elif remaining_contracts <= 1e-9:
+                status = "CLOSED"
+                realized_pnl = realized
+                if last_exit:
+                    activity_at = last_exit.get("filled_at")
+                    available_after = last_exit.get("available_cash_after")
+            elif remaining_contracts < total_contracts:
+                status = "PARTIALLY CLOSED"
+                realized_pnl = realized
+                if last_exit:
+                    activity_at = last_exit.get("filled_at")
+                    available_after = last_exit.get("available_cash_after")
+
+            strategies = {
+                str(row.get("strategy")) for row in buys if row.get("strategy")
+            }
+            sources = {str(row.get("source")) for row in buys if row.get("source")}
+            ledger.append(
+                {
+                    "ticker": key[0],
+                    "side": key[1],
+                    "opened_at": buys[0].get("filled_at"),
+                    "activity_at": activity_at,
+                    "price": entry_value / total_contracts,
+                    "contracts": total_contracts,
+                    "strategy": next(iter(strategies)) if len(strategies) == 1 else "MIXED",
+                    "source": next(iter(sources)) if len(sources) == 1 else "mixed",
+                    "status": status,
+                    "realized_pnl": realized_pnl,
+                    "available_cash_after": available_after,
+                    "market_result": (settlement or {}).get("market_result"),
+                    "position_won": (settlement or {}).get("position_won"),
+                }
+            )
+        return sorted(
+            ledger,
+            key=lambda row: str(row.get("activity_at") or row.get("opened_at") or ""),
+            reverse=True,
+        )[:100]
 
     def risk_state(self) -> dict[str, Any]:
         settings = self.db.settings()
@@ -861,6 +984,7 @@ class KalshiBroker(Broker):
                 reduce_only=intent.action == "SELL",
                 post_only=intent.post_only,
                 live_authorized=self.session_armed,
+                price_ranges=intent.price_ranges,
             )
         except AmbiguousSubmissionError as exc:
             self._set_intent(
@@ -954,13 +1078,15 @@ class KalshiBroker(Broker):
                 self.client.positions(), self.client.settlements(),
             )
         except (KalshiTradingError, ValueError) as exc:
-            self._update_mode_state(
+            failed_state: dict[str, Any] = dict(
                 connected=False,
-                authenticated=False if getattr(exc, "status_code", None) in {401, 403} else None,
                 reconciled=False,
                 reconciliation_required=True,
                 last_error=str(exc),
             )
+            if getattr(exc, "status_code", None) in {401, 403}:
+                failed_state["authenticated"] = False
+            self._update_mode_state(**failed_state)
             self.disarm("Reconciliation failed.")
             raise
         observed_at = iso_now()
@@ -978,13 +1104,53 @@ class KalshiBroker(Broker):
         remote_fills = list(fills.get("fills") or [])
         remote_positions = list(positions.get("market_positions") or positions.get("positions") or [])
         remote_settlements = list(settlements.get("settlements") or [])
+        new_fill_ids = {
+            str(fill.get("fill_id") or fill.get("trade_id") or "")
+            for fill in remote_fills
+            if (fill.get("fill_id") or fill.get("trade_id"))
+            and not self.db.fetch_one(
+                "SELECT 1 FROM broker_fills WHERE mode=? AND fill_id=?",
+                (self.mode, str(fill.get("fill_id") or fill.get("trade_id"))),
+            )
+        }
+        new_settlement_tickers = {
+            str(settlement.get("ticker") or settlement.get("market_ticker") or "")
+            for settlement in remote_settlements
+            if (settlement.get("ticker") or settlement.get("market_ticker"))
+            and not self.db.fetch_one(
+                "SELECT 1 FROM broker_settlements WHERE mode=? AND ticker=?",
+                (
+                    self.mode,
+                    str(settlement.get("ticker") or settlement.get("market_ticker")),
+                ),
+            )
+        }
+        single_new_transaction = len(new_fill_ids) + len(new_settlement_tickers) == 1
         for order in remote_orders:
             self._upsert_order(order)
         for fill in remote_fills:
-            self._upsert_fill(fill)
+            fill_id = str(fill.get("fill_id") or fill.get("trade_id") or "")
+            self._upsert_fill(
+                fill,
+                available_cash_after=(
+                    available
+                    if single_new_transaction and fill_id in new_fill_ids
+                    else None
+                ),
+            )
         self._replace_positions(remote_positions)
         for settlement in remote_settlements:
-            self._upsert_settlement(settlement)
+            ticker = str(
+                settlement.get("ticker") or settlement.get("market_ticker") or ""
+            )
+            self._upsert_settlement(
+                settlement,
+                available_cash_after=(
+                    available
+                    if single_new_transaction and ticker in new_settlement_tickers
+                    else None
+                ),
+            )
         # Resolve crash-interrupted and ambiguous submissions by persistent client ID.
         interrupted = self.db.fetch_all(
             "SELECT * FROM broker_order_intents WHERE mode=? AND status='INTENT_CREATED'",
@@ -1348,7 +1514,9 @@ class KalshiBroker(Broker):
                 ticker=str(order.get("ticker") or ""),
             )
 
-    def _upsert_fill(self, fill: dict[str, Any]) -> None:
+    def _upsert_fill(
+        self, fill: dict[str, Any], *, available_cash_after: float | None = None
+    ) -> None:
         fill_id = str(fill.get("fill_id") or fill.get("trade_id") or "")
         if not fill_id:
             return
@@ -1394,8 +1562,9 @@ class KalshiBroker(Broker):
             """
             INSERT OR IGNORE INTO broker_fills(
                 mode,fill_id,exchange_order_id,client_order_id,ticker,side,action,
-                contracts,price,fee,strategy,source,filled_at,raw_json
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                contracts,price,fee,strategy,source,filled_at,raw_json,
+                available_cash_after
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 self.mode, fill_id, exchange_id, client_id,
@@ -1404,9 +1573,17 @@ class KalshiBroker(Broker):
                 (intent or {}).get("strategy") or (order or {}).get("strategy"),
                 (intent or {}).get("source") or (order or {}).get("source"),
                 str(fill.get("created_time") or fill.get("filled_at") or iso_now()),
-                _safe_json(fill),
+                _safe_json(fill), available_cash_after,
             ),
         )
+        if available_cash_after is not None:
+            self.db.execute(
+                """
+                UPDATE broker_fills SET available_cash_after=COALESCE(available_cash_after,?)
+                WHERE mode=? AND fill_id=?
+                """,
+                (available_cash_after, self.mode, fill_id),
+            )
         if exchange_id:
             fill_rows = self.db.fetch_all(
                 "SELECT contracts,price,fee FROM broker_fills WHERE mode=? AND exchange_order_id=?",
@@ -1521,7 +1698,12 @@ class KalshiBroker(Broker):
                     (iso_now(), self.mode, *key),
                 )
 
-    def _upsert_settlement(self, settlement: dict[str, Any]) -> None:
+    def _upsert_settlement(
+        self,
+        settlement: dict[str, Any],
+        *,
+        available_cash_after: float | None = None,
+    ) -> None:
         ticker = str(settlement.get("ticker") or settlement.get("market_ticker") or "")
         if not ticker:
             return
@@ -1566,19 +1748,23 @@ class KalshiBroker(Broker):
         self.db.execute(
             """
             INSERT INTO broker_settlements(
-                mode,ticker,side,settled_at,market_result,position_won,realized_pnl,fees,raw_json
-            ) VALUES (?,?,?,?,?,?,?,?,?)
+                mode,ticker,side,settled_at,market_result,position_won,realized_pnl,
+                fees,raw_json,available_cash_after
+            ) VALUES (?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT(mode,ticker) DO UPDATE SET
                 side=excluded.side,settled_at=excluded.settled_at,
                 market_result=excluded.market_result,position_won=excluded.position_won,
-                realized_pnl=excluded.realized_pnl,fees=excluded.fees,raw_json=excluded.raw_json
+                realized_pnl=excluded.realized_pnl,fees=excluded.fees,
+                raw_json=excluded.raw_json,
+                available_cash_after=COALESCE(
+                    excluded.available_cash_after,broker_settlements.available_cash_after
+                )
             """,
             (
                 self.mode, ticker, side,
                 str(settlement.get("settled_time") or settlement.get("settled_at") or iso_now()),
                 market_result, position_won, realized,
-                fee,
-                _safe_json(settlement),
+                fee, _safe_json(settlement), available_cash_after,
             ),
         )
         self.db.execute(

@@ -9,6 +9,27 @@ from app.domain import (
     market_probability,
     position_size,
 )
+from app.services.kalshi_trading import normalize_order_price
+
+
+def _executable_price(
+    raw_price: float,
+    slippage: float,
+    action: str,
+    settings: dict[str, Any],
+    side: str,
+    price_ranges: list[dict[str, Any]] | None,
+) -> float:
+    candidate = (
+        min(0.999, raw_price + slippage)
+        if action == "BUY"
+        else max(0.001, raw_price - slippage)
+    )
+    if str(settings.get("trading_mode") or "PAPER").upper() in {"DEMO", "LIVE"}:
+        return normalize_order_price(
+            candidate, action, side=side, price_ranges=price_ranges
+        )
+    return candidate
 
 
 @dataclass(frozen=True)
@@ -68,10 +89,13 @@ def make_trade_assessment(
                 "net_edge": None,
                 "expected_value": None,
             }
-        executable = (
-            min(0.999, raw_price + slippage)
-            if action == "BUY"
-            else max(0.001, raw_price - slippage)
+        executable = _executable_price(
+            raw_price,
+            slippage,
+            action,
+            settings,
+            normalized_side,
+            market.get("price_ranges"),
         )
         fee = kalshi_fee(executable)
         net = (
@@ -100,6 +124,7 @@ def make_trade_assessment(
             else None
         ),
         "ask_size": market.get(f"{normalized_side.lower()}_ask_size"),
+        "price_ranges": market.get("price_ranges"),
         "data_reliable": bool(quality.get("reliable", False)),
         "trade_allowed": bool(
             quality.get("reliable", False) and quality.get("trade_allowed", True)
@@ -162,8 +187,12 @@ def make_decision(
         )
 
     slippage = float(settings.get("slippage_cents", 0.5)) / 100
-    buy_price = min(0.999, float(ask) + slippage)
-    sell_price = max(0.001, float(bid) - slippage)
+    buy_price = _executable_price(
+        float(ask), slippage, "BUY", settings, side, market.get("price_ranges")
+    )
+    sell_price = _executable_price(
+        float(bid), slippage, "SELL", settings, side, market.get("price_ranges")
+    )
     probability = float(selected_probability)
     buy_fee = kalshi_fee(buy_price)
     sell_fee = kalshi_fee(sell_price)

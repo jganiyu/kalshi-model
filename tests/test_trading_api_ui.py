@@ -86,6 +86,8 @@ def test_trading_ui_contains_mode_safety_and_confirmation_controls() -> None:
     assert 'disabled = !preview.risk?.passed' in script
     assert "ARM LIVE TRADING" in script
     assert "VERIFY DEMO TRADING" in script
+    assert "data.ledger || []" in script
+    assert "paper.ledger || []" in script
 
 
 def test_private_stream_accepts_current_singular_event_types() -> None:

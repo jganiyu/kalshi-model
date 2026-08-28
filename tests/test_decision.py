@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from app.services.decision import make_decision, material_change
+from app.services.decision import make_decision, make_trade_assessment, material_change
 
 
 SETTINGS = {
@@ -67,6 +67,47 @@ def test_positive_ev_produces_yes_signal_and_conservative_size() -> None:
     assert result.expected_value > 0
     assert result.suggested_dollars <= 20
     assert result.confidence in {"Moderate", "High"}
+
+
+def test_exchange_assessment_uses_actual_whole_cent_limit_price() -> None:
+    market = {**MARKET, "yes_bid": 0.80, "yes_ask": 0.81}
+    demo = make_trade_assessment(
+        up_probability=0.92,
+        market=market,
+        settings={**SETTINGS, "trading_mode": "DEMO"},
+        side="YES",
+        data_quality={"reliable": True},
+    )
+    paper = make_trade_assessment(
+        up_probability=0.92,
+        market=market,
+        settings={**SETTINGS, "trading_mode": "PAPER"},
+        side="YES",
+        data_quality={"reliable": True},
+    )
+    assert demo["buy"]["executable_price"] == 0.82
+    assert paper["buy"]["executable_price"] == pytest.approx(0.815)
+
+
+def test_exchange_assessment_uses_market_price_ranges_near_endpoint() -> None:
+    market = {
+        **MARKET,
+        "yes_bid": 0.947,
+        "yes_ask": 0.948,
+        "price_ranges": [
+            {"start": "0.0000", "end": "0.1000", "step": "0.0010"},
+            {"start": "0.1000", "end": "0.9000", "step": "0.0100"},
+            {"start": "0.9000", "end": "1.0000", "step": "0.0010"},
+        ],
+    }
+    demo = make_trade_assessment(
+        up_probability=0.99,
+        market=market,
+        settings={**SETTINGS, "trading_mode": "DEMO"},
+        side="YES",
+        data_quality={"reliable": True},
+    )
+    assert demo["buy"]["executable_price"] == pytest.approx(0.953)
 
 
 def test_low_probability_positive_ev_is_speculative_not_buy() -> None:

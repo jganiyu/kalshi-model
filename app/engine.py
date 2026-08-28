@@ -62,6 +62,7 @@ class AnalysisEngine:
         self.http: httpx.AsyncClient | None = None
         self.bitcoin: BitcoinCompositeFeed | None = None
         self.kalshi: KalshiPublicClient | None = None
+        self.kalshi_demo: KalshiPublicClient | None = None
         self.paper = PaperTradingService(db)
         self.trading = TradingCoordinator(config, db, self.paper)
         self.models = ModelManager(db)
@@ -100,6 +101,7 @@ class AnalysisEngine:
         self._current_market: dict[str, Any] | None = None
         self._next_market: dict[str, Any] | None = None
         self._market_state: dict[str, Any] | None = None
+        self._execution_market_state: dict[str, Any] | None = None
         self._stream_status: dict[str, dict[str, Any]] = {
             "Coinbase": {"connected": False},
             "Kraken": {"connected": False},
@@ -120,6 +122,9 @@ class AnalysisEngine:
         self.bitcoin = BitcoinCompositeFeed(self.http)
         self.kalshi = KalshiPublicClient(
             self.http, self.config.kalshi_api_base, self.config.kalshi_series
+        )
+        self.kalshi_demo = KalshiPublicClient(
+            self.http, self.config.kalshi_demo_api_base, self.config.kalshi_series
         )
         await self.trading.start(self.http)
         await self.collect_once()
@@ -268,15 +273,25 @@ class AnalysisEngine:
                 current_market, orderbook_payload, observed_at
             )
             self._market_state = market_state
+            execution_market_state = await self._execution_state_for(
+                current_market, market_state, observed_at
+            )
+            self._execution_market_state = execution_market_state
             self.paper.process_open_orders(ticker, market_state)
             current_payload, notification = self._analyze(
-                current_market, market_state, btc_state, settings, observed_at
+                current_market,
+                market_state,
+                btc_state,
+                settings,
+                observed_at,
+                execution_market_state=execution_market_state,
             )
             if self._previous_ticker and self._previous_ticker != ticker:
                 self._pending_settlements.add(self._previous_ticker)
             self._previous_ticker = ticker
         elif current_market:
             self._market_state = None
+            self._execution_market_state = None
             self._save_market(current_market, observed_at)
             self._record_threshold_observation(
                 current_market, observed_at, source="REST", event_type="poll"
@@ -291,6 +306,7 @@ class AnalysisEngine:
             )
         elif self._previous_ticker:
             self._market_state = None
+            self._execution_market_state = None
             self._pending_settlements.add(self._previous_ticker)
             self._previous_ticker = None
 
@@ -318,6 +334,59 @@ class AnalysisEngine:
         }
         self._schedule_publish()
         self.trading.schedule_process(current_payload)
+
+    async def _execution_state_for(
+        self,
+        market: dict[str, Any],
+        live_state: dict[str, Any],
+        observed_at: str,
+    ) -> dict[str, Any]:
+        """Return quotes from the exchange that will execute the selected mode."""
+        if self.trading.selected_mode != "DEMO":
+            state = dict(live_state)
+            state["execution_market_mode"] = "LIVE"
+            state["execution_data_error"] = None
+            return state
+
+        ticker = str(market["ticker"])
+        if self.kalshi_demo is None:
+            return self._empty_execution_state(
+                market, observed_at, "Demo order book is unavailable."
+            )
+        try:
+            demo_market, demo_book = await asyncio.gather(
+                self.kalshi_demo.market(ticker),
+                self.kalshi_demo.orderbook(ticker),
+            )
+            state = self._save_kalshi_snapshot(
+                {**market, **demo_market},
+                demo_book,
+                observed_at,
+                persist=False,
+                allow_summary_fallback=False,
+            )
+            state["execution_market_mode"] = "DEMO"
+            state["execution_data_error"] = None
+            return state
+        except (httpx.HTTPError, ValueError, TypeError, KeyError):
+            logger.warning("Demo execution book unavailable for %s", ticker, exc_info=True)
+            return self._empty_execution_state(
+                market, observed_at, "Demo order book is unavailable."
+            )
+
+    def _empty_execution_state(
+        self, market: dict[str, Any], observed_at: str, reason: str
+    ) -> dict[str, Any]:
+        state = self._save_kalshi_snapshot(
+            market,
+            {"orderbook_fp": {}},
+            observed_at,
+            persist=False,
+            allow_summary_fallback=False,
+        )
+        state["execution_market_mode"] = "DEMO"
+        state["execution_data_error"] = reason
+        return state
 
     def subscribe(self) -> asyncio.Queue[None]:
         queue: asyncio.Queue[None] = asyncio.Queue(maxsize=1)
@@ -592,6 +661,10 @@ class AnalysisEngine:
                     if new_mid is not None and old_mid is not None
                     else 0.0
                 ),
+                "price_level_structure": market.get("price_level_structure")
+                or state.get("price_level_structure"),
+                "price_ranges": market.get("price_ranges")
+                or state.get("price_ranges"),
             }
         )
         return state
@@ -611,12 +684,27 @@ class AnalysisEngine:
         self.paper.process_open_orders(
             str(self._current_market["ticker"]), self._market_state
         )
+        if self.trading.selected_mode == "DEMO":
+            execution_state = self._execution_market_state
+            if (
+                execution_state is None
+                or execution_state.get("ticker") != self._current_market.get("ticker")
+                or execution_state.get("execution_market_mode") != "DEMO"
+            ):
+                execution_state = self._empty_execution_state(
+                    self._current_market,
+                    observed_at,
+                    "Waiting for the Demo order book.",
+                )
+        else:
+            execution_state = self._market_state
         current, notification = self._analyze(
             self._current_market,
             self._market_state,
             self._latest_btc,
             self.db.settings(),
             observed_at,
+            execution_market_state=execution_state,
         )
         reliable = current["decision"]["reason_code"] != "DATA_UNRELIABLE"
         self.dashboard = {
@@ -880,14 +968,39 @@ class AnalysisEngine:
         observed_at: str,
         *,
         persist: bool = True,
+        allow_summary_fallback: bool = True,
     ) -> dict[str, Any]:
         metrics = orderbook_metrics(book_payload)
         # The list-markets response can lag the dedicated order book. Executability
         # must come from the freshest resting levels, with summary fields as fallback.
-        yes_bid = metrics["yes_bids"][0][0] if metrics["yes_bids"] else as_float(market.get("yes_bid_dollars"))
-        yes_ask = metrics["yes_asks"][0][0] if metrics["yes_asks"] else as_float(market.get("yes_ask_dollars"))
-        no_bid = metrics["no_bids"][0][0] if metrics["no_bids"] else as_float(market.get("no_bid_dollars"))
-        no_ask = metrics["no_asks"][0][0] if metrics["no_asks"] else as_float(market.get("no_ask_dollars"))
+        yes_bid = (
+            metrics["yes_bids"][0][0]
+            if metrics["yes_bids"]
+            else as_float(market.get("yes_bid_dollars"))
+            if allow_summary_fallback
+            else None
+        )
+        yes_ask = (
+            metrics["yes_asks"][0][0]
+            if metrics["yes_asks"]
+            else as_float(market.get("yes_ask_dollars"))
+            if allow_summary_fallback
+            else None
+        )
+        no_bid = (
+            metrics["no_bids"][0][0]
+            if metrics["no_bids"]
+            else as_float(market.get("no_bid_dollars"))
+            if allow_summary_fallback
+            else None
+        )
+        no_ask = (
+            metrics["no_asks"][0][0]
+            if metrics["no_asks"]
+            else as_float(market.get("no_ask_dollars"))
+            if allow_summary_fallback
+            else None
+        )
         spread = (yes_ask - yes_bid) if yes_ask is not None and yes_bid is not None else None
         previous_bid = as_float(market.get("previous_yes_bid_dollars"))
         previous_ask = as_float(market.get("previous_yes_ask_dollars"))
@@ -909,12 +1022,26 @@ class AnalysisEngine:
             "liquidity": as_float(market.get("liquidity_dollars")) or 0.0,
             "open_interest": as_float(market.get("open_interest_fp")) or 0.0,
             "volume": as_float(market.get("volume_fp")) or 0.0,
-            "yes_bid_size": metrics["yes_bids"][0][1] if metrics["yes_bids"] else as_float(market.get("yes_bid_size_fp")),
-            "yes_ask_size": metrics["yes_asks"][0][1] if metrics["yes_asks"] else as_float(market.get("yes_ask_size_fp")),
+            "yes_bid_size": (
+                metrics["yes_bids"][0][1]
+                if metrics["yes_bids"]
+                else as_float(market.get("yes_bid_size_fp"))
+                if allow_summary_fallback
+                else None
+            ),
+            "yes_ask_size": (
+                metrics["yes_asks"][0][1]
+                if metrics["yes_asks"]
+                else as_float(market.get("yes_ask_size_fp"))
+                if allow_summary_fallback
+                else None
+            ),
             "no_ask_size": metrics["no_asks"][0][1] if metrics["no_asks"] else None,
             "no_bid_size": metrics["no_bids"][0][1] if metrics["no_bids"] else None,
             "imbalance": metrics["imbalance"],
             "rapid_repricing": rapid,
+            "price_level_structure": market.get("price_level_structure"),
+            "price_ranges": market.get("price_ranges"),
             "orderbook": metrics,
         }
         if persist:
@@ -942,6 +1069,8 @@ class AnalysisEngine:
         btc: dict[str, Any],
         settings: dict[str, Any],
         observed_at: str,
+        *,
+        execution_market_state: dict[str, Any] | None = None,
     ) -> tuple[dict[str, Any], dict[str, Any] | None]:
         close = parse_time(market.get("close_time"))
         observed = parse_time(observed_at) or datetime.now(UTC)
@@ -1005,6 +1134,7 @@ class AnalysisEngine:
         variant_spread = max(variants) - min(variants) if len(variants) > 1 else 0.0
         calibration = self.calibration_summary()
         trading_mode = self.trading.selected_mode
+        trade_market_state = execution_market_state or market_state
         portfolio = self.trading.broker(trading_mode).portfolio()
         selected_side = str(settings.get("selected_side", "YES"))
         held_by_side = {
@@ -1026,13 +1156,35 @@ class AnalysisEngine:
             benchmark_uncertainty_pct=benchmark_uncertainty,
             settlement_window=settlement_window,
         )
+        execution_quality_by_side: dict[str, dict[str, Any]] = {}
+        for side in ("YES", "NO"):
+            execution_quality = dict(quality)
+            execution_error = trade_market_state.get("execution_data_error")
+            if execution_error:
+                execution_quality.update(
+                    {"reliable": False, "trade_allowed": False, "reason": execution_error}
+                )
+            elif trading_mode == "DEMO" and trade_market_state.get(
+                f"{side.lower()}_ask"
+            ) is None:
+                execution_quality.update(
+                    {
+                        "reliable": False,
+                        "trade_allowed": False,
+                        "reason": (
+                            "The Demo order book has no executable "
+                            f"{'Up' if side == 'YES' else 'Down'} ask."
+                        ),
+                    }
+                )
+            execution_quality_by_side[side] = execution_quality
         decisions = {
             side: make_decision(
                 model_probability=probability,
-                market=market_state,
+                market=trade_market_state,
                 settings=settings,
                 bankroll=portfolio["available_cash"],
-                data_quality=quality,
+                data_quality=execution_quality_by_side[side],
                 calibration=calibration,
                 model_variant_spread=variant_spread,
                 selected_side=side,
@@ -1043,10 +1195,10 @@ class AnalysisEngine:
         assessments = {
             side: make_trade_assessment(
                 up_probability=probability,
-                market=market_state,
+                market=trade_market_state,
                 settings=settings,
                 side=side,
-                data_quality=quality,
+                data_quality=execution_quality_by_side[side],
             )
             for side in ("YES", "NO")
         }
@@ -1155,7 +1307,7 @@ class AnalysisEngine:
             seconds_remaining=seconds_remaining,
             market_status=market.get("status"),
             market_open_time=market.get("open_time"),
-            market_observed_at=market_state.get("observed_at"),
+            market_observed_at=trade_market_state.get("observed_at"),
             threshold_state=threshold_state,
             settlement_window=settlement_window,
             z_distance=baseline.z_distance,
@@ -1166,12 +1318,15 @@ class AnalysisEngine:
         summary = self._market_summary(market)
         summary.update(
             {
-                **market_state,
+                **trade_market_state,
                 "time_remaining_seconds": seconds_remaining,
                 "model_probability": decision.model_probability,
                 "up_probability": probability,
                 "selected_side": selected_side,
                 "trading_mode": trading_mode,
+                "execution_market_mode": trade_market_state.get(
+                    "execution_market_mode", "LIVE"
+                ),
                 "model_version": model_version,
                 "z_distance": baseline.z_distance,
                 "annualized_volatility": baseline.annualized_volatility,

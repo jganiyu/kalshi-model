@@ -20,6 +20,7 @@ from app.services.kalshi_trading import (
     KalshiTradingClient,
     KalshiTradingError,
     outcome_to_book,
+    normalize_order_price,
     signed_headers,
 )
 from app.services.paper import PaperTradingService
@@ -132,6 +133,29 @@ def test_v2_single_book_mapping() -> None:
     assert outcome_to_book("YES", "SELL", 0.42) == ("ask", 0.42)
     assert outcome_to_book("NO", "BUY", 0.42) == ("ask", 0.58)
     assert outcome_to_book("NO", "SELL", 0.42) == ("bid", 0.58)
+
+
+def test_exchange_order_prices_use_directional_whole_cent_rounding() -> None:
+    assert normalize_order_price(0.8150000000000001, "BUY") == 0.82
+    assert normalize_order_price(0.795, "SELL") == 0.79
+    assert OrderIntent(
+        "DEMO", "T", "NO", "BUY", 1, 0.8150000000000001,
+        "STANDARD_EDGE", "automatic",
+    ).limit_price == 0.82
+
+
+def test_exchange_order_prices_follow_tapered_market_ticks() -> None:
+    ranges = [
+        {"start": "0.0000", "end": "0.1000", "step": "0.0010"},
+        {"start": "0.1000", "end": "0.9000", "step": "0.0100"},
+        {"start": "0.9000", "end": "1.0000", "step": "0.0010"},
+    ]
+    assert normalize_order_price(
+        0.953, "BUY", side="YES", price_ranges=ranges
+    ) == 0.953
+    assert normalize_order_price(
+        0.815, "BUY", side="NO", price_ranges=ranges
+    ) == 0.82
 
 
 def test_signed_headers_sign_method_and_path(tmp_path: Path) -> None:
@@ -297,7 +321,7 @@ def test_additive_migration_preserves_existing_paper_history(tmp_path: Path) -> 
         )
     db.initialize()
     assert db.fetch_one("SELECT side FROM paper_trades WHERE ticker='OLD'")["side"] == "NO"
-    assert db.fetch_one("SELECT MAX(version) version FROM schema_migrations")["version"] == 11
+    assert db.fetch_one("SELECT MAX(version) version FROM schema_migrations")["version"] == 12
     assert db.fetch_one("SELECT COUNT(*) count FROM broker_order_intents")["count"] == 0
 
 
@@ -378,6 +402,30 @@ async def test_v2_order_payload_is_fixed_point_limit_and_post_only(tmp_path: Pat
     assert captured["post_only"] is True
     assert captured["cancel_order_on_pause"] is True
     assert "exchange_index" not in captured
+    await http.aclose()
+
+
+@run_async
+async def test_v2_order_payload_rounds_subcent_price_before_exchange(
+    tmp_path: Path,
+) -> None:
+    captured: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.update(json.loads(request.content))
+        return httpx.Response(201, json={"order_id": "rounded"})
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client = KalshiTradingClient(
+        http, "https://external-api.demo.kalshi.co/trade-api/v2",
+        "demo-key-id", private_key(tmp_path), environment="DEMO",
+    )
+    await client.create_order(
+        ticker="T", client_order_id="rounded-client", side="NO", action="BUY",
+        contracts=1, limit_price=0.8150000000000001,
+    )
+    assert captured["side"] == "ask"
+    assert captured["price"] == "0.1800"
     await http.aclose()
 
 
@@ -666,6 +714,7 @@ async def test_manual_preview_rechecks_latest_market_before_confirm(tmp_path: Pa
     current = {
         "ticker": "CURRENT",
         "status": "active",
+        "data_quality": {"reliable": True},
         "trade_assessments": {
             "YES": {
                 "buy": {"executable_price": 0.40}, "sell": {"executable_price": 0.38},
@@ -680,6 +729,7 @@ async def test_manual_preview_rechecks_latest_market_before_confirm(tmp_path: Pa
     )
     stale = {
         **current,
+        "data_quality": {"reliable": False},
         "trade_assessments": {
             "YES": {**current["trade_assessments"]["YES"], "data_reliable": False}
         },
@@ -689,6 +739,161 @@ async def test_manual_preview_rechecks_latest_market_before_confirm(tmp_path: Pa
             preview["confirmation_token"], "DEMO", stale
         )
     assert client.created == []
+
+
+@run_async
+async def test_manual_custom_limit_can_rest_when_demo_ask_is_missing(
+    tmp_path: Path,
+) -> None:
+    db = make_db(tmp_path)
+    coordinator = TradingCoordinator(
+        AppConfig(database_path=db.path), db, PaperTradingService(db)
+    )
+    broker = coordinator.broker("DEMO")
+    assert isinstance(broker, KalshiBroker)
+    client = FakeTradingClient()
+    broker.set_client(client)  # type: ignore[arg-type]
+    await broker.reconcile()
+    broker.arm(confirmation="ARM DEMO TRADING")
+    db.update_settings({"trading_mode": "DEMO"})
+    current = {
+        "ticker": "SPARSE-DEMO",
+        "status": "active",
+        "exchange_index": None,
+        "data_quality": {
+            "reliable": True,
+            "trade_allowed": True,
+            "reason": "critical feeds are current and mutually consistent",
+        },
+        "trade_assessments": {
+            "YES": {
+                "buy": {"executable_price": None},
+                "sell": {"executable_price": 0.47},
+                "spread": 0.20,
+                "ask_size": 1,
+                "data_reliable": False,
+                "trade_allowed": False,
+                "quality_reason": "The Demo order book has no executable Up ask.",
+            }
+        },
+        "trade_decisions": {"YES": {"confidence": "Low"}},
+    }
+
+    preview = coordinator.preview_manual(
+        "DEMO",
+        {
+            "side": "YES",
+            "action": "BUY",
+            "contracts": 1,
+            "limit_price_cents": 50,
+        },
+        current,
+    )
+
+    assert preview["risk"]["passed"] is True
+    submitted = await coordinator.confirm_manual(
+        preview["confirmation_token"], "DEMO", current
+    )
+    assert submitted["status"] == "ACKNOWLEDGED"
+    assert client.created[0]["limit_price"] == pytest.approx(0.50)
+
+
+@run_async
+async def test_demo_automation_resumes_after_private_stream_reconnect(
+    tmp_path: Path,
+) -> None:
+    db = make_db(tmp_path)
+    coordinator = TradingCoordinator(
+        AppConfig(database_path=db.path), db, PaperTradingService(db)
+    )
+    broker = coordinator.broker("DEMO")
+    assert isinstance(broker, KalshiBroker)
+    broker.set_client(FakeTradingClient())  # type: ignore[arg-type]
+    await broker.reconcile()
+    broker.arm(confirmation="ARM DEMO TRADING", automatic=True)
+
+    await coordinator._handle_private_stream_status(
+        "DEMO", False, "temporary disconnect"
+    )
+    assert broker.session_armed is True
+    assert broker.automatic_armed is True
+    assert broker.readiness()["ready_for_automatic"] is False
+
+    await coordinator._handle_private_stream_status("DEMO", True, None)
+    assert broker.readiness()["ready_for_automatic"] is True
+    events = broker.audit_history(10)
+    assert any(
+        event["event_type"] == "PRIVATE_STREAM_RESUMED"
+        and event["detail"]["automatic_resumed"] is True
+        for event in events
+    )
+
+
+@run_async
+async def test_live_automation_resumes_after_private_stream_reconnect(
+    tmp_path: Path,
+) -> None:
+    db = make_db(tmp_path)
+    coordinator = TradingCoordinator(
+        AppConfig(database_path=db.path), db, PaperTradingService(db)
+    )
+    broker = coordinator.broker("LIVE")
+    assert isinstance(broker, KalshiBroker)
+    client = FakeTradingClient()
+    client.environment = "LIVE"
+    broker.set_client(client)  # type: ignore[arg-type]
+    await broker.reconcile()
+    db.execute(
+        "UPDATE broker_mode_state SET demo_verified_at=?,limits_reviewed_at=? WHERE mode='LIVE'",
+        (iso_now(), iso_now()),
+    )
+    broker.arm(confirmation="ARM LIVE TRADING", automatic=True)
+
+    await coordinator._handle_private_stream_status(
+        "LIVE", False, "temporary disconnect"
+    )
+    assert broker.session_armed is True
+    assert broker.automatic_armed is True
+    assert broker.readiness()["ready_for_automatic"] is False
+
+    await coordinator._handle_private_stream_status("LIVE", True, None)
+    assert broker.readiness()["ready_for_automatic"] is True
+    events = broker.audit_history(10)
+    assert any(
+        event["event_type"] == "PRIVATE_STREAM_RESUMED"
+        and event["detail"]["automatic_resumed"] is True
+        for event in events
+    )
+
+
+@run_async
+async def test_live_reconnect_failure_disarms_trading(tmp_path: Path) -> None:
+    db = make_db(tmp_path)
+    coordinator = TradingCoordinator(
+        AppConfig(database_path=db.path), db, PaperTradingService(db)
+    )
+    broker = coordinator.broker("LIVE")
+    assert isinstance(broker, KalshiBroker)
+    client = FakeTradingClient()
+    client.environment = "LIVE"
+    broker.set_client(client)  # type: ignore[arg-type]
+    await broker.reconcile()
+    db.execute(
+        "UPDATE broker_mode_state SET demo_verified_at=?,limits_reviewed_at=? WHERE mode='LIVE'",
+        (iso_now(), iso_now()),
+    )
+    broker.arm(confirmation="ARM LIVE TRADING", automatic=True)
+    await coordinator._handle_private_stream_status(
+        "LIVE", False, "temporary disconnect"
+    )
+
+    async def failed_balance():
+        raise KalshiTradingError("reconciliation unavailable")
+
+    client.balance = failed_balance  # type: ignore[method-assign]
+    await coordinator._handle_private_stream_status("LIVE", True, None)
+    assert broker.session_armed is False
+    assert broker.automatic_armed is False
 
 
 @run_async
@@ -790,6 +995,95 @@ def test_exchange_strategy_ledger_counts_winning_down_settlement(tmp_path: Path)
     assert result["realized_pnl"] == pytest.approx(7.98)
 
 
+def test_exchange_trade_ledger_aggregates_settlement_and_available_cash(
+    tmp_path: Path,
+) -> None:
+    db = make_db(tmp_path)
+    broker = KalshiBroker("DEMO", db, FakeTradingClient())  # type: ignore[arg-type]
+    db.execute(
+        """
+        INSERT INTO broker_fills(
+            mode,fill_id,ticker,side,action,contracts,price,fee,strategy,source,
+            filled_at,raw_json,available_cash_after
+        ) VALUES
+            ('DEMO','fill-1','SETTLED','NO','BUY',1,.53,.0175,'MANUAL','manual',
+             '2026-08-28T03:51:49Z','{}',99.4525),
+            ('DEMO','fill-2','SETTLED','NO','BUY',1,.53,.0175,'MANUAL','manual',
+             '2026-08-28T03:54:15Z','{}',98.905)
+        """
+    )
+    db.execute(
+        """
+        INSERT INTO broker_settlements(
+            mode,ticker,side,settled_at,market_result,position_won,realized_pnl,
+            fees,raw_json,available_cash_after
+        ) VALUES ('DEMO','SETTLED','NO','2026-08-28T04:00:18Z','YES',0,-1.095,
+                  .035,'{}',98.905)
+        """
+    )
+
+    ledger = broker.trade_ledger()
+
+    assert len(ledger) == 1
+    assert ledger[0]["status"] == "SETTLED"
+    assert ledger[0]["contracts"] == pytest.approx(2)
+    assert ledger[0]["price"] == pytest.approx(.53)
+    assert ledger[0]["realized_pnl"] == pytest.approx(-1.095)
+    assert ledger[0]["available_cash_after"] == pytest.approx(98.905)
+    assert broker.portfolio()["ledger"] == ledger
+
+
+def test_broker_cash_migration_preserves_history_and_backfills_nearby_snapshot(
+    tmp_path: Path,
+) -> None:
+    db = Database(tmp_path / "broker-legacy.db")
+    with db.transaction() as connection:
+        for version, sql in MIGRATIONS[:11]:
+            connection.executescript(sql)
+            connection.execute(
+                "INSERT INTO schema_migrations(version,applied_at) VALUES (?,?)",
+                (version, iso_now()),
+            )
+        connection.execute(
+            """
+            INSERT INTO broker_fills(
+                mode,fill_id,ticker,side,action,contracts,price,fee,filled_at,raw_json
+            ) VALUES ('DEMO','legacy-fill','LEGACY','YES','BUY',1,.4,.01,
+                      '2026-08-28T03:00:00Z','{}')
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO broker_settlements(
+                mode,ticker,side,settled_at,market_result,position_won,realized_pnl,
+                fees,raw_json
+            ) VALUES ('DEMO','LEGACY','YES','2026-08-28T03:15:00Z','YES',1,.59,
+                      .01,'{}')
+            """
+        )
+        connection.executemany(
+            """
+            INSERT INTO broker_account_snapshots(
+                mode,observed_at,available_balance,portfolio_value,allocated_capital,raw_json
+            ) VALUES ('DEMO',?,?,0,0,'{}')
+            """,
+            [
+                ("2026-08-28T03:00:10Z", 99.59),
+                ("2026-08-28T03:15:12Z", 100.59),
+            ],
+        )
+
+    db.initialize()
+
+    fill = db.fetch_one("SELECT * FROM broker_fills WHERE fill_id='legacy-fill'")
+    settlement = db.fetch_one(
+        "SELECT * FROM broker_settlements WHERE ticker='LEGACY'"
+    )
+    assert fill and fill["available_cash_after"] == pytest.approx(99.59)
+    assert settlement and settlement["available_cash_after"] == pytest.approx(100.59)
+    assert db.fetch_one("SELECT MAX(version) version FROM schema_migrations")["version"] == 12
+
+
 @run_async
 async def test_profit_take_is_managed_when_another_mode_is_selected(
     tmp_path: Path,
@@ -832,7 +1126,7 @@ async def test_profit_take_is_managed_when_another_mode_is_selected(
     assert len(intents) == 1
     assert intents[0]["source"] == "global_profit_take"
     assert intents[0]["requested_contracts"] == 10
-    assert intents[0]["limit_price"] == pytest.approx(0.985)
+    assert intents[0]["limit_price"] == pytest.approx(0.98)
     await coordinator.process(current)
     assert db.fetch_one(
         "SELECT COUNT(*) count FROM broker_order_intents WHERE mode='DEMO' AND action='SELL'"

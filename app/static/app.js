@@ -174,15 +174,18 @@ function orderBookRows(levels, type, maxQuantity, reverse = false) {
   return reverse ? rows.reverse() : rows;
 }
 
-function renderOrderBook(outcome, orderbook) {
+function renderOrderBook(outcome, orderbook, environment = "LIVE") {
   const prefix = outcome === "YES" ? "yes" : "no";
   const target = $("#orderbook-rows");
   if (!target) return;
+  const source = String(environment || "LIVE").toUpperCase() === "DEMO" ? "Demo" : "Live";
+  const sourceLabel = $("#orderbook-environment-label");
+  if (sourceLabel) sourceLabel.textContent = source;
   $("#orderbook-title").textContent = `${marketSideLabel(outcome)} order book`;
   const bids = normalizeBookLevels(orderbook?.[`${prefix}_bids`]);
   const asks = normalizeBookLevels(orderbook?.[`${prefix}_asks`]);
   if (!bids.length && !asks.length) {
-    target.innerHTML = '<tr><td class="book-empty" colspan="3">Waiting for live depth</td></tr>';
+    target.innerHTML = `<tr><td class="book-empty" colspan="3">No ${source} depth available</td></tr>`;
     return;
   }
   const maxQuantity = Math.max(1, ...bids.map((level) => level.quantity), ...asks.map((level) => level.quantity));
@@ -203,7 +206,7 @@ function renderRecentTrades(trades, mode = "PAPER") {
   const target = $("#recent-paper-trades");
   if (!target) return;
   target.innerHTML = trades?.length ? trades.map((trade) => `
-    <tr><td>${shortDate(trade.opened_at || trade.filled_at)}</td><td>${marketSideLabel(trade.side)}</td>
+    <tr><td>${shortDate(trade.activity_at || trade.opened_at || trade.filled_at)}</td><td>${marketSideLabel(trade.side)}</td>
     <td>${cents(trade.entry_price ?? trade.price)}</td><td>${trade.contracts}</td>
     <td>${String(trade.strategy || trade.source || "manual").replaceAll("_", " ")}</td>
     <td class="${Number(trade.realized_pnl) > 0 ? "positive" : Number(trade.realized_pnl) < 0 ? "negative" : ""}">${String(trade.status || (mode === "PAPER" ? "open" : trade.action || "filled"))}${trade.realized_pnl == null ? "" : ` · ${money(trade.realized_pnl)}`}</td>
@@ -458,10 +461,14 @@ function renderDashboard(data) {
       || current?.automatic_entry?.standard_edge_readiness,
   );
   renderTradeAssessment();
-  renderOrderBook(state.paperOrder.side, current?.orderbook || {});
+  renderOrderBook(
+    state.paperOrder.side,
+    current?.orderbook || {},
+    current?.execution_market_mode || "LIVE",
+  );
   const recent = trading.mode === "PAPER"
     ? data.paper?.recent_paper_trades || []
-    : (paper.fills || []).slice(0, 8);
+    : (paper.ledger || []).slice(0, 8);
   renderRecentTrades(recent, trading.mode);
   renderPaperController();
   drawChart();
@@ -739,7 +746,11 @@ function updateSelectedSide(side) {
   localStorage.setItem("kalshi-display-side-v1", side);
   renderPaperController();
   renderTradeAssessment();
-  renderOrderBook(side, state.dashboard?.current?.orderbook || {});
+  renderOrderBook(
+    side,
+    state.dashboard?.current?.orderbook || {},
+    state.dashboard?.current?.execution_market_mode || "LIVE",
+  );
 }
 
 async function selectTradingMode(mode) {
@@ -1466,9 +1477,9 @@ async function loadPaper() {
       statCard("Resting orders", data.open_order_count || 0, `${money(data.allocation_cap)} cap`),
       statCard("Actual fees", money(data.actual_fees, 4), "Confirmed fills"),
     ].join("");
-  const trades = mode === "PAPER" ? data.trades || [] : data.fills || [];
+  const trades = mode === "PAPER" ? data.trades || [] : data.ledger || [];
   $("#trade-table").innerHTML = trades.length ? trades.map((trade) => `
-    <tr><td>${shortDate(trade.opened_at || trade.filled_at)}</td><td>${trade.ticker}</td><td>${marketSideLabel(trade.side)}</td>
+    <tr><td>${shortDate(trade.activity_at || trade.opened_at || trade.filled_at)}</td><td>${trade.ticker}</td><td>${marketSideLabel(trade.side)}</td>
     <td>${cents(trade.entry_price ?? trade.price)}</td><td>${trade.contracts}</td><td>${String(trade.strategy || trade.source || "automatic").replaceAll("_", " ").toUpperCase()}${(trade.entries || []).some((entry) => entry.stop_status === "active") ? " · STOP ACTIVE" : ""}</td><td>${mode === "PAPER" ? points(trade.edge) : "—"}</td>
     <td><span class="status-pill ${String(trade.status || "filled").toLowerCase()}">${String(trade.status || trade.action || "FILLED").toUpperCase()}</span></td>
     <td class="${Number(trade.realized_pnl) > 0 ? "positive" : Number(trade.realized_pnl) < 0 ? "negative" : ""}">${trade.realized_pnl == null ? "--" : money(trade.realized_pnl)}</td>
