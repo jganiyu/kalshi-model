@@ -212,6 +212,38 @@ async def test_submit_persists_intent_before_network_and_is_idempotent(tmp_path:
 
 
 @run_async
+async def test_filled_exchange_position_is_unsettled_not_an_open_order(
+    tmp_path: Path,
+) -> None:
+    _db, broker, client = await ready_broker(tmp_path)
+    client.remote_positions = [{
+        "ticker": "WAITING-SETTLEMENT",
+        "position_fp": "16.00",
+        "market_exposure_dollars": "14.4000",
+        "last_updated_ts": "2026-08-28T20:37:17Z",
+    }]
+    client.remote_fills = [{
+        "fill_id": "filled-entry",
+        "ticker": "WAITING-SETTLEMENT",
+        "side": "yes",
+        "action": "buy",
+        "count_fp": "16.00",
+        "yes_price_dollars": "0.9000",
+        "fee_cost_dollars": "0.1008",
+        "created_time": "2026-08-28T20:37:17Z",
+    }]
+
+    await broker.reconcile()
+    portfolio = broker.portfolio()
+
+    assert portfolio["open_order_count"] == 0
+    assert portfolio["positions"][0]["status"] == "open"
+    assert portfolio["positions"][0]["display_status"] == "UNSETTLED"
+    assert portfolio["ledger"][0]["status"] == "OPEN"
+    assert portfolio["ledger"][0]["display_status"] == "UNSETTLED"
+
+
+@run_async
 async def test_ambiguous_timeout_requires_reconciliation_without_retry(tmp_path: Path) -> None:
     db, broker, client = await ready_broker(tmp_path)
     client.timeout = True

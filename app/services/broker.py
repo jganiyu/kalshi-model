@@ -356,6 +356,10 @@ class KalshiBroker(Broker):
             "SELECT * FROM broker_positions WHERE mode=? AND status='open' ORDER BY updated_at DESC",
             (self.mode,),
         )
+        for position in positions:
+            # A non-zero Kalshi position is filled exposure awaiting an exit or
+            # exchange settlement; it is not a resting order.
+            position["display_status"] = "UNSETTLED"
         orders = self.db.fetch_all(
             "SELECT * FROM broker_orders WHERE mode=? ORDER BY updated_at DESC LIMIT 100",
             (self.mode,),
@@ -578,6 +582,7 @@ class KalshiBroker(Broker):
                     "strategy": strategy,
                     "source": source,
                     "status": status,
+                    "display_status": "UNSETTLED" if status == "OPEN" else status,
                     "realized_pnl": realized_pnl,
                     "available_cash_after": available_after,
                     "market_result": (settlement or {}).get("market_result"),

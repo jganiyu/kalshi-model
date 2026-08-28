@@ -62,6 +62,7 @@ def mobile_snapshot(dashboard: dict[str, Any]) -> dict[str, Any]:
         "strategy",
         "source",
         "status",
+        "display_status",
         "action",
         "realized_pnl",
         "available_cash_after",
@@ -119,6 +120,32 @@ def tailscale_private_url() -> str | None:
     return f"https://{dns_name.rstrip('.')}" if dns_name else None
 
 
+def tailscale_serve_target() -> str | None:
+    binary = _tailscale_binary()
+    if not binary:
+        return None
+    try:
+        completed = subprocess.run(
+            [binary, "serve", "status", "--json"],
+            capture_output=True,
+            check=False,
+            env={**os.environ, "TAILSCALE_BE_CLI": "1"},
+            text=True,
+            timeout=1.5,
+        )
+        if completed.returncode:
+            return None
+        web = json.loads(completed.stdout).get("Web") or {}
+        for host in web.values():
+            for handler in (host.get("Handlers") or {}).values():
+                proxy = str(handler.get("Proxy") or "")
+                if proxy:
+                    return proxy.rstrip("/")
+    except (OSError, subprocess.SubprocessError, json.JSONDecodeError, AttributeError):
+        return None
+    return None
+
+
 def mobile_status(db: Any, port: int) -> dict[str, Any]:
     enabled = bool(db.settings().get("mobile_monitor_enabled", False))
     binary = _tailscale_binary()
@@ -127,13 +154,31 @@ def mobile_status(db: Any, port: int) -> dict[str, Any]:
         if binary and binary.startswith("/Applications/")
         else binary or "tailscale"
     )
+    expected_target = f"http://127.0.0.1:{port}"
+    detected_url = tailscale_private_url() if enabled else None
+    serve_target = tailscale_serve_target() if enabled else None
+    tailscale_ready = bool(detected_url and serve_target == expected_target)
+    tailscale_issue = None
+    if enabled and not binary:
+        tailscale_issue = "Install and sign in to Tailscale on this Mac."
+    elif enabled and not detected_url:
+        tailscale_issue = "Sign in to Tailscale on this Mac, then refresh."
+    elif enabled and serve_target != expected_target:
+        tailscale_issue = (
+            f"Tailscale Serve points to {serve_target}. Copy and run the updated command."
+            if serve_target else "Run the copied Tailscale Serve command, then refresh."
+        )
     return {
         "enabled": enabled,
         "status": "running" if enabled else "disabled",
         "port": port,
-        "local_url": f"http://127.0.0.1:{port}" if enabled else None,
-        "private_url": tailscale_private_url() if enabled else None,
-        "tailscale_command": f"{cli} serve --bg http://127.0.0.1:{port}",
+        "local_url": expected_target if enabled else None,
+        "private_url": detected_url if tailscale_ready else None,
+        "detected_private_url": detected_url,
+        "tailscale_ready": tailscale_ready,
+        "tailscale_target": serve_target,
+        "tailscale_issue": tailscale_issue,
+        "tailscale_command": f"{cli} serve --bg {expected_target}",
     }
 
 

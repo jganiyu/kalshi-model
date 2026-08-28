@@ -224,6 +224,39 @@ def test_app_store_tailscale_command_forces_cli_and_discovers_private_url(monkey
     )
 
 
+def test_mobile_status_detects_stale_tailscale_forwarding(monkeypatch) -> None:
+    binary = "/Applications/Tailscale.app/Contents/MacOS/Tailscale"
+
+    def run(command, **_kwargs):
+        if command[1:] == ["status", "--json"]:
+            payload = {"Self": {"DNSName": "monitor.example.ts.net."}}
+        else:
+            payload = {
+                "Web": {
+                    "monitor.example.ts.net:443": {
+                        "Handlers": {"/": {"Proxy": "http://127.0.0.1:8767"}}
+                    }
+                }
+            }
+        import json
+        return SimpleNamespace(returncode=0, stdout=json.dumps(payload))
+
+    monkeypatch.setattr(mobile, "_tailscale_binary", lambda: binary)
+    monkeypatch.setattr(mobile.subprocess, "run", run)
+
+    stale = mobile.mobile_status(FakeDatabase(), 8768)
+    assert stale["tailscale_ready"] is False
+    assert stale["private_url"] is None
+    assert stale["detected_private_url"] == "https://monitor.example.ts.net"
+    assert "points to http://127.0.0.1:8767" in stale["tailscale_issue"]
+    assert stale["tailscale_command"].endswith("http://127.0.0.1:8768")
+
+    ready = mobile.mobile_status(FakeDatabase(), 8767)
+    assert ready["tailscale_ready"] is True
+    assert ready["private_url"] == "https://monitor.example.ts.net"
+    assert ready["tailscale_issue"] is None
+
+
 def test_mobile_websocket_sends_current_snapshot_and_live_environment_updates() -> None:
     from fastapi.testclient import TestClient
 

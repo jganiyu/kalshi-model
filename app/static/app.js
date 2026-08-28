@@ -212,7 +212,7 @@ function renderRecentTrades(trades, mode = "PAPER") {
     <tr><td>${shortDate(trade.activity_at || trade.opened_at || trade.filled_at)}</td><td>${marketSideLabel(trade.side)}</td>
     <td>${cents(trade.entry_price ?? trade.price)}</td><td>${trade.contracts}</td>
     <td>${String(trade.strategy || trade.source || "manual").replaceAll("_", " ")}</td>
-    <td class="${Number(trade.realized_pnl) > 0 ? "positive" : Number(trade.realized_pnl) < 0 ? "negative" : ""}">${String(trade.status || (mode === "PAPER" ? "open" : trade.action || "filled"))}${trade.realized_pnl == null ? "" : ` · ${money(trade.realized_pnl)}`}</td>
+    <td class="${Number(trade.realized_pnl) > 0 ? "positive" : Number(trade.realized_pnl) < 0 ? "negative" : ""}">${String(trade.display_status || trade.status || (mode === "PAPER" ? "open" : trade.action || "filled"))}${trade.realized_pnl == null ? "" : ` · ${money(trade.realized_pnl)}`}</td>
     <td>${trade.available_cash_after == null ? "—" : money(trade.available_cash_after)}</td></tr>
   `).join("") : `<tr><td class="book-empty" colspan="7">No ${mode === "PAPER" ? "paper trades" : "fills"} yet</td></tr>`;
 }
@@ -1528,7 +1528,7 @@ async function loadPaper() {
       statCard("Maximum drawdown", percent(data.max_drawdown_pct), "Settled equity"),
     ].join("") : [
       statCard("Available", money(data.available_cash), readiness.authenticated ? "Kalshi account" : "Not authenticated"),
-      statCard("Portfolio value", money(data.portfolio_value), `${data.open_positions || 0} open positions`),
+      statCard("Portfolio value", money(data.portfolio_value), `${data.open_positions || 0} unsettled position${data.open_positions === 1 ? "" : "s"}`),
       statCard("Allocated", money(data.allocated_capital), `${money(data.remaining_allocation)} remaining`),
       statCard("Resting orders", data.open_order_count || 0, `${money(data.allocation_cap)} cap`),
       statCard("Actual fees", money(data.actual_fees, 4), "Account fill history"),
@@ -1537,7 +1537,7 @@ async function loadPaper() {
   $("#trade-table").innerHTML = trades.length ? trades.map((trade) => `
     <tr><td>${shortDate(trade.activity_at || trade.opened_at || trade.filled_at)}</td><td>${trade.ticker}</td><td>${marketSideLabel(trade.side)}</td>
     <td>${cents(trade.entry_price ?? trade.price)}</td><td>${trade.contracts}</td><td>${String(trade.strategy || trade.source || "automatic").replaceAll("_", " ").toUpperCase()}${(trade.entries || []).some((entry) => entry.stop_status === "active") ? " · STOP ACTIVE" : ""}</td><td>${mode === "PAPER" ? points(trade.edge) : "—"}</td>
-    <td><span class="status-pill ${String(trade.status || "filled").toLowerCase()}">${String(trade.status || trade.action || "FILLED").toUpperCase()}</span></td>
+    <td><span class="status-pill ${String(trade.display_status || trade.status || "filled").toLowerCase()}">${String(trade.display_status || trade.status || trade.action || "FILLED").toUpperCase()}</span></td>
     <td class="${Number(trade.realized_pnl) > 0 ? "positive" : Number(trade.realized_pnl) < 0 ? "negative" : ""}">${trade.realized_pnl == null ? "--" : money(trade.realized_pnl)}</td>
     <td>${trade.available_cash_after == null ? "—" : money(trade.available_cash_after)}</td></tr>
   `).join("") : `<tr><td colspan="10" class="empty-state">No ${mode === "PAPER" ? "paper trades" : "confirmed fills"} yet.</td></tr>`;
@@ -1548,8 +1548,8 @@ async function loadPaper() {
     $("#position-table").innerHTML = (data.positions || []).length ? data.positions.map((position) => `
       <tr><td>${position.ticker}</td><td>${marketSideLabel(position.side)}</td><td>${position.contracts}</td>
       <td>${money(position.market_exposure)}</td><td>${position.stop_loss_price == null ? "Off" : cents(position.stop_loss_price)}</td>
-      <td>${profitTake.enabled === false ? "Off" : cents(profitTake.trigger_price ?? .99)}</td><td>${String(position.status).toUpperCase()}</td></tr>
-    `).join("") : '<tr><td colspan="7" class="empty-state">No open positions.</td></tr>';
+      <td>${profitTake.enabled === false ? "Off" : cents(profitTake.trigger_price ?? .99)}</td><td>${String(position.display_status || position.status).toUpperCase()}</td></tr>
+    `).join("") : '<tr><td colspan="7" class="empty-state">No unsettled positions.</td></tr>';
     $("#exchange-order-table").innerHTML = (data.orders || []).length ? data.orders.map((order) => `
       <tr><td>${shortDate(order.updated_at)}</td><td>${order.ticker}</td><td>${marketSideLabel(order.side)}</td><td>${order.action}</td>
       <td>${order.filled_contracts}</td><td>${order.remaining_contracts}</td><td>${cents(order.limit_price)}</td><td>${order.status}</td>
@@ -1623,11 +1623,18 @@ function renderMobileMonitor(monitor) {
   $("#mobile-monitor-status").textContent = enabled ? "Enabled" : "Disabled";
   $("#mobile-monitor-status").classList.toggle("configured", enabled);
   $("#mobile-monitor-port").textContent = monitor?.port ?? "--";
-  $("#mobile-monitor-local-status").textContent = enabled ? "Running · read only" : "Disabled";
+  $("#mobile-monitor-local-status").textContent = enabled
+    ? monitor?.tailscale_ready ? "Running · Tailscale ready" : "Running · Tailscale update required"
+    : "Disabled";
   $("#mobile-monitor-local-url").value = monitor?.local_url || "";
-  $("#mobile-monitor-private-url").value = monitor?.private_url || "";
+  $("#mobile-monitor-private-url").value = monitor?.private_url || monitor?.detected_private_url || "";
   $("#mobile-monitor-tailscale-command").textContent = monitor?.tailscale_command || "--";
-  $("#copy-mobile-monitor-url").disabled = !monitor?.private_url;
+  $("#copy-mobile-monitor-url").disabled = !monitor?.tailscale_ready;
+  const result = $("#mobile-monitor-result");
+  if (enabled && monitor?.tailscale_issue) {
+    result.hidden = false;
+    result.textContent = monitor.tailscale_issue;
+  }
 }
 
 async function updateMobileMonitor(event) {
@@ -1642,7 +1649,9 @@ async function updateMobileMonitor(event) {
     });
     renderMobileMonitor(monitor);
     result.textContent = monitor.enabled
-      ? "Mobile Monitor is running. Configure Tailscale Serve for private iPhone access."
+      ? monitor.tailscale_ready
+        ? "Mobile Monitor and Tailscale Serve are ready."
+        : monitor.tailscale_issue || "Configure Tailscale Serve for private iPhone access."
       : "Mobile Monitor is disabled.";
   } catch (error) {
     input.checked = !input.checked;
@@ -1684,9 +1693,9 @@ async function refreshMobileMonitorUrl() {
   try {
     const monitor = await api("/api/mobile-monitor");
     renderMobileMonitor(monitor);
-    result.textContent = monitor.private_url
+    result.textContent = monitor.tailscale_ready && monitor.private_url
       ? "Private Tailscale URL found. Open it on your iPhone."
-      : "No private URL found yet. The successful command prints the private https://…ts.net URL in Terminal; you can use it there or retry Refresh.";
+      : monitor.tailscale_issue || "No private URL found yet. Run the copied command, then retry Refresh.";
   } catch (error) {
     result.textContent = error.message;
   } finally {

@@ -22,6 +22,10 @@ def _port_is_available(host: str, port: int) -> bool:
     family = socket.AF_INET6 if ":" in host else socket.AF_INET
     try:
         with socket.socket(family, socket.SOCK_STREAM) as probe:
+            # Permit immediate reuse after a normal app restart. Without this,
+            # macOS can leave the preferred ports unavailable during TCP
+            # teardown even though no process is listening on them.
+            probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             probe.bind((host, port))
     except OSError:
         return False

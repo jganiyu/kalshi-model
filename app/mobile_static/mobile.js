@@ -140,7 +140,7 @@ function renderHud(readiness) {
 }
 
 function tradeResult(trade) {
-  const status = String(trade.status || trade.action || "Open");
+  const status = String(trade.display_status || trade.status || trade.action || "Open");
   return trade.realized_pnl == null ? status : `${status} · ${money(trade.realized_pnl)}`;
 }
 

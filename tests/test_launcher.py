@@ -31,6 +31,29 @@ def test_port_probe_detects_active_listener() -> None:
         assert launcher._port_is_available("127.0.0.1", port) is False
 
 
+def test_port_probe_requests_immediate_restart_reuse(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[tuple[object, ...]] = []
+
+    class Probe:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            pass
+
+        def setsockopt(self, *args: object) -> None:
+            calls.append(args)
+
+        def bind(self, address: tuple[str, int]) -> None:
+            calls.append(("bind", address))
+
+    monkeypatch.setattr(launcher.socket, "socket", lambda *_args: Probe())
+
+    assert launcher._port_is_available("127.0.0.1", 8767) is True
+    assert (socket.SOL_SOCKET, socket.SO_REUSEADDR, 1) in calls
+    assert ("bind", ("127.0.0.1", 8767)) in calls
+
+
 @pytest.mark.parametrize("port", [0, 65536])
 def test_find_available_port_rejects_invalid_preference(port: int) -> None:
     with pytest.raises(ValueError):
