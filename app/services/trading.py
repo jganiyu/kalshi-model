@@ -786,6 +786,11 @@ class TradingCoordinator:
                     ),
                 )
         except (KalshiTradingError, ValueError):
+            if intent.action == "SELL":
+                try:
+                    await broker.reconcile()
+                except (KalshiTradingError, ValueError):
+                    pass
             return
         finally:
             if intent.source == "automatic":
@@ -904,6 +909,25 @@ class TradingCoordinator:
             )
             if reason is None:
                 continue
+            rejected_exits = self.db.fetch_all(
+                """
+                SELECT status,updated_at FROM broker_order_intents
+                WHERE mode=? AND ticker=? AND side=? AND action='SELL' AND source=?
+                ORDER BY id DESC LIMIT 7
+                """,
+                (broker.mode, ticker, side, reason.lower()),
+            )
+            consecutive_rejections = 0
+            last_rejected_at = None
+            for row in rejected_exits:
+                if row.get("status") != "REJECTED":
+                    break
+                consecutive_rejections += 1
+                last_rejected_at = last_rejected_at or parse_time(row.get("updated_at"))
+            if consecutive_rejections and last_rejected_at:
+                retry_delay = min(60.0, float(2 ** min(consecutive_rejections, 6)))
+                if time.time() - last_rejected_at.timestamp() < retry_delay:
+                    continue
             pending_key = (broker.mode, ticker, side)
             if pending_key in self._pending_exit_keys:
                 continue
@@ -931,6 +955,7 @@ class TradingCoordinator:
                 source=reason.lower(),
                 price_ranges=current.get("price_ranges"),
                 decision_snapshot={"trigger": reason, "executable_bid": bid, "priority": priority},
+                risk_snapshot={"exchange_index": current.get("exchange_index")},
             )
             self._pending_exit_keys.add(pending_key)
             task = asyncio.create_task(self._submit_exit(intent, pending_key))

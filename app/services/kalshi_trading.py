@@ -318,6 +318,7 @@ class KalshiTradingClient:
         post_only: bool = False,
         live_authorized: bool = False,
         price_ranges: list[dict[str, Any]] | None = None,
+        exchange_index: int | None = None,
     ) -> dict[str, Any]:
         if self.environment == "LIVE" and not live_authorized:
             raise KalshiTradingError("Live order submission is not armed.")
@@ -342,6 +343,8 @@ class KalshiTradingClient:
             "reduce_only": bool(reduce_only),
             "subaccount": 0,
         }
+        if exchange_index is not None:
+            payload["exchange_index"] = int(exchange_index)
         return await self._request(
             "POST",
             "/portfolio/events/orders",

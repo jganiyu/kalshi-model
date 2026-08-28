@@ -1318,7 +1318,7 @@ for (const [mode, label] of [["demo", "Demo"], ["live", "Live"]]) {
     { id: `${mode}_max_total_open_exposure`, label: "Maximum open exposure", unit: "dollars", min: 0, max: 100000000, step: 10, tip: "Hard exposure ceiling across all open markets." },
     { id: `${mode}_max_open_orders`, label: "Maximum open orders", unit: "orders", min: 0, max: 10000, step: 1, integer: true, tip: "Maximum number of resting or partially filled orders." },
     { id: `${mode}_max_daily_loss`, label: "Maximum daily loss", unit: "dollars", min: 0, max: 100000000, step: 10, tip: "Daily realized and unrealized equity loss that blocks new exposure." },
-    { id: `${mode}_max_daily_order_count`, label: "Maximum daily orders", unit: "orders", min: 0, max: 1000000, step: 1, integer: true, tip: "Maximum submitted order intents per UTC day." },
+    { id: `${mode}_max_daily_order_count`, label: "Maximum daily orders", unit: "orders", min: 0, max: 1000000, step: 1, integer: true, tip: "Maximum orders accepted for exchange handling per UTC day; rejected attempts do not count." },
     { id: `${mode}_max_entry_price`, label: "Maximum entry price", unit: "cents", min: 1, max: 99, step: 1, scale: 100, tip: "Highest outcome price allowed for new exposure." },
     { id: `${mode}_max_spread`, label: "Maximum spread", unit: "cents", min: 0, max: 99, step: 1, scale: 100, tip: "Hard spread ceiling independent of strategy settings." },
     { id: `${mode}_min_liquidity`, label: "Minimum liquidity", unit: "contracts", min: 0, max: 1000000, step: 1, integer: true, tip: "Hard minimum at the selected executable quote." },

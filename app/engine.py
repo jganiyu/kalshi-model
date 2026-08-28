@@ -1607,10 +1607,12 @@ class AnalysisEngine:
         restored_from_id: int | None = None,
     ) -> dict[str, Any]:
         async with self._update_lock:
+            current_settings = self.db.settings()
             live_limit_changed = any(
                 key.startswith("live_")
                 and key not in {"live_automatic_trading_enabled"}
-                for key in updates
+                and current_settings.get(key) != value
+                for key, value in updates.items()
             )
             settings = self.db.update_settings(
                 updates, restored_from_id=restored_from_id
@@ -1618,8 +1620,7 @@ class AnalysisEngine:
             if live_limit_changed:
                 live_broker = self.trading.broker("LIVE")
                 if isinstance(live_broker, KalshiBroker):
-                    live_broker.disarm("Live limits changed; review them before rearming.")
-                    live_broker._update_mode_state(limits_reviewed_at=None)
+                    live_broker.disarm("Live limits changed; rearm to continue.")
             self._refresh_cached_dashboard(iso_now())
             return settings
 

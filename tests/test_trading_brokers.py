@@ -51,8 +51,11 @@ class FakeTradingClient:
             "portfolio_value": 0,
         }
         self.cancel_tickers: list[str | None] = []
+        self.balance_calls = 0
+        self.reject_sells = False
 
     async def balance(self):
+        self.balance_calls += 1
         return dict(self.balance_payload)
 
     async def orders(self, **_):
@@ -71,6 +74,8 @@ class FakeTradingClient:
         if self.timeout:
             raise AmbiguousSubmissionError("ambiguous")
         self.created.append(payload)
+        if self.reject_sells and payload["action"] == "SELL":
+            raise KalshiTradingError("invalid order", status_code=400)
         order = {
             "order_id": f"order-{len(self.created)}",
             "client_order_id": payload["client_order_id"],
@@ -610,6 +615,47 @@ async def test_each_entry_hard_limit_blocks_submission(
     with pytest.raises(ValueError, match=message):
         await broker.submit(intent)
     assert client.created == []
+
+
+@run_async
+async def test_rejected_intents_do_not_consume_daily_order_limit(
+    tmp_path: Path,
+) -> None:
+    db, broker, client = await ready_broker(tmp_path)
+    db.update_settings({"demo_max_daily_order_count": 1})
+    rejected = OrderIntent(
+        "DEMO", "REJECTED", "YES", "BUY", 1, 0.40,
+        "MANUAL", "manual", risk_snapshot={
+            "data_reliable": False, "market_open": True,
+        },
+    )
+    with pytest.raises(ValueError, match="stale or unreliable"):
+        await broker.submit(rejected)
+    assert broker.daily_order_count() == 0
+    assert broker.risk_state()["daily_order_count"] == 0
+
+    accepted = OrderIntent(
+        "DEMO", "ACCEPTED", "YES", "BUY", 1, 0.40,
+        "MANUAL", "manual", risk_snapshot={
+            "data_reliable": True, "market_open": True,
+        },
+    )
+    await broker.submit(accepted)
+    assert broker.daily_order_count() == 1
+    assert broker.risk_state()["primary_blocker"] == (
+        "The daily order-count limit is active."
+    )
+
+    blocked = OrderIntent(
+        "DEMO", "BLOCKED", "YES", "BUY", 1, 0.40,
+        "MANUAL", "manual", risk_snapshot={
+            "data_reliable": True, "market_open": True,
+        },
+    )
+    with pytest.raises(ValueError, match="daily order-count"):
+        await broker.submit(blocked)
+    assert len(client.created) == 1
+    assert broker.daily_order_count() == 1
 
 
 @run_async
@@ -1234,6 +1280,54 @@ async def test_profit_take_is_managed_when_another_mode_is_selected(
     await coordinator.process(current)
     assert db.fetch_one(
         "SELECT COUNT(*) count FROM broker_order_intents WHERE mode='DEMO' AND action='SELL'"
+    )["count"] == 1
+
+
+@run_async
+async def test_rejected_protective_exit_reconciles_and_backs_off(
+    tmp_path: Path,
+) -> None:
+    db = make_db(tmp_path)
+    coordinator = TradingCoordinator(
+        AppConfig(database_path=db.path), db, PaperTradingService(db)
+    )
+    broker = coordinator.broker("DEMO")
+    assert isinstance(broker, KalshiBroker)
+    client = FakeTradingClient()
+    client.remote_positions = [{
+        "ticker": "EXIT-RETRY", "position_fp": "10.00",
+        "market_exposure_dollars": "2.00", "realized_pnl_dollars": "0.00",
+        "fees_paid_dollars": "0.02",
+    }]
+    broker.set_client(client)  # type: ignore[arg-type]
+    await broker.reconcile()
+    broker.arm(confirmation="ARM DEMO TRADING")
+    client.reject_sells = True
+    current = {
+        "ticker": "EXIT-RETRY", "status": "active", "observed_at": iso_now(),
+        "time_remaining_seconds": 300, "yes_bid": 0.99, "no_bid": 0.01,
+        "exchange_index": 2,
+        "price_ranges": [
+            {"start": "0.0000", "end": "0.1000", "step": "0.0010"},
+            {"start": "0.1000", "end": "0.9000", "step": "0.0100"},
+            {"start": "0.9000", "end": "1.0000", "step": "0.0010"},
+        ],
+        "trade_assessments": {}, "trade_decisions": {},
+    }
+
+    await coordinator.process(current)
+    await asyncio.gather(*list(coordinator._submission_tasks))
+    assert client.balance_calls == 2
+    assert len(client.created) == 1
+    assert client.created[0]["exchange_index"] == 2
+
+    for _ in range(3):
+        await coordinator.process(current)
+        await asyncio.gather(*list(coordinator._submission_tasks))
+    assert len(client.created) == 1
+    assert db.fetch_one(
+        "SELECT COUNT(*) count FROM broker_order_intents "
+        "WHERE mode='DEMO' AND ticker='EXIT-RETRY' AND action='SELL'"
     )["count"] == 1
 
 

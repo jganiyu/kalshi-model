@@ -9,6 +9,7 @@ from app.config import AppConfig
 from app.db import MIGRATIONS, Database
 from app.domain import iso_now
 from app.engine import AnalysisEngine
+from app.services.broker import KalshiBroker
 from app.services.decision import Decision, make_trade_assessment
 from app.services.paper import PaperTradingService
 
@@ -640,6 +641,54 @@ def test_market_summary_preserves_exchange_routing_index(tmp_path: Path) -> None
         {"ticker": "KXBTC15M-TEST", "status": "active", "exchange_index": 2}
     )
     assert summary and summary["exchange_index"] == 2
+
+
+def test_live_limit_review_persists_across_calibration_saves_and_restart(
+    tmp_path: Path,
+) -> None:
+    db = make_db(tmp_path)
+    engine = AnalysisEngine(AppConfig(database_path=db.path), db)
+    broker = engine.trading.broker("LIVE")
+    assert isinstance(broker, KalshiBroker)
+    reviewed_at = "2026-08-28T12:00:00+00:00"
+    db.execute(
+        """
+        UPDATE broker_mode_state SET authenticated=1,reconciled=1,
+            reconciliation_required=0,demo_verified_at=?,limits_reviewed_at=?
+        WHERE mode='LIVE'
+        """,
+        (reviewed_at, reviewed_at),
+    )
+    broker.session_armed = True
+    broker.automatic_armed = True
+
+    current = db.settings()
+    unchanged_live_limits = {
+        key: value for key, value in current.items()
+        if key.startswith("live_")
+        and key != "live_automatic_trading_enabled"
+    }
+    asyncio.run(engine.apply_settings({
+        **unchanged_live_limits,
+        "minimum_buy_probability": 0.70,
+    }))
+
+    assert broker.session_armed is True
+    assert broker.automatic_armed is True
+    assert broker.mode_state()["limits_reviewed_at"] == reviewed_at
+
+    asyncio.run(engine.apply_settings({"live_max_amount_per_order": 25.0}))
+
+    assert broker.session_armed is False
+    assert broker.automatic_armed is False
+    assert broker.mode_state()["limits_reviewed_at"] == reviewed_at
+
+    restarted = AnalysisEngine(AppConfig(database_path=db.path), db)
+    restarted_broker = restarted.trading.broker("LIVE")
+    assert isinstance(restarted_broker, KalshiBroker)
+    restarted_broker.arm(confirmation="ARM LIVE TRADING")
+    assert restarted_broker.readiness()["limits_reviewed"] is True
+    assert restarted_broker.session_armed is True
 
 
 def test_demo_execution_state_uses_demo_book_without_live_fallback(

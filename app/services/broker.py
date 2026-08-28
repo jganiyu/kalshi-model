@@ -34,6 +34,7 @@ OPEN_ORDER_STATES = {
     "RECONCILIATION_REQUIRED",
 }
 FINAL_ORDER_STATES = {"FILLED", "CANCELED", "REJECTED", "EXPIRED", "SETTLED"}
+NON_COUNTED_DAILY_INTENT_STATES = {"INTENT_CREATED", "REJECTED"}
 
 
 def normalize_mode(value: Any) -> str:
@@ -616,10 +617,6 @@ class KalshiBroker(Broker):
             _number(latest.get("portfolio_value")),
         )
         daily_pnl = current_equity - starting_equity if first and latest else 0.0
-        count = self.db.fetch_one(
-            "SELECT COUNT(*) AS count FROM broker_order_intents WHERE mode=? AND created_at LIKE ?",
-            (self.mode, f"{today}%"),
-        ) or {}
         open_orders = self.db.fetch_one(
             """
             SELECT COUNT(*) AS count FROM broker_orders WHERE mode=?
@@ -641,7 +638,7 @@ class KalshiBroker(Broker):
             "min_liquidity": int(settings[f"{prefix}_min_liquidity"]),
             "min_data_quality": str(settings[f"{prefix}_min_data_quality"]),
         }
-        order_count = int(count.get("count") or 0)
+        order_count = self.daily_order_count(today)
         open_order_count = int(open_orders.get("count") or 0)
         allocated = self.allocated_capital()
         failures: list[str] = []
@@ -666,6 +663,27 @@ class KalshiBroker(Broker):
             "limits": limits,
             "checked_at": iso_now(),
         }
+
+    def daily_order_count(self, day: str | None = None) -> int:
+        """Count orders that reached submission or exchange handling.
+
+        Locally created intents and rejected attempts are retained for auditability,
+        but they do not consume the user's accepted-order safety allowance.
+        """
+        target_day = day or datetime.now(UTC).date().isoformat()
+        placeholders = ",".join("?" for _ in NON_COUNTED_DAILY_INTENT_STATES)
+        row = self.db.fetch_one(
+            f"""
+            SELECT COUNT(*) AS count FROM broker_order_intents
+            WHERE mode=? AND created_at LIKE ? AND status NOT IN ({placeholders})
+            """,
+            (
+                self.mode,
+                f"{target_day}%",
+                *sorted(NON_COUNTED_DAILY_INTENT_STATES),
+            ),
+        ) or {}
+        return int(row.get("count") or 0)
 
     def audit_history(self, limit: int = 200) -> list[dict[str, Any]]:
         rows = self.db.fetch_all(
@@ -879,11 +897,7 @@ class KalshiBroker(Broker):
             if data_quality is not None and quality_rank.get(data_quality, -1) < quality_rank.get(required, 1):
                 failures.append("Data quality is below the hard minimum.")
             today = datetime.now(UTC).date().isoformat()
-            order_count = self.db.fetch_one(
-                "SELECT COUNT(*) AS count FROM broker_order_intents WHERE mode=? AND created_at LIKE ?",
-                (self.mode, f"{today}%"),
-            )
-            if int((order_count or {}).get("count") or 0) > int(
+            if self.daily_order_count(today) >= int(
                 settings[f"{prefix}_max_daily_order_count"]
             ):
                 failures.append("The daily order-count limit is active.")
@@ -1004,6 +1018,7 @@ class KalshiBroker(Broker):
                 post_only=intent.post_only,
                 live_authorized=self.session_armed,
                 price_ranges=intent.price_ranges,
+                exchange_index=intent.risk_snapshot.get("exchange_index"),
             )
         except AmbiguousSubmissionError as exc:
             self._set_intent(
