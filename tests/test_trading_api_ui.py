@@ -85,6 +85,9 @@ def test_trading_ui_contains_mode_safety_and_confirmation_controls() -> None:
     assert "Risk review" in script
     assert 'disabled = !preview.risk?.passed' in script
     assert "ARM LIVE TRADING" in script
+    assert "Type ${phrase} to arm this session" not in script
+    assert 'pending ? "Confirm" : "Arm session"' in script
+    assert "Click Confirm within 6 seconds" in script
     assert "VERIFY DEMO TRADING" in script
     assert "data.ledger || []" in script
     assert "paper.ledger || []" in script

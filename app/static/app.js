@@ -19,7 +19,10 @@ const state = {
     stopInitialized: false, sideUpdating: false,
   },
   paperReset: { confirming: false, resetting: false, timer: null },
-  trading: { mode: "PAPER", pendingConfirmation: null, switching: false },
+  trading: {
+    mode: "PAPER", pendingConfirmation: null, switching: false,
+    armConfirmation: { mode: null, confirming: false, submitting: false, timer: null },
+  },
   calibration: { saved: null, defaults: null, dirty: false },
 };
 
@@ -755,6 +758,7 @@ function updateSelectedSide(side) {
 
 async function selectTradingMode(mode) {
   if (state.trading.switching || mode === state.trading.mode) return;
+  resetArmConfirmation();
   state.trading.switching = true;
   try {
     await api("/api/trading/mode", {
@@ -774,6 +778,7 @@ async function selectTradingMode(mode) {
 async function reconcileSelectedTrading() {
   const { mode } = selectedTrading();
   if (mode === "PAPER") return;
+  resetArmConfirmation();
   try {
     await api(`/api/trading/${mode}/reconcile`, { method: "POST" });
     await refreshDashboard();
@@ -782,31 +787,75 @@ async function reconcileSelectedTrading() {
   } catch (error) { showToast("Reconciliation failed", error.message); }
 }
 
+function syncArmButton(readiness = selectedTrading().selected?.readiness || {}, mode = selectedTrading().mode) {
+  const button = $("#arm-trading");
+  if (!button) return;
+  const confirmation = state.trading.armConfirmation;
+  const pending = confirmation.confirming && confirmation.mode === mode && !readiness.session_armed;
+  button.classList.toggle("confirming", pending);
+  button.disabled = confirmation.submitting;
+  button.textContent = readiness.session_armed
+    ? "Disarm session"
+    : confirmation.submitting ? "Arming…" : pending ? "Confirm" : "Arm session";
+}
+
+function resetArmConfirmation() {
+  const confirmation = state.trading.armConfirmation;
+  clearTimeout(confirmation.timer);
+  confirmation.mode = null;
+  confirmation.confirming = false;
+  confirmation.submitting = false;
+  confirmation.timer = null;
+  syncArmButton();
+}
+
 async function armSelectedTrading() {
   const { mode, selected } = selectedTrading();
   if (mode === "PAPER") return;
   if (selected?.readiness?.session_armed) {
+    resetArmConfirmation();
     await api(`/api/trading/${mode}/disarm`, { method: "POST" });
     await refreshDashboard();
     await loadPaper();
     return;
   }
+
+  const confirmationState = state.trading.armConfirmation;
+  if (!confirmationState.confirming || confirmationState.mode !== mode) {
+    resetArmConfirmation();
+    confirmationState.mode = mode;
+    confirmationState.confirming = true;
+    syncArmButton(selected?.readiness, mode);
+    showToast(
+      `Arm ${modeLabel(mode)}?`,
+      "Click Confirm within 6 seconds to authorize this session.",
+    );
+    confirmationState.timer = setTimeout(resetArmConfirmation, 6000);
+    return;
+  }
+
+  clearTimeout(confirmationState.timer);
+  confirmationState.submitting = true;
+  syncArmButton(selected?.readiness, mode);
   const phrase = mode === "LIVE" ? "ARM LIVE TRADING" : "ARM DEMO TRADING";
-  const confirmation = window.prompt(`Type ${phrase} to arm this session.`);
-  if (confirmation == null) return;
   try {
     await api(`/api/trading/${mode}/arm`, {
-      method: "POST", body: JSON.stringify({ confirmation, automatic: false }),
+      method: "POST", body: JSON.stringify({ confirmation: phrase, automatic: false }),
     });
     await refreshDashboard();
     await loadPaper();
     showToast(`${modeLabel(mode)} armed`, "Manual limit orders are now authorized for this session.");
-  } catch (error) { showToast("Session not armed", error.message); }
+  } catch (error) {
+    showToast("Session not armed", error.message);
+  } finally {
+    resetArmConfirmation();
+  }
 }
 
 async function killSelectedTrading() {
   const { mode, selected } = selectedTrading();
   if (mode === "PAPER") return;
+  resetArmConfirmation();
   try {
     const release = Boolean(selected?.readiness?.kill_switch);
     await api(`/api/trading/${mode}/kill${release ? "/release" : ""}`, { method: "POST" });
@@ -1458,7 +1507,14 @@ async function loadPaper() {
     ? "Paper is ready. No exchange order is placed."
     : readiness.blocker || `${modeLabel(mode)} is reconciled and ${readiness.session_armed ? "armed" : "disarmed"}.`;
   $("#trading-command-status").classList.toggle("blocked", mode !== "PAPER" && !readiness.ready_for_manual);
-  $("#arm-trading").textContent = readiness.session_armed ? "Disarm session" : "Arm session";
+  if (readiness.session_armed || state.trading.armConfirmation.mode !== mode) {
+    clearTimeout(state.trading.armConfirmation.timer);
+    state.trading.armConfirmation.mode = null;
+    state.trading.armConfirmation.confirming = false;
+    state.trading.armConfirmation.submitting = false;
+    state.trading.armConfirmation.timer = null;
+  }
+  syncArmButton(readiness, mode);
   $("#kill-trading").textContent = readiness.kill_switch ? "Release kill switch" : "Kill switch";
   $("#automatic-trading-toggle").checked = Boolean(readiness.automatic_armed);
   $("#automatic-trading-toggle").disabled = !readiness.session_armed || readiness.kill_switch;
