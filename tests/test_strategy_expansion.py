@@ -17,7 +17,9 @@ from app.services.paper import PaperTradingService
 def make_db(tmp_path: Path) -> Database:
     db = Database(tmp_path / "strategies.db")
     db.initialize()
-    db.update_settings({"paper_trading_enabled": True})
+    db.update_settings(
+        {"paper_trading_enabled": True, "threshold_margin_gate_dollars": 0}
+    )
     return db
 
 
@@ -105,6 +107,7 @@ def strategy_call(
     coverage: float = 0.0,
     z_distance: float = 0.0,
     standard_decisions: dict[str, Decision] | None = None,
+    threshold_margin_dollars: float | None = None,
 ) -> dict:
     return service.consider_strategies(
         ticker=ticker,
@@ -119,9 +122,98 @@ def strategy_call(
         threshold_state=threshold_state,
         settlement_window={"coverage": coverage},
         z_distance=z_distance,
+        threshold_margin_dollars=threshold_margin_dollars,
         model_version="test",
         now=now,
     )
+
+
+def test_threshold_margin_gate_is_directional_and_resets_confirmation(
+    tmp_path: Path,
+) -> None:
+    db = make_db(tmp_path)
+    add_market(db, "MARGIN-GATE")
+    db.update_settings(
+        {
+            "early_threshold_enabled": False,
+            "late_conviction_enabled": False,
+            "threshold_margin_gate_dollars": 50.0,
+            "automatic_confirmation_seconds": 5,
+            "automatic_min_confidence": "Moderate",
+        }
+    )
+    service = PaperTradingService(db)
+    side_assessments = assessments(0.75, yes_bid=0.38, yes_ask=0.40)
+    decisions = {
+        "YES": buy("YES", side_assessments["YES"]),
+        "NO": hold("NO"),
+    }
+
+    blocked = strategy_call(
+        service,
+        ticker="MARGIN-GATE",
+        side_assessments=side_assessments,
+        observed_at="2026-08-24T12:01:00+00:00",
+        standard_decisions=decisions,
+        threshold_margin_dollars=49.99,
+        now=0,
+    )["standard_edge_readiness"]
+    assert blocked["status"] == "BLOCKED"
+    assert blocked["gates"]["threshold_margin"] == {
+        "enabled": True,
+        "passed": False,
+        "current": pytest.approx(49.99),
+        "required": pytest.approx(50.0),
+        "detail": (
+            "The BTC proxy must be at least $50.00 above the threshold "
+            "for an Up entry."
+        ),
+    }
+    assert blocked["metrics"]["confirmation"]["locked"] is True
+
+    strategy_call(
+        service,
+        ticker="MARGIN-GATE",
+        side_assessments=side_assessments,
+        observed_at="2026-08-24T12:01:01+00:00",
+        standard_decisions=decisions,
+        threshold_margin_dollars=55.0,
+        now=1,
+    )
+    progressing = strategy_call(
+        service,
+        ticker="MARGIN-GATE",
+        side_assessments=side_assessments,
+        observed_at="2026-08-24T12:01:04+00:00",
+        standard_decisions=decisions,
+        threshold_margin_dollars=55.0,
+        now=4,
+    )["standard_edge_readiness"]
+    assert progressing["metrics"]["confirmation"]["progress"] > 0
+
+    reset = strategy_call(
+        service,
+        ticker="MARGIN-GATE",
+        side_assessments=side_assessments,
+        observed_at="2026-08-24T12:01:05+00:00",
+        standard_decisions=decisions,
+        threshold_margin_dollars=-55.0,
+        now=5,
+    )["standard_edge_readiness"]
+    assert reset["gates"]["threshold_margin"]["passed"] is False
+    assert reset["metrics"]["confirmation"]["progress"] == 0
+    assert db.fetch_one("SELECT id FROM paper_trades WHERE ticker='MARGIN-GATE'") is None
+
+    down_passed = service._threshold_margin_gate(
+        db.settings(), side="NO", margin_dollars=-55.0
+    )
+    down_blocked = service._threshold_margin_gate(
+        db.settings(), side="NO", margin_dollars=55.0
+    )
+    assert down_passed["passed"] is True
+    assert down_passed["required"] == pytest.approx(-50.0)
+    assert down_blocked["passed"] is False
+    assert down_blocked["detail"].endswith("below the threshold for a Down entry.")
 
 
 def test_buy_and_sell_ev_are_action_specific() -> None:
@@ -842,7 +934,7 @@ def test_dashboard_markup_has_one_book_and_paper_trade_history() -> None:
     assert 'id="standard-edge-hud"' in markup
     assert 'id="standard-edge-confirmation-track"' in markup
     assert 'id="standard-edge-quality-gate"' in markup
-    assert markup.count('class="hud-help"') == 11
+    assert markup.count('class="hud-help"') == 12
     assert 'data-tooltip="The model probability' in markup
     assert 'aria-label="About risk controls"' in markup
     assert markup.count("v={{ asset_version }}") == 2

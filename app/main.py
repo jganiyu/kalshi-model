@@ -479,6 +479,7 @@ def clean_settings_payload(payload: dict[str, Any]) -> dict[str, Any]:
         "automatic_entry_window_minutes": (0.25, 15.0),
         "automatic_confirmation_seconds": (1.0, 120.0),
         "automatic_buy_duration_pct": (0.50, 1.0),
+        "threshold_margin_gate_dollars": (0.0, 100_000.0),
         "early_bankroll_pct": (0.0, 1.0),
         "early_min_probability": (0.50, 0.99),
         "early_min_net_ev": (0.0, 0.50),

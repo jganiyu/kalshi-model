@@ -76,6 +76,7 @@ def test_trading_ui_contains_mode_safety_and_confirmation_controls() -> None:
         assert f'data-trading-mode="{mode}"' in template
     for control in (
         "live-armed-indicator", "automatic-trading-toggle", "arm-trading",
+        "hud-arm-trading",
         "kill-trading", "reconcile-trading", "trade-confirmation",
         "exchange-order-table", "position-table",
     ):
@@ -94,6 +95,11 @@ def test_trading_ui_contains_mode_safety_and_confirmation_controls() -> None:
     assert "Unsettled positions" in template
     assert "they are not resting orders" in template
     assert "trade.display_status || trade.status" in script
+    assert 'data-window="15"' in template
+    assert 'data-window="180"' not in template
+    assert "Settle margin" in template
+    assert "threshold_margin_gate_dollars" in script
+    assert "$$('[data-arm-session]')" in script
 
 
 def test_private_stream_accepts_current_singular_event_types() -> None:

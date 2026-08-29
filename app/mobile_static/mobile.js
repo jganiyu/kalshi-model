@@ -43,6 +43,12 @@ function money(value) {
     : new Intl.NumberFormat("en-US", { style: "currency", currency: "USD" }).format(Number(value));
 }
 
+function signedMoney(value) {
+  if (value == null || !Number.isFinite(Number(value))) return "—";
+  const number = Number(value);
+  return `${number > 0 ? "+" : number < 0 ? "−" : ""}${money(Math.abs(number))}`;
+}
+
 function price(value) {
   return value == null || !Number.isFinite(Number(value))
     ? "--"
@@ -135,6 +141,11 @@ function renderHud(readiness) {
   setGate("#gate-liquidity", liquidity, liquidityLabel);
   setGate("#gate-data", gates.data, gates.data?.passed ? "Fresh" : "Blocked");
   setGate("#gate-quality", quality, quality.current == null ? "--" : `${quality.current} / ${quality.required || "--"}`);
+  const threshold = gates.threshold_margin || {};
+  const thresholdLabel = threshold.enabled === false ? "Off" : threshold.current == null
+    ? `-- / ${signedMoney(threshold.required)}`
+    : `${signedMoney(threshold.current)} / ${signedMoney(threshold.required)}`;
+  setGate("#gate-threshold", threshold, thresholdLabel);
   setGate("#gate-risk", gates.risk, gates.risk?.passed ? "Clear" : "Blocked");
   $("#hud-blocker").textContent = readiness?.blocker || "Waiting for live trade data.";
 }
@@ -158,10 +169,32 @@ function renderTrades(trades, mode) {
       <div class="trade-grid">
         <div><span>Price</span><b>${escapeHtml(cents(trade.entry_price ?? trade.price))}</b></div>
         <div><span>Quantity</span><b>${escapeHtml(compact(trade.contracts))}</b></div>
+        <div><span>Settle margin</span><b class="${Number(trade.settlement_margin) > 0 ? "positive" : Number(trade.settlement_margin) < 0 ? "negative" : ""}">${escapeHtml(signedMoney(trade.settlement_margin))}</b></div>
         <div><span>Strategy</span><b>${escapeHtml(strategy)}</b></div>
         <div><span>Result / P&amp;L</span><b class="${pnlClass}">${escapeHtml(tradeResult(trade))}</b></div>
         <div><span>Available after</span><b>${escapeHtml(money(trade.available_cash_after))}</b></div>
       </div>
+    </article>`;
+  }).join("");
+}
+
+function renderOpenTrades(trades, mode, availableCash, market) {
+  $("#open-trades-label").textContent = mode;
+  $("#available-funds").textContent = money(availableCash);
+  $("#current-up-price").textContent = cents(market?.up_price);
+  $("#current-down-price").textContent = cents(market?.down_price);
+  const target = $("#open-trade-list");
+  if (!trades?.length) {
+    target.innerHTML = '<p class="empty compact">No open trades.</p>';
+    return;
+  }
+  target.innerHTML = trades.map((trade) => {
+    const strategy = String(trade.strategy || "Manual").replaceAll("_", " ");
+    const sideClass = String(trade.side).toUpperCase() === "YES" ? "positive" : "negative";
+    return `<article class="open-trade">
+      <div class="open-trade-head"><strong class="${sideClass}">${escapeHtml(sideLabel(trade.side))}</strong><span>${escapeHtml(strategy)}</span></div>
+      <p title="${escapeHtml(trade.ticker)}">${escapeHtml(trade.ticker || "Current market")}</p>
+      <div><span>${escapeHtml(compact(trade.contracts))} contracts</span><span>${escapeHtml(cents(trade.entry_price))} entry</span><span>${escapeHtml(money(trade.exposure))} exposure</span></div>
     </article>`;
   }).join("");
 }
@@ -173,10 +206,12 @@ function render(data) {
   $("#last-updated").textContent = data?.updated_at ? `Updated ${timeLabel(data.updated_at)}` : "Waiting for data";
   $("#market-to-beat").textContent = price(data?.market?.to_beat);
   $("#market-btc-proxy").textContent = price(data?.market?.btc_proxy);
+  $("#market-btc-margin").textContent = `${signedMoney(data?.market?.btc_margin)} to beat`;
   const remaining = Number(data?.market?.time_remaining_seconds);
   timerDeadline = Number.isFinite(remaining) ? Date.now() + Math.max(0, remaining) * 1000 : null;
   updateTimer();
   renderHud(data?.readiness);
+  renderOpenTrades(data?.open_trades || [], mode, data?.available_cash, data?.market);
   renderTrades(data?.recent_trades || [], mode);
 }
 

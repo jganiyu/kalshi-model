@@ -1311,6 +1311,7 @@ class AnalysisEngine:
             threshold_state=threshold_state,
             settlement_window=settlement_window,
             z_distance=baseline.z_distance,
+            threshold_margin_dollars=float(btc["price"]) - float(strike),
             model_version=model_version,
             portfolio=portfolio,
             **execution_kwargs,
@@ -1556,6 +1557,7 @@ class AnalysisEngine:
                 "status": trade.get("status"),
                 "realized_pnl": trade.get("realized_pnl"),
                 "available_cash_after": trade.get("available_cash_after"),
+                "settlement_margin": trade.get("settlement_margin"),
             }
             for trade in portfolio.get("trades", [])[:10]
         ]

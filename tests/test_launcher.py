@@ -60,6 +60,25 @@ def test_find_available_port_rejects_invalid_preference(port: int) -> None:
         launcher.find_available_port("127.0.0.1", port)
 
 
+def test_native_trackpad_zoom_enables_wkwebview_magnification() -> None:
+    calls: list[bool] = []
+    native_webview = SimpleNamespace(
+        setAllowsMagnification_=lambda enabled: calls.append(enabled)
+    )
+    window = SimpleNamespace(
+        uid="master",
+        gui=SimpleNamespace(
+            BrowserView=SimpleNamespace(
+                instances={"master": SimpleNamespace(webview=native_webview)}
+            )
+        ),
+    )
+
+    launcher._enable_native_trackpad_zoom(window)
+
+    assert calls == [True]
+
+
 def test_native_app_opens_window_and_stops_server(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

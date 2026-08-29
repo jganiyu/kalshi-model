@@ -51,6 +51,10 @@ def readiness() -> dict:
             "liquidity": {"current": 140, "required": 42, "passed": True},
             "data": {"passed": True, "detail": "Fresh"},
             "quality": {"current": "Moderate", "required": "Moderate", "passed": True},
+            "threshold_margin": {
+                "enabled": True, "current": -50.25, "required": -50.0,
+                "passed": True, "detail": "Outside the threshold band",
+            },
             "risk": {"passed": True, "detail": "Clear"},
         },
         "blocker": "Waiting for 2.1¢ more EV",
@@ -68,15 +72,23 @@ def dashboard(mode: str = "PAPER") -> dict:
             "status": "settled",
             "realized_pnl": 1.25,
             "available_cash_after": 1001.25,
+            "settlement_margin": 23.75,
         }
         for index in range(12)
     ]
     demo_trade = {**paper_trades[0], "side": "NO", "strategy": "DEMO_ONLY"}
     live_trade = {**paper_trades[0], "side": "YES", "strategy": "LIVE_ONLY"}
     modes = {
-        "PAPER": {"mode": "PAPER"},
-        "DEMO": {"mode": "DEMO", "ledger": [demo_trade]},
-        "LIVE": {"mode": "LIVE", "ledger": [live_trade]},
+        "PAPER": {
+            "mode": "PAPER", "available_cash": 995.0,
+            "positions": [{
+                "ticker": "KXBTC15M-TEST", "side": "YES", "contracts": 10,
+                "entry_price": 0.51, "committed_dollars": 5.1,
+                "strategy": "STANDARD_EDGE",
+            }],
+        },
+        "DEMO": {"mode": "DEMO", "available_cash": 500.0, "positions": [], "ledger": [demo_trade]},
+        "LIVE": {"mode": "LIVE", "available_cash": 300.0, "positions": [], "ledger": [live_trade]},
     }
     return {
         "system": {"status": "live", "updated_at": "2026-08-28T12:00:00+00:00"},
@@ -84,6 +96,8 @@ def dashboard(mode: str = "PAPER") -> dict:
         "current": {
             "strike": 79_450.0,
             "time_remaining_seconds": 182,
+            "yes_ask": 0.80,
+            "no_ask": 0.21,
             "standard_edge_readiness": readiness(),
         },
         "paper": {"recent_paper_trades": paper_trades},
@@ -108,9 +122,18 @@ def test_mobile_snapshot_matches_dashboard_hud_market_and_recent_trades() -> Non
     assert payload["market"] == {
         "to_beat": 79_450.0,
         "btc_proxy": 79_500.25,
+        "btc_margin": 50.25,
         "time_remaining_seconds": 182,
+        "up_price": 0.80,
+        "down_price": 0.21,
     }
     assert payload["recent_trades"] == source["paper"]["recent_paper_trades"][:10]
+    assert payload["available_cash"] == 995.0
+    assert payload["open_trades"] == [{
+        "ticker": "KXBTC15M-TEST", "side": "YES", "contracts": 10,
+        "entry_price": 0.51, "exposure": 5.1,
+        "strategy": "STANDARD_EDGE", "status": None,
+    }]
 
 
 def test_mobile_histories_are_isolated_by_selected_environment() -> None:
@@ -190,7 +213,14 @@ def test_mobile_frontend_supports_live_reconnect_theme_persistence_and_compact_l
     assert 'id="theme-toggle"' in template
     assert 'id="market-to-beat"' in template
     assert 'id="market-btc-proxy"' in template
+    assert 'id="market-btc-margin"' in template
     assert 'id="market-timer"' in template
+    assert 'id="open-trade-list"' in template
+    assert 'id="current-up-price"' in template
+    assert 'id="current-down-price"' in template
+    assert 'id="available-funds"' in template
+    assert "renderOpenTrades" in script
+    assert "settlement_margin" in script
     assert 'id="copy-mobile-monitor-command"' in (
         root / "app/templates/index.html"
     ).read_text()

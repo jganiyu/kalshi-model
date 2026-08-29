@@ -190,14 +190,39 @@ def test_stop_loss_and_settlement_record_available_cash(tmp_path: Path) -> None:
         ticker="SETTLE", side="YES", action="BUY", order_type="MARKET",
         market=market(), dollars=10,
     )
-    assert service.settle("SETTLE", 1, iso_now()) == 1
+    settled_at = iso_now()
+    assert service.settle("SETTLE", 1, settled_at) == 1
+    db.execute(
+        """
+        INSERT INTO settlements(
+            ticker,settled_at,result,settlement_value,raw_json,processed_at
+        ) VALUES (?,?,?,?,?,?)
+        """,
+        (
+            "SETTLE",
+            settled_at,
+            1,
+            1.0,
+            '{"expiration_value":"123.45"}',
+            settled_at,
+        ),
+    )
     after_settlement = service.portfolio()["available_cash"]
     settled_trade = db.fetch_one("SELECT * FROM paper_trades WHERE ticker='SETTLE'")
     settled_entry = db.fetch_one("SELECT * FROM paper_entries WHERE ticker='SETTLE'")
     assert settled_trade and settled_trade["status"] == "settled"
     assert settled_entry and settled_entry["status"] == "settled"
+    assert service.portfolio()["trades"][0]["settlement_margin"] == pytest.approx(23.45)
+    dashboard = AnalysisEngine(AppConfig(database_path=db.path), db)._portfolio_summary()
+    assert dashboard["recent_paper_trades"][0]["settlement_margin"] == pytest.approx(23.45)
     assert_available_after(settled_trade, after_settlement)
     assert_available_after(settled_entry, after_settlement)
+
+    db.execute(
+        "UPDATE settlements SET settlement_value=?,raw_json=? WHERE ticker=?",
+        (123.45, "{}", "SETTLE"),
+    )
+    assert service.portfolio()["trades"][0]["settlement_margin"] is None
 
 
 def test_every_automatic_strategy_records_available_cash(tmp_path: Path) -> None:
@@ -262,7 +287,7 @@ def test_available_after_columns_are_rendered_on_both_pages() -> None:
     script = (root / "app/static/app.js").read_text()
 
     assert markup.count("<th>Available after</th>") == 2
-    assert 'colspan="7">No paper trades yet' in markup
+    assert 'colspan="8">No paper trades yet' in markup
     assert 'colspan="10" class="empty-state">No paper trades yet.' in markup
     assert script.count("trade.available_cash_after") >= 2
     assert 'trade.available_cash_after == null ? "—"' in script

@@ -93,6 +93,14 @@ def _load_webview() -> Any:
     return webview
 
 
+def _enable_native_trackpad_zoom(window: Any) -> None:
+    """Enable WKWebView pinch magnification across the full desktop page."""
+    browser_view = window.gui.BrowserView.instances.get(window.uid)
+    native_webview = getattr(browser_view, "webview", None)
+    if native_webview is not None and hasattr(native_webview, "setAllowsMagnification_"):
+        native_webview.setAllowsMagnification_(True)
+
+
 def run_native_app(config: AppConfig, port: int) -> None:
     webview = _load_webview()
     server = LocalAppServer(config.host, port)
@@ -118,7 +126,7 @@ def run_native_app(config: AppConfig, port: int) -> None:
         )
         mobile_server.start()
         webview.settings["OPEN_EXTERNAL_LINKS_IN_BROWSER"] = True
-        webview.create_window(
+        window = webview.create_window(
             "Kalshi Model",
             url,
             width=NATIVE_WINDOW_WIDTH,
@@ -127,6 +135,8 @@ def run_native_app(config: AppConfig, port: int) -> None:
             background_color="#f7f7f5",
             zoomable=True,
         )
+        if window is not None:
+            window.events.before_show += _enable_native_trackpad_zoom
         webview.start(
             gui="cocoa",
             private_mode=False,

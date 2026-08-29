@@ -46,6 +46,24 @@ class PaperTradingService:
         settings = self.db.settings()
         starting = float(settings["starting_bankroll"])
         trades = self.db.fetch_all("SELECT * FROM paper_trades ORDER BY opened_at ASC")
+        settlement_rows = self.db.fetch_all(
+            """
+            SELECT s.ticker,
+                   COALESCE(
+                     json_extract(s.raw_json,'$.expiration_value'),
+                     json_extract(m.raw_json,'$.expiration_value')
+                   ) AS settlement_price,
+                   m.strike
+            FROM settlements s LEFT JOIN markets m ON m.ticker=s.ticker
+            """
+        )
+        settlement_margins = {
+            str(row["ticker"]): float(row["settlement_price"]) - float(row["strike"])
+            for row in settlement_rows
+            if row.get("settlement_price") is not None and row.get("strike") is not None
+        }
+        for trade in trades:
+            trade["settlement_margin"] = settlement_margins.get(str(trade["ticker"]))
         orders = self.db.fetch_all("SELECT * FROM paper_orders ORDER BY created_at ASC")
         settled = [trade for trade in trades if trade["status"] == "settled"]
         open_trades = [trade for trade in trades if trade["status"] == "open"]
@@ -1294,6 +1312,59 @@ class PaperTradingService:
             and self._confidence_meets(decision, required_confidence)
         ]
 
+    @staticmethod
+    def _threshold_margin_gate(
+        settings: dict[str, Any],
+        *,
+        side: str,
+        margin_dollars: float | None,
+    ) -> dict[str, Any]:
+        required = max(
+            0.0, float(settings.get("threshold_margin_gate_dollars", 50.0))
+        )
+        normalized_side = str(side or "YES").upper()
+        signed_required = required if normalized_side == "YES" else -required
+        if required <= 0:
+            return {
+                "enabled": False,
+                "passed": True,
+                "current": margin_dollars,
+                "required": signed_required,
+                "detail": "The threshold-margin gate is off.",
+            }
+        if margin_dollars is None or not math.isfinite(float(margin_dollars)):
+            return {
+                "enabled": True,
+                "passed": False,
+                "current": None,
+                "required": signed_required,
+                "detail": "Waiting for the BTC-proxy distance from the threshold.",
+            }
+        current = float(margin_dollars)
+        passed = (
+            current + 1e-12 >= required
+            if normalized_side == "YES"
+            else current - 1e-12 <= -required
+        )
+        direction = "above" if normalized_side == "YES" else "below"
+        label = "Up" if normalized_side == "YES" else "Down"
+        article = "an" if normalized_side == "YES" else "a"
+        detail = (
+            f"The BTC proxy is outside the ${required:,.2f} {label} threshold band."
+            if passed
+            else (
+                f"The BTC proxy must be at least ${required:,.2f} {direction} "
+                f"the threshold for {article} {label} entry."
+            )
+        )
+        return {
+            "enabled": True,
+            "passed": passed,
+            "current": current,
+            "required": signed_required,
+            "detail": detail,
+        }
+
     def _standard_entry_readiness(
         self,
         *,
@@ -1312,6 +1383,7 @@ class PaperTradingService:
         execution_mode: str = "PAPER",
         execution_block_reason: str | None = None,
         execution_risk_by_side: dict[str, dict[str, Any]] | None = None,
+        threshold_margin_dollars: float | None = None,
     ) -> dict[str, Any]:
         """Describe Standard Edge using the same inputs that drive execution."""
         settings = self.db.settings()
@@ -1367,6 +1439,9 @@ class PaperTradingService:
         ev_value = float(expected_value) if expected_value is not None else None
         spread_value = float(spread) if spread is not None else None
         liquidity_value = float(liquidity) if liquidity is not None else None
+        threshold_gate = self._threshold_margin_gate(
+            settings, side=side, margin_dollars=threshold_margin_dollars
+        )
 
         probability_passed = bool(
             probability_value is not None
@@ -1463,6 +1538,7 @@ class PaperTradingService:
             and liquidity_passed
             and data_passed
             and confidence_ok
+            and threshold_gate["passed"]
             and risk_passed
         )
         confirmation_progress = (
@@ -1489,6 +1565,7 @@ class PaperTradingService:
             or not liquidity_passed
             or not data_passed
             or not confidence_ok
+            or not threshold_gate["passed"]
             or not risk_passed
         ):
             status = "BLOCKED"
@@ -1505,6 +1582,8 @@ class PaperTradingService:
             blocker = "Outside the Standard Edge entry window."
         elif not raw_data_passed:
             blocker = data_detail
+        elif not threshold_gate["passed"]:
+            blocker = str(threshold_gate["detail"])
         elif not risk_passed:
             blocker = risk_detail
         elif not spread_passed:
@@ -1592,6 +1671,7 @@ class PaperTradingService:
                     "required": required_confidence,
                     "detail": quality_detail,
                 },
+                "threshold_margin": threshold_gate,
                 "risk": {
                     "passed": risk_passed,
                     "detail": risk_detail,
@@ -2030,6 +2110,7 @@ class PaperTradingService:
         threshold_state: dict[str, Any] | None,
         settlement_window: dict[str, Any],
         z_distance: float,
+        threshold_margin_dollars: float | None = None,
         model_version: str,
         portfolio: dict[str, Any] | None = None,
         now: float | None = None,
@@ -2097,6 +2178,7 @@ class PaperTradingService:
                 execution_mode=execution_mode,
                 execution_block_reason=execution_block_reason,
                 execution_risk_by_side=execution_risk_by_side,
+                threshold_margin_dollars=threshold_margin_dollars,
             )
             result["swing_readiness"] = self._swing_entry_readiness(
                 ticker=ticker,
@@ -2133,6 +2215,13 @@ class PaperTradingService:
             self.reset_automatic_confirmation()
             result["blocked_reason"] = "The market is not active."
             return finish(blocked_reason=result["blocked_reason"])
+
+        def margin_gate(side: str) -> dict[str, Any]:
+            return self._threshold_margin_gate(
+                settings,
+                side=side,
+                margin_dollars=threshold_margin_dollars,
+            )
         early_candidate = None
         threshold_ready = False
         if threshold_state and observed is not None and opened is not None:
@@ -2160,6 +2249,15 @@ class PaperTradingService:
                 minimum_liquidity=int(settings.get("early_min_liquidity_contracts", 1)),
             )
         if early_candidate:
+            threshold_gate = margin_gate(str(early_candidate["side"]))
+            if not threshold_gate["passed"]:
+                self.reset_automatic_confirmation()
+                result["active_strategy"] = "EARLY_THRESHOLD"
+                result["blocked_reason"] = str(threshold_gate["detail"])
+                return finish(
+                    priority_strategy="EARLY_THRESHOLD",
+                    blocked_reason=result["blocked_reason"],
+                )
             effective = self._effective_strategy_fraction(
                 settings, float(settings.get("early_bankroll_pct", 0.03))
             )
@@ -2194,6 +2292,15 @@ class PaperTradingService:
         self._strategy_states.pop("EARLY_THRESHOLD", None)
 
         if standard is not None:
+            threshold_gate = margin_gate(str(standard.side))
+            if not threshold_gate["passed"]:
+                self.reset_automatic_confirmation()
+                result["active_strategy"] = "STANDARD_EDGE"
+                result["blocked_reason"] = str(threshold_gate["detail"])
+                return finish(
+                    priority_strategy="STANDARD_EDGE",
+                    blocked_reason=result["blocked_reason"],
+                )
             standard_result = self.consider_automatic_entry(
                 ticker=ticker, decision=standard, seconds_remaining=seconds_remaining,
                 model_version=model_version, now=current_time,
@@ -2226,6 +2333,15 @@ class PaperTradingService:
                 minimum_liquidity=int(settings.get("late_min_liquidity_contracts", 1)),
             )
         if late_candidate:
+            threshold_gate = margin_gate(str(late_candidate["side"]))
+            if not threshold_gate["passed"]:
+                self.reset_automatic_confirmation()
+                result["active_strategy"] = "LATE_CONVICTION"
+                result["blocked_reason"] = str(threshold_gate["detail"])
+                return finish(
+                    priority_strategy="LATE_CONVICTION",
+                    blocked_reason=result["blocked_reason"],
+                )
             effective = self._effective_strategy_fraction(
                 settings, float(settings.get("late_bankroll_pct", 0.03))
             )
@@ -2269,6 +2385,15 @@ class PaperTradingService:
             and swing_candidate
             and portfolio_state.get("automatic_trade_allowed", True)
         ):
+            threshold_gate = margin_gate(str(swing_candidate["side"]))
+            if not threshold_gate["passed"]:
+                self.reset_automatic_confirmation()
+                result["active_strategy"] = "SWING"
+                result["blocked_reason"] = str(threshold_gate["detail"])
+                return finish(
+                    priority_strategy="SWING",
+                    blocked_reason=result["blocked_reason"],
+                )
             effective = self._effective_strategy_fraction(
                 settings, float(settings.get("swing_bankroll_pct", 0.01))
             )

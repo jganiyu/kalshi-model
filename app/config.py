@@ -98,6 +98,7 @@ DEFAULT_SETTINGS: dict[str, object] = {
     "automatic_confirmation_seconds": 5,
     "automatic_buy_duration_pct": 0.50,
     "automatic_min_confidence": "Moderate",
+    "threshold_margin_gate_dollars": 50.0,
     "early_threshold_enabled": True,
     "early_bankroll_pct": 0.03,
     "early_min_probability": 0.65,

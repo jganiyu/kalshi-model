@@ -1182,6 +1182,29 @@ def test_exchange_trade_ledger_aggregates_settlement_and_available_cash(
 ) -> None:
     db = make_db(tmp_path)
     broker = KalshiBroker("DEMO", db, FakeTradingClient())  # type: ignore[arg-type]
+    now = iso_now()
+    db.execute(
+        """
+        INSERT INTO markets(ticker,status,strike,raw_json,first_seen_at,updated_at)
+        VALUES (?,?,?,?,?,?)
+        """,
+        ("SETTLED", "finalized", 100.0, "{}", now, now),
+    )
+    db.execute(
+        """
+        INSERT INTO settlements(
+            ticker,settled_at,result,settlement_value,raw_json,processed_at
+        ) VALUES (?,?,?,?,?,?)
+        """,
+        (
+            "SETTLED",
+            now,
+            1,
+            0.0,
+            '{"expiration_value":"91.25"}',
+            now,
+        ),
+    )
     db.execute(
         """
         INSERT INTO broker_fills(
@@ -1212,6 +1235,7 @@ def test_exchange_trade_ledger_aggregates_settlement_and_available_cash(
     assert ledger[0]["price"] == pytest.approx(.53)
     assert ledger[0]["realized_pnl"] == pytest.approx(-1.095)
     assert ledger[0]["available_cash_after"] == pytest.approx(98.905)
+    assert ledger[0]["settlement_margin"] == pytest.approx(-8.75)
     assert broker.portfolio()["ledger"] == ledger
 
 

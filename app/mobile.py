@@ -66,6 +66,7 @@ def mobile_snapshot(dashboard: dict[str, Any]) -> dict[str, Any]:
         "action",
         "realized_pnl",
         "available_cash_after",
+        "settlement_margin",
     }
     recent_trades = [
         {
@@ -74,6 +75,22 @@ def mobile_snapshot(dashboard: dict[str, Any]) -> dict[str, Any]:
             if key in allowed_trade_fields
         }
         for trade in trades[:10]
+    ]
+    positions = [
+        {
+            "ticker": position.get("ticker"),
+            "side": position.get("side"),
+            "contracts": position.get("contracts"),
+            "entry_price": position.get("entry_price")
+            if position.get("entry_price") is not None
+            else position.get("average_price"),
+            "exposure": position.get("committed_dollars")
+            if position.get("committed_dollars") is not None
+            else position.get("market_exposure"),
+            "strategy": position.get("strategy") or position.get("source"),
+            "status": position.get("display_status") or position.get("status"),
+        }
+        for position in (selected.get("positions") or [])
     ]
     system = dashboard.get("system") or {}
     btc = dashboard.get("btc") or {}
@@ -84,9 +101,18 @@ def mobile_snapshot(dashboard: dict[str, Any]) -> dict[str, Any]:
         "market": {
             "to_beat": current.get("strike"),
             "btc_proxy": btc.get("price"),
+            "btc_margin": (
+                float(btc["price"]) - float(current["strike"])
+                if btc.get("price") is not None and current.get("strike") is not None
+                else None
+            ),
             "time_remaining_seconds": current.get("time_remaining_seconds"),
+            "up_price": current.get("yes_ask"),
+            "down_price": current.get("no_ask"),
         },
         "readiness": _safe_copy(readiness),
+        "open_trades": positions,
+        "available_cash": selected.get("available_cash"),
         "recent_trades": recent_trades,
     }
 

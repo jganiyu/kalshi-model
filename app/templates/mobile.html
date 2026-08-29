@@ -37,7 +37,7 @@
 
     <section class="market-strip" aria-label="Current market">
       <div><span>TO BEAT</span><strong id="market-to-beat">--</strong></div>
-      <div><span>BTC PROXY</span><strong id="market-btc-proxy">--</strong></div>
+      <div><span>BTC PROXY</span><strong id="market-btc-proxy">--</strong><small id="market-btc-margin">--</small></div>
       <div><span>KALSHI TIMER</span><strong id="market-timer">--:--</strong></div>
     </section>
 
@@ -65,9 +65,22 @@
         <div class="gate" id="gate-liquidity"><i></i><span>Liquidity<small>--</small></span></div>
         <div class="gate" id="gate-data"><i></i><span>Data<small>--</small></span></div>
         <div class="gate" id="gate-quality"><i></i><span>Quality<small>--</small></span></div>
+        <div class="gate" id="gate-threshold"><i></i><span>Threshold<small>--</small></span></div>
         <div class="gate" id="gate-risk"><i></i><span>Risk<small>--</small></span></div>
       </div>
       <p class="blocker" id="hud-blocker">Waiting for live trade data.</p>
+    </section>
+
+    <section class="open-trades" aria-labelledby="open-trades-title">
+      <div class="section-heading">
+        <div><p class="eyebrow" id="open-trades-label">PAPER</p><h2 id="open-trades-title">Open trades</h2></div>
+        <span class="available-reading">Available <strong id="available-funds">—</strong></span>
+      </div>
+      <div class="open-trade-list" id="open-trade-list"><p class="empty compact">No open trades.</p></div>
+      <div class="market-prices" aria-label="Current Up and Down asks">
+        <div class="up"><span>UP</span><strong id="current-up-price">--</strong></div>
+        <div class="down"><span>DOWN</span><strong id="current-down-price">--</strong></div>
+      </div>
     </section>
 
     <section class="trades" aria-labelledby="trades-title">

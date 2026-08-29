@@ -91,9 +91,9 @@
               <div class="chart-tools">
                 <div class="segmented" aria-label="Chart window">
                   <button class="active" data-window="5">5m</button>
+                  <button data-window="15">15m</button>
                   <button data-window="30">30m</button>
                   <button data-window="60">60m</button>
-                  <button data-window="180">3h</button>
                 </div>
                 <p id="composite-source">Multi-exchange median</p>
                 <span id="btc-dispersion">--</span>
@@ -224,9 +224,11 @@
                 <span id="standard-edge-liquidity-gate"><i></i><b>Liquidity <button class="hud-help" type="button" aria-label="About liquidity" data-tooltip="Contracts available at the executable ask versus the configured minimum.">i</button></b><small>--</small></span>
                 <span id="standard-edge-data-gate"><i></i><b>Data <button class="hud-help" type="button" aria-label="About data quality" data-tooltip="Whether critical feeds are current, reliable, mutually consistent, and the market is active.">i</button></b><small>--</small></span>
                 <span id="standard-edge-quality-gate"><i></i><b>Quality <button class="hud-help" type="button" aria-label="About entry quality" data-tooltip="Current decision strength versus the minimum confidence required for automatic Standard Edge entries.">i</button></b><small>--</small></span>
+                <span id="standard-edge-threshold-gate"><i></i><b>Threshold <button class="hud-help" type="button" aria-label="About threshold margin" data-tooltip="Up entries require the BTC proxy above the configured threshold band; Down entries require it below the band.">i</button></b><small>--</small></span>
                 <span id="standard-edge-risk-gate"><i></i><b>Risk <button class="hud-help" type="button" aria-label="About risk controls" data-tooltip="Whether bankroll, drawdown, position, duplicate-entry, and sizing controls permit an automatic entry.">i</button></b><small>--</small></span>
               </div>
               <p class="standard-edge-hud-blocker"><button class="hud-help" type="button" aria-label="About the primary blocker" data-tooltip="The first requirement currently preventing Standard Edge confirmation or entry.">i</button><span id="standard-edge-hud-blocker">Waiting for live trade data.</span></p>
+              <button class="standard-edge-hud-arm" id="hud-arm-trading" data-arm-session type="button" hidden>Arm session</button>
             </div>
           </aside>
         </div>
@@ -251,8 +253,8 @@
             </div>
             <div class="orderbook-table-wrap">
               <table class="orderbook-table recent-trades-table">
-                <thead><tr><th>Opened</th><th>Side</th><th>Price</th><th>Qty</th><th>Strategy</th><th>Result</th><th>Available after</th></tr></thead>
-                <tbody id="recent-paper-trades"><tr><td class="book-empty" colspan="7">No paper trades yet</td></tr></tbody>
+                <thead><tr><th>Opened</th><th>Side</th><th>Price</th><th>Qty</th><th title="Settlement price minus threshold">Settle margin</th><th>Strategy</th><th>Result</th><th>Available after</th></tr></thead>
+                <tbody id="recent-paper-trades"><tr><td class="book-empty" colspan="8">No paper trades yet</td></tr></tbody>
               </table>
             </div>
           </section>
@@ -313,7 +315,7 @@
           <div class="button-row exchange-actions" id="exchange-actions" hidden>
             <label class="compact-toggle exchange-auto-toggle"><span>Automatic</span><input id="automatic-trading-toggle" type="checkbox"><i></i></label>
             <button class="secondary-button" id="reconcile-trading" type="button">Reconcile</button>
-            <button class="secondary-button" id="arm-trading" type="button">Arm session</button>
+            <button class="secondary-button" id="arm-trading" data-arm-session type="button">Arm session</button>
             <button class="secondary-button danger-button" id="kill-trading" type="button">Kill switch</button>
           </div>
         </section>

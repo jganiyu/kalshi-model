@@ -31,6 +31,7 @@ def make_db(tmp_path: Path, **settings: object) -> Database:
             "swing_confirmation_seconds": 0,
             "early_threshold_enabled": False,
             "late_conviction_enabled": False,
+            "threshold_margin_gate_dollars": 0,
             **settings,
         }
     )
@@ -104,6 +105,7 @@ def consider(
     standard_decisions: dict[str, Decision] | None = None,
     portfolio: dict | None = None,
     now: float = 60,
+    threshold_margin_dollars: float | None = None,
 ) -> dict:
     return service.consider_strategies(
         ticker=ticker,
@@ -118,10 +120,28 @@ def consider(
         threshold_state=None,
         settlement_window={"coverage": 0.0},
         z_distance=0.0,
+        threshold_margin_dollars=threshold_margin_dollars,
         model_version="test",
         portfolio=portfolio,
         now=now,
     )
+
+
+def test_threshold_margin_gate_applies_to_swing_entries(tmp_path: Path) -> None:
+    db = make_db(tmp_path, threshold_margin_gate_dollars=50.0)
+    add_market(db, "SWING-MARGIN")
+    service = PaperTradingService(db)
+
+    blocked = consider(
+        service, "SWING-MARGIN", assessment(), threshold_margin_dollars=49.0
+    )
+    assert blocked["entered"] is False
+    assert "at least $50.00 above" in blocked["blocked_reason"]
+
+    entered = consider(
+        service, "SWING-MARGIN", assessment(), threshold_margin_dollars=55.0
+    )
+    assert entered["entered"] is True
 
 
 def test_swing_defaults_are_conservative() -> None:
@@ -131,6 +151,7 @@ def test_swing_defaults_are_conservative() -> None:
     assert DEFAULT_SETTINGS["swing_target_exit_price"] == pytest.approx(0.10)
     assert DEFAULT_SETTINGS["swing_bankroll_pct"] == pytest.approx(0.01)
     assert DEFAULT_SETTINGS["swing_stop_loss_cents"] is None
+    assert DEFAULT_SETTINGS["threshold_margin_gate_dollars"] == pytest.approx(50.0)
 
 
 def test_exact_entry_price_qualifies_and_manual_side_is_independent(tmp_path: Path) -> None:

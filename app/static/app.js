@@ -55,6 +55,12 @@ function money(value, digits = 2) {
   }).format(Number(value));
 }
 
+function signedMoney(value, digits = 2) {
+  if (value === null || value === undefined || !Number.isFinite(Number(value))) return "—";
+  const number = Number(value);
+  return `${number > 0 ? "+" : number < 0 ? "−" : ""}${money(Math.abs(number), digits)}`;
+}
+
 function numberOrNull(value) {
   if (value === null || value === undefined || value === "") return null;
   const number = Number(value);
@@ -211,10 +217,11 @@ function renderRecentTrades(trades, mode = "PAPER") {
   target.innerHTML = trades?.length ? trades.map((trade) => `
     <tr><td>${shortDate(trade.activity_at || trade.opened_at || trade.filled_at)}</td><td>${marketSideLabel(trade.side)}</td>
     <td>${cents(trade.entry_price ?? trade.price)}</td><td>${trade.contracts}</td>
+    <td class="${Number(trade.settlement_margin) > 0 ? "positive" : Number(trade.settlement_margin) < 0 ? "negative" : ""}">${signedMoney(trade.settlement_margin)}</td>
     <td>${String(trade.strategy || trade.source || "manual").replaceAll("_", " ")}</td>
     <td class="${Number(trade.realized_pnl) > 0 ? "positive" : Number(trade.realized_pnl) < 0 ? "negative" : ""}">${String(trade.display_status || trade.status || (mode === "PAPER" ? "open" : trade.action || "filled"))}${trade.realized_pnl == null ? "" : ` · ${money(trade.realized_pnl)}`}</td>
     <td>${trade.available_cash_after == null ? "—" : money(trade.available_cash_after)}</td></tr>
-  `).join("") : `<tr><td class="book-empty" colspan="7">No ${mode === "PAPER" ? "paper trades" : "fills"} yet</td></tr>`;
+  `).join("") : `<tr><td class="book-empty" colspan="8">No ${mode === "PAPER" ? "paper trades" : "fills"} yet</td></tr>`;
 }
 
 function renderTradeAssessment() {
@@ -309,6 +316,13 @@ function renderStandardEdgeHud(readiness) {
     ? "--"
     : `${quality.current} / ${quality.required || "--"}`;
   renderReadinessGate("#standard-edge-quality-gate", quality, qualityValue);
+  const threshold = gates.threshold_margin || {};
+  const thresholdValue = threshold.enabled === false
+    ? "Off"
+    : threshold.current == null
+      ? `-- / ${signedMoney(threshold.required, 0)}`
+      : `${signedMoney(threshold.current, 0)} / ${signedMoney(threshold.required, 0)}`;
+  renderReadinessGate("#standard-edge-threshold-gate", threshold, thresholdValue);
   renderReadinessGate("#standard-edge-risk-gate", gates.risk, gates.risk?.passed ? "Clear" : "Blocked");
   $("#standard-edge-hud-blocker").textContent = readiness?.blocker
     || "Waiting for live trade data.";
@@ -463,6 +477,7 @@ function renderDashboard(data) {
     current?.standard_edge_readiness
       || current?.automatic_entry?.standard_edge_readiness,
   );
+  syncArmButton(readiness, trading.mode);
   renderTradeAssessment();
   renderOrderBook(
     state.paperOrder.side,
@@ -788,15 +803,17 @@ async function reconcileSelectedTrading() {
 }
 
 function syncArmButton(readiness = selectedTrading().selected?.readiness || {}, mode = selectedTrading().mode) {
-  const button = $("#arm-trading");
-  if (!button) return;
   const confirmation = state.trading.armConfirmation;
   const pending = confirmation.confirming && confirmation.mode === mode && !readiness.session_armed;
-  button.classList.toggle("confirming", pending);
-  button.disabled = confirmation.submitting;
-  button.textContent = readiness.session_armed
-    ? "Disarm session"
-    : confirmation.submitting ? "Arming…" : pending ? "Confirm" : "Arm session";
+  $$('[data-arm-session]').forEach((button) => {
+    button.hidden = button.id === "hud-arm-trading" && mode === "PAPER";
+    button.classList.toggle("confirming", pending);
+    button.classList.toggle("armed", Boolean(readiness.session_armed));
+    button.disabled = confirmation.submitting;
+    button.textContent = readiness.session_armed
+      ? "Disarm session"
+      : confirmation.submitting ? "Arming…" : pending ? "Confirm" : "Arm session";
+  });
 }
 
 function resetArmConfirmation() {
@@ -1233,6 +1250,7 @@ const calibrationGroups = [
     { id: "automatic_confirmation_seconds", label: "Confirmation period", unit: "seconds", min: 1, max: 120, step: 1, tip: "Rolling elapsed-time window used to confirm Buy signals. Default: 5 seconds." },
     { id: "automatic_buy_duration_pct", label: "Required Buy duration", unit: "%", min: 50, max: 100, step: 1, scale: 100, tip: "Share of the confirmation period that must be spent in Buy. Default: 50%." },
     { id: "automatic_min_confidence", label: "Minimum edge strength", type: "select", options: ["Low", "Moderate", "High"], tip: "Lowest edge-strength label allowed for an automatic entry. Speculative assessments never enter automatically. Default: Moderate." },
+    { id: "threshold_margin_gate_dollars", label: "Threshold margin", unit: "dollars", min: 0, max: 100000, step: 1, tip: "Directional BTC-proxy distance required for automatic entries: Up must be above the threshold and Down below it by this amount. Use 0 to turn it off. Default: $50." },
   ]],
   ["Early Threshold", [
     { id: "early_threshold_enabled", label: "Early threshold strategy", type: "toggle", tip: "Allows a small automatic entry when a pre-open threshold remains favorable after activation. Default: on." },
@@ -1985,7 +2003,7 @@ function bindEvents() {
   $("#confirm-exchange-order").addEventListener("click", confirmExchangeOrder);
   $("#trade-confirmation").addEventListener("close", () => { state.trading.pendingConfirmation = null; });
   $("#reconcile-trading").addEventListener("click", reconcileSelectedTrading);
-  $("#arm-trading").addEventListener("click", armSelectedTrading);
+  $$('[data-arm-session]').forEach((button) => button.addEventListener("click", armSelectedTrading));
   $("#kill-trading").addEventListener("click", killSelectedTrading);
   $("#automatic-trading-toggle").addEventListener("change", toggleAutomaticTrading);
   $("#open-order-list").addEventListener("click", (event) => {

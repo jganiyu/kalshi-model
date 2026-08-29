@@ -53,8 +53,9 @@ h2 { font-size: 22px; letter-spacing: -.03em; }
 .market-strip > div { min-width: 0; padding: 13px 11px; background: var(--surface); }
 .market-strip span { display: block; margin-bottom: 4px; color: var(--muted); font-size: 8px; font-weight: 700; letter-spacing: .08em; }
 .market-strip strong { display: block; overflow: hidden; font-size: 15px; font-variant-numeric: tabular-nums; letter-spacing: -.025em; text-overflow: ellipsis; white-space: nowrap; }
+.market-strip small { display: block; overflow: hidden; margin-top: 3px; color: var(--muted); font-size: 8px; text-overflow: ellipsis; white-space: nowrap; }
 #market-timer { color: var(--amber); }
-.hud, .trades { margin-top: 12px; padding: 17px 16px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface); }
+.hud, .open-trades, .trades { margin-top: 12px; padding: 17px 16px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface); }
 .hud-heading { padding-bottom: 18px; }
 .hud-status { color: var(--amber); font-size: 10px; letter-spacing: .08em; text-transform: uppercase; }
 .hud-status[data-status="ready"], .hud-status[data-status="confirming"], .hud-status[data-status="entered"] { color: var(--green); }
@@ -75,6 +76,20 @@ h2 { font-size: 22px; letter-spacing: -.03em; }
 .section-heading { padding-bottom: 13px; }
 .section-heading > span { color: var(--muted); font-size: 9px; text-transform: uppercase; }
 .section-heading h2 { font-size: 17px; }
+.available-reading { display: flex; align-items: flex-end; flex-direction: column; gap: 2px; color: var(--muted); font-size: 8px; text-transform: uppercase; }
+.available-reading strong { color: var(--ink); font-size: 11px; font-variant-numeric: tabular-nums; }
+.open-trade-list { display: grid; gap: 7px; }
+.open-trade { min-width: 0; padding: 10px 11px; border-radius: 7px; background: var(--soft); }
+.open-trade-head { display: flex; justify-content: space-between; gap: 8px; font-size: 10px; text-transform: uppercase; }
+.open-trade-head span { overflow: hidden; color: var(--muted); text-overflow: ellipsis; white-space: nowrap; }
+.open-trade p { overflow: hidden; margin: 6px 0; color: var(--muted); font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
+.open-trade > div:last-child { display: flex; flex-wrap: wrap; gap: 5px 12px; color: var(--muted); font-size: 9px; }
+.market-prices { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin-top: 11px; }
+.market-prices > div { display: flex; min-width: 0; min-height: 34px; align-items: center; justify-content: center; gap: 6px; border-radius: 6px; color: #fff; font-size: 10px; }
+.market-prices .up { background: var(--green); }
+.market-prices .down { background: var(--red); }
+.market-prices span { font-size: 9px; font-weight: 750; }
+.market-prices strong { font-size: 11px; font-variant-numeric: tabular-nums; }
 .trade-list { display: grid; gap: 8px; }
 .trade { min-width: 0; padding: 12px; border-radius: 7px; background: var(--soft); }
 .trade-head, .trade-grid { display: grid; min-width: 0; }
@@ -88,15 +103,18 @@ h2 { font-size: 22px; letter-spacing: -.03em; }
 .trade-grid b.positive { color: var(--green); }
 .trade-grid b.negative { color: var(--red); }
 .empty { padding: 24px 0; color: var(--muted); font-size: 11px; text-align: center; }
+.empty.compact { padding: 11px 0; }
+.positive { color: var(--green); }
+.negative { color: var(--red); }
 
 @media (min-width: 430px) {
   .mobile-shell { padding-left: max(22px, env(safe-area-inset-left)); padding-right: max(22px, env(safe-area-inset-right)); }
-  .hud, .trades { padding: 20px; }
+  .hud, .open-trades, .trades { padding: 20px; }
 }
 
 @media (max-width: 340px) {
   .mobile-shell { padding-left: max(12px, env(safe-area-inset-left)); padding-right: max(12px, env(safe-area-inset-right)); }
-  .hud, .trades { padding: 14px 12px; }
+  .hud, .open-trades, .trades { padding: 14px 12px; }
   .trade-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .market-strip > div { padding-inline: 8px; }
   .market-strip strong { font-size: 13px; }

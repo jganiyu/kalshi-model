@@ -474,6 +474,22 @@ class KalshiBroker(Broker):
                 "SELECT * FROM broker_settlements WHERE mode=?", (self.mode,)
             )
         }
+        settlement_margin_rows = self.db.fetch_all(
+            """
+            SELECT s.ticker,
+                   COALESCE(
+                     json_extract(s.raw_json,'$.expiration_value'),
+                     json_extract(m.raw_json,'$.expiration_value')
+                   ) AS settlement_price,
+                   m.strike
+            FROM settlements s LEFT JOIN markets m ON m.ticker=s.ticker
+            """
+        )
+        settlement_margins = {
+            str(row["ticker"]): float(row["settlement_price"]) - float(row["strike"])
+            for row in settlement_margin_rows
+            if row.get("settlement_price") is not None and row.get("strike") is not None
+        }
         grouped: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
         for fill in fills:
             grouped[(str(fill.get("ticker")), str(fill.get("side")))].append(fill)
@@ -585,6 +601,7 @@ class KalshiBroker(Broker):
                     "display_status": "UNSETTLED" if status == "OPEN" else status,
                     "realized_pnl": realized_pnl,
                     "available_cash_after": available_after,
+                    "settlement_margin": settlement_margins.get(key[0]),
                     "market_result": (settlement or {}).get("market_result"),
                     "position_won": position_won,
                 }
