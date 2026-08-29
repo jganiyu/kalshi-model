@@ -1,6 +1,9 @@
 const state = {
   dashboard: null,
   chartPoints: [],
+  volatilityPoints: [],
+  chartMode: "btc",
+  maximumMvi: 0,
   chartWindow: 5,
   closeTime: null,
   lastNotification: null,
@@ -323,6 +326,18 @@ function renderStandardEdgeHud(readiness) {
       ? `-- / ${signedMoney(threshold.required, 0)}`
       : `${signedMoney(threshold.current, 0)} / ${signedMoney(threshold.required, 0)}`;
   renderReadinessGate("#standard-edge-threshold-gate", threshold, thresholdValue);
+  const volatility = gates.volatility || {};
+  state.maximumMvi = Number(volatility.required || 0);
+  const volatilityValue = volatility.enabled === false
+    ? "Off"
+    : volatility.current == null
+      ? `${volatility.status === "LEARNING" ? "Learning" : "--"} / ${Number(volatility.required || 0).toFixed(1)}`
+      : `${Number(volatility.current).toFixed(1)} / ${Number(volatility.required || 0).toFixed(1)}`;
+  renderReadinessGate("#standard-edge-volatility-gate", volatility, volatilityValue);
+  const cushion = numberOrNull(volatility.cushion_ratio);
+  $("#standard-edge-cushion").textContent = cushion == null
+    ? "Cushion --"
+    : `Cushion ${cushion > 99 ? ">99" : cushion.toFixed(1)}× expected move`;
   renderReadinessGate("#standard-edge-risk-gate", gates.risk, gates.risk?.passed ? "Clear" : "Blocked");
   $("#standard-edge-hud-blocker").textContent = readiness?.blocker
     || "Waiting for live trade data.";
@@ -954,6 +969,74 @@ function smoothChartAxis(targetLow, targetHigh, frameTime) {
   return axis;
 }
 
+function drawVolatilityChart(context, width, height, color, numberFont) {
+  const windowMs = state.chartWindow * 60 * 1000;
+  const liveGutterMs = Math.min(10000, windowMs * 0.025);
+  const viewEnd = Date.now() + liveGutterMs;
+  const viewStart = viewEnd - windowMs;
+  const points = state.volatilityPoints
+    .map((point) => ({ ...point, time: new Date(point.observed_at).getTime(), value: Number(point.mvi) }))
+    .filter((point) => Number.isFinite(point.time) && Number.isFinite(point.value)
+      && point.time >= viewStart && point.time <= viewEnd);
+  const left = 8;
+  const right = width < 430 ? 52 : 60;
+  const top = 14;
+  const bottom = 32;
+  const chartWidth = width - left - right;
+  const chartHeight = height - top - bottom;
+  const plotRight = width - right;
+  const x = (timestamp) => left + ((timestamp - viewStart) / windowMs) * chartWidth;
+  const y = (value) => top + (1 - value / 10) * chartHeight;
+
+  context.strokeStyle = color("--chart-grid");
+  context.fillStyle = color("--chart-label");
+  context.font = `10px ${numberFont}`;
+  context.textAlign = "left";
+  [0, 2.5, 5, 7.5, 10].forEach((value) => {
+    const rowY = y(value);
+    context.beginPath(); context.moveTo(left, rowY); context.lineTo(plotRight, rowY); context.stroke();
+    context.fillText(value.toFixed(1), plotRight + 8, rowY + 3);
+  });
+  const timeInterval = chartTickInterval(windowMs, chartWidth);
+  const firstTimeTick = Math.ceil(viewStart / timeInterval) * timeInterval;
+  context.textAlign = "center";
+  for (let timestamp = firstTimeTick; timestamp <= viewEnd; timestamp += timeInterval) {
+    const columnX = x(timestamp);
+    context.beginPath(); context.moveTo(columnX, top); context.lineTo(columnX, top + chartHeight); context.stroke();
+    if (columnX >= left + 34 && columnX <= plotRight - 34) {
+      context.fillText(chartTimeLabel(timestamp, state.chartWindow <= 5), columnX, height - 8);
+    }
+  }
+  if (state.maximumMvi > 0) {
+    const maximumY = y(Math.max(0, Math.min(10, state.maximumMvi)));
+    context.save();
+    context.strokeStyle = color("--red");
+    context.setLineDash([4, 4]);
+    context.beginPath(); context.moveTo(left, maximumY); context.lineTo(plotRight, maximumY); context.stroke();
+    context.restore();
+  }
+  if (!points.length) {
+    context.fillStyle = color("--chart-label");
+    context.font = "12px -apple-system, sans-serif";
+    context.textAlign = "center";
+    context.fillText("Learning reliable margin volatility", width / 2, height / 2);
+    return;
+  }
+  if (points.length > 1) {
+    context.beginPath();
+    points.forEach((point, index) => index === 0
+      ? context.moveTo(x(point.time), y(point.value))
+      : context.lineTo(x(point.time), y(point.value)));
+    context.strokeStyle = color("--hud-warning");
+    context.lineWidth = 2.25;
+    context.lineJoin = "round";
+    context.stroke();
+  }
+  const last = points.at(-1);
+  context.beginPath(); context.arc(x(last.time), y(last.value), 3.25, 0, Math.PI * 2);
+  context.fillStyle = color("--hud-warning"); context.fill();
+}
+
 function drawChart(frameTime = performance.now()) {
   const canvas = $("#price-chart");
   if (!canvas) return;
@@ -973,6 +1056,15 @@ function drawChart(frameTime = performance.now()) {
   const numberFont = color("--number-font");
   context.setTransform(ratio, 0, 0, ratio, 0, 0);
   context.clearRect(0, 0, width, height);
+  const volatilityMode = state.chartMode === "volatility";
+  $("#price-legend").hidden = volatilityMode;
+  $("#threshold-legend").hidden = volatilityMode;
+  $("#volatility-legend").hidden = !volatilityMode;
+  $("#volatility-max-legend").hidden = !volatilityMode || state.maximumMvi <= 0;
+  if (volatilityMode) {
+    drawVolatilityChart(context, width, height, color, numberFont);
+    return;
+  }
   const windowMs = state.chartWindow * 60 * 1000;
   const liveGutterMs = Math.min(10000, windowMs * 0.025);
   const viewEnd = Date.now() + liveGutterMs;
@@ -1182,6 +1274,18 @@ function appendLiveChartPoint(data) {
   else state.chartPoints.push(point);
   const cutoff = Date.now() - state.chartWindow * 60 * 1000;
   state.chartPoints = state.chartPoints.filter((item) => new Date(item.observed_at).getTime() >= cutoff);
+  const volatility = data?.current?.margin_volatility;
+  if (volatility?.observed_at) {
+    const lastVolatility = state.volatilityPoints.at(-1);
+    if (lastVolatility?.observed_at === volatility.observed_at) {
+      state.volatilityPoints[state.volatilityPoints.length - 1] = volatility;
+    } else {
+      state.volatilityPoints.push(volatility);
+    }
+    state.volatilityPoints = state.volatilityPoints.filter(
+      (item) => new Date(item.observed_at).getTime() >= cutoff,
+    );
+  }
 }
 
 function connectLive() {
@@ -1217,6 +1321,8 @@ async function refreshDashboard() {
       api("/api/dashboard"), api(`/api/chart?minutes=${state.chartWindow}`),
     ]);
     state.chartPoints = chart.points || [];
+    state.volatilityPoints = chart.volatility_points || [];
+    state.maximumMvi = Number(chart.maximum_margin_volatility || 0);
     renderDashboard(dashboard);
   } catch (error) {
     $("#sidebar-status").textContent = "App offline";
@@ -1251,6 +1357,9 @@ const calibrationGroups = [
     { id: "automatic_buy_duration_pct", label: "Required Buy duration", unit: "%", min: 50, max: 100, step: 1, scale: 100, tip: "Share of the confirmation period that must be spent in Buy. Default: 50%." },
     { id: "automatic_min_confidence", label: "Minimum edge strength", type: "select", options: ["Low", "Moderate", "High"], tip: "Lowest edge-strength label allowed for an automatic entry. Speculative assessments never enter automatically. Default: Moderate." },
     { id: "threshold_margin_gate_dollars", label: "Threshold margin", unit: "dollars", min: 0, max: 100000, step: 1, tip: "Directional BTC-proxy distance required for automatic entries: Up must be above the threshold and Down below it by this amount. Use 0 to turn it off. Default: $50." },
+  ]],
+  ["Margin Volatility", [
+    { id: "maximum_margin_volatility", label: "Maximum Margin Volatility", unit: "MVI", min: 0, max: 10, step: .1, tip: "Maximum 30-minute Margin Volatility Index allowed for automatic confirmation in Paper, Demo, and Live. Low MVI is allowed; values above this maximum block. Use 0 to turn it off. Default: off." },
   ]],
   ["Early Threshold", [
     { id: "early_threshold_enabled", label: "Early threshold strategy", type: "toggle", tip: "Allows a small automatic entry when a pre-open threshold remains favorable after activation. Default: on." },
@@ -1452,6 +1561,14 @@ function renderCalibrationResults(data) {
       <span class="${Number(result.realized_pnl) > 0 ? "positive" : Number(result.realized_pnl) < 0 ? "negative" : ""}" title="Realized profit and loss">${money(result.realized_pnl || 0)}</span>
     </div>`;
   }).join("");
+  const volatilityReport = data.margin_volatility_report || {};
+  $("#mvi-evidence-subtitle").textContent = `${volatilityReport.reliable_observations || 0} reliable windows · ${volatilityReport.settled_entries || 0} settled entries`;
+  const evidenceBuckets = (volatilityReport.buckets || []).filter(
+    (bucket) => bucket.observations || bucket.entries || bucket.blocked_opportunities,
+  );
+  $("#mvi-evidence").innerHTML = evidenceBuckets.length
+    ? `${evidenceBuckets.map((bucket) => `<div class="mvi-evidence-row"><strong>${bucket.label}</strong><span>${bucket.entries} entries</span><span>${bucket.settled} settled</span><span>${bucket.win_rate == null ? "--" : percent(bucket.win_rate, 0)} · ${money(bucket.realized_pnl || 0)}</span></div>`).join("")}<p class="mvi-evidence-note">${volatilityReport.guidance || "Sample sizes are shown before any limit is considered."}</p>`
+    : `<p class="empty-state">${volatilityReport.guidance || "No reliable observations yet."}</p>`;
   const buckets = summary.buckets || [];
   $("#calibration-bars").innerHTML = buckets.length ? buckets.map((bucket) => `
     <div class="bucket">
@@ -1959,7 +2076,16 @@ function bindEvents() {
     resetChartAxis();
     $$("[data-window]").forEach((item) => item.classList.toggle("active", item === button));
     const chart = await api(`/api/chart?minutes=${state.chartWindow}`);
-    state.chartPoints = chart.points || []; drawChart();
+    state.chartPoints = chart.points || [];
+    state.volatilityPoints = chart.volatility_points || [];
+    state.maximumMvi = Number(chart.maximum_margin_volatility || 0);
+    drawChart();
+  }));
+  $$('[data-chart-mode]').forEach((button) => button.addEventListener("click", () => {
+    state.chartMode = button.dataset.chartMode === "volatility" ? "volatility" : "btc";
+    $$('[data-chart-mode]').forEach((item) => item.classList.toggle("active", item === button));
+    resetChartAxis();
+    drawChart();
   }));
   $("#credential-form").addEventListener("submit", saveKalshiCredentials);
   $("#remove-credentials").addEventListener("click", removeKalshiCredentials);

@@ -40,7 +40,7 @@ def test_database_migrations_and_settings_persist(tmp_path: Path) -> None:
     reopened.initialize()
     assert reopened.settings()["starting_bankroll"] == 2_500.0
     assert "unknown" not in reopened.settings()
-    assert reopened.fetch_one("SELECT MAX(version) version FROM schema_migrations")["version"] == 12
+    assert reopened.fetch_one("SELECT MAX(version) version FROM schema_migrations")["version"] == 13
     assert ModelManager(reopened).active()["version"] == "baseline-1.1"
 
 
@@ -54,6 +54,7 @@ def test_new_database_uses_project_calibration_and_paper_defaults(tmp_path: Path
     assert settings["minimum_buy_probability"] == 0.65
     assert settings["min_edge"] == 0.10
     assert settings["automatic_confirmation_seconds"] == 5
+    assert settings["maximum_margin_volatility"] == 0
     assert settings["early_entry_window_seconds"] == 60
     assert settings["late_min_probability"] == 0.79
     assert settings["swing_enabled"] is False

@@ -116,7 +116,7 @@ def test_migration_preserves_legacy_history_without_inventing_balance(
 
     db.initialize()
 
-    assert db.fetch_one("SELECT MAX(version) version FROM schema_migrations")["version"] == 12
+    assert db.fetch_one("SELECT MAX(version) version FROM schema_migrations")["version"] == 13
     assert db.fetch_one("SELECT available_cash_after FROM paper_orders")["available_cash_after"] is None
     assert db.fetch_one("SELECT available_cash_after FROM paper_entries")["available_cash_after"] is None
     assert db.fetch_one("SELECT available_cash_after FROM paper_trades")["available_cash_after"] is None

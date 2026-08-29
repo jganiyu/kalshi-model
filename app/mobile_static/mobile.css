@@ -72,6 +72,7 @@ h2 { font-size: 22px; letter-spacing: -.03em; }
 .gate.pass > i { background: var(--green); box-shadow: 0 0 0 3px color-mix(in srgb, var(--green) 13%, transparent); }
 .gate span { min-width: 0; font-weight: 650; }
 .gate small { display: block; overflow: hidden; margin-top: 2px; color: var(--muted); font-size: 9px; font-weight: 450; text-overflow: ellipsis; white-space: nowrap; }
+.cushion { margin: 0 0 12px; color: var(--muted); font-size: 10px; font-variant-numeric: tabular-nums; }
 .blocker { padding-top: 13px; border-top: 1px solid var(--line); color: var(--red); font-size: 11px; line-height: 1.4; }
 .section-heading { padding-bottom: 13px; }
 .section-heading > span { color: var(--muted); font-size: 9px; text-transform: uppercase; }

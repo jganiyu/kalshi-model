@@ -474,6 +474,19 @@ class KalshiBroker(Broker):
                 "SELECT * FROM broker_settlements WHERE mode=?", (self.mode,)
             )
         }
+        entry_evidence_rows = self.db.fetch_all(
+            """
+            SELECT ticker,side,margin_volatility_index,margin_cushion_ratio
+            FROM broker_order_intents
+            WHERE mode=? AND action='BUY' AND source='automatic'
+            ORDER BY created_at ASC,id ASC
+            """,
+            (self.mode,),
+        )
+        entry_evidence = {
+            (str(row.get("ticker")), str(row.get("side"))): row
+            for row in entry_evidence_rows
+        }
         settlement_margin_rows = self.db.fetch_all(
             """
             SELECT s.ticker,
@@ -604,6 +617,12 @@ class KalshiBroker(Broker):
                     "settlement_margin": settlement_margins.get(key[0]),
                     "market_result": (settlement or {}).get("market_result"),
                     "position_won": position_won,
+                    "margin_volatility_index": (
+                        entry_evidence.get(key) or {}
+                    ).get("margin_volatility_index"),
+                    "margin_cushion_ratio": (
+                        entry_evidence.get(key) or {}
+                    ).get("margin_cushion_ratio"),
                 }
             )
         return sorted(
@@ -992,7 +1011,8 @@ class KalshiBroker(Broker):
                 status,strategy,source,created_at,updated_at,stop_loss_price,
                 target_exit_price,fallback_exit_mode,fallback_exit_seconds,
                 cancel_deadline_at,decision_snapshot_json,risk_snapshot_json
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                ,margin_volatility_index,margin_cushion_ratio
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 self.mode, intent.client_order_id, intent.ticker, intent.side,
@@ -1001,6 +1021,8 @@ class KalshiBroker(Broker):
                 intent.target_exit_price, intent.fallback_exit_mode,
                 intent.fallback_exit_seconds, deadline,
                 _safe_json(intent.decision_snapshot), _safe_json(intent.risk_snapshot),
+                intent.decision_snapshot.get("margin_volatility_index"),
+                intent.decision_snapshot.get("margin_cushion_ratio"),
             ),
         )
         self._audit("INTENT_CREATED", asdict(intent), intent=intent)

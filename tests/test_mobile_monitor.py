@@ -55,6 +55,11 @@ def readiness() -> dict:
                 "enabled": True, "current": -50.25, "required": -50.0,
                 "passed": True, "detail": "Outside the threshold band",
             },
+            "volatility": {
+                "enabled": True, "current": 6.2, "required": 7.5,
+                "cushion_ratio": 1.4, "passed": True, "status": "PASS",
+                "detail": "Volatility is within the configured limit.",
+            },
             "risk": {"passed": True, "detail": "Clear"},
         },
         "blocker": "Waiting for 2.1¢ more EV",
@@ -119,6 +124,7 @@ def test_mobile_snapshot_matches_dashboard_hud_market_and_recent_trades() -> Non
     source = dashboard()
     payload = mobile_snapshot(source)
     assert payload["readiness"] == source["current"]["standard_edge_readiness"]
+    assert payload["readiness"]["gates"]["volatility"]["cushion_ratio"] == 1.4
     assert payload["market"] == {
         "to_beat": 79_450.0,
         "btc_proxy": 79_500.25,

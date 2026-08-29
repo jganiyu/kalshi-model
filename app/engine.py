@@ -46,6 +46,7 @@ from app.services.market_data import (
     ExchangeQuote,
     live_composite_quote,
 )
+from app.services.margin_volatility import MarginVolatilityService
 from app.services.paper import PaperTradingService
 from app.services.streaming import BitcoinWebSocketFeeds, KalshiWebSocketFeed
 from app.services.training import ModelManager
@@ -64,6 +65,7 @@ class AnalysisEngine:
         self.kalshi: KalshiPublicClient | None = None
         self.kalshi_demo: KalshiPublicClient | None = None
         self.paper = PaperTradingService(db)
+        self.margin_volatility = MarginVolatilityService(db)
         self.trading = TradingCoordinator(config, db, self.paper)
         self.models = ModelManager(db)
         self._benchmark_calibration: dict[str, Any] = {
@@ -114,6 +116,7 @@ class AnalysisEngine:
         }
 
     async def start(self) -> None:
+        self.margin_volatility.backfill_recent()
         self._benchmark_calibration = self.models.benchmark_calibration()
         self.http = httpx.AsyncClient(
             timeout=httpx.Timeout(8.0, connect=5.0),
@@ -1156,6 +1159,24 @@ class AnalysisEngine:
             benchmark_uncertainty_pct=benchmark_uncertainty,
             settlement_window=settlement_window,
         )
+        btc_observed = parse_time(btc.get("observed_at"))
+        mvi_source_reliable = bool(
+            int(btc.get("exchange_count") or 0)
+            >= int(settings.get("minimum_exchange_feeds", 2))
+            and float(btc.get("dispersion_pct") or 0)
+            <= float(settings.get("max_exchange_dispersion_pct", 0.40))
+            and btc_observed is not None
+            and (datetime.now(UTC) - btc_observed).total_seconds()
+            <= float(settings.get("max_data_age_seconds", 20))
+        )
+        margin_volatility = self.margin_volatility.observe(
+            observed_at=observed_at,
+            ticker=str(market["ticker"]),
+            threshold=float(strike),
+            btc_proxy=float(btc["price"]),
+            seconds_remaining=seconds_remaining,
+            source_reliable=mvi_source_reliable,
+        )
         execution_quality_by_side: dict[str, dict[str, Any]] = {}
         for side in ("YES", "NO"):
             execution_quality = dict(quality)
@@ -1205,6 +1226,7 @@ class AnalysisEngine:
         for side, assessment in assessments.items():
             assessment["decision_confidence"] = decisions[side].confidence
             assessment["exchange_index"] = market.get("exchange_index")
+            assessment["margin_volatility"] = margin_volatility
         decision = decisions.get(selected_side, decisions["YES"])
         previous = self.db.fetch_one(
             "SELECT * FROM signal_snapshots WHERE ticker=? ORDER BY id DESC LIMIT 1",
@@ -1237,6 +1259,7 @@ class AnalysisEngine:
             signal_id = self._save_signal(
                 market["ticker"], forecast, decision, model_version, features, btc,
                 market_state, reason, observed_at, probability, selected_side,
+                margin_volatility,
             )
             if previous_forecast and previous_forecast != forecast.signal:
                 notification = {
@@ -1282,6 +1305,13 @@ class AnalysisEngine:
                     model_version=entry_model_version,
                     reason=entry_decision.explanation,
                     stop_loss_cents=settings.get("default_stop_loss_cents"),
+                    strategy_metadata={
+                        "margin_volatility_index": margin_volatility.get("mvi"),
+                        "margin_cushion_ratio": margin_volatility.get("cushion_ratio"),
+                        "margin_volatility_version": margin_volatility.get(
+                            "calculation_version"
+                        ),
+                    },
                 )
                 return entered
 
@@ -1312,6 +1342,7 @@ class AnalysisEngine:
             settlement_window=settlement_window,
             z_distance=baseline.z_distance,
             threshold_margin_dollars=float(btc["price"]) - float(strike),
+            margin_volatility=margin_volatility,
             model_version=model_version,
             portfolio=portfolio,
             **execution_kwargs,
@@ -1347,6 +1378,7 @@ class AnalysisEngine:
                 },
                 "trade_assessments": assessments,
                 "threshold_state": threshold_state,
+                "margin_volatility": margin_volatility,
                 "automatic_entry": automatic_entry,
                 "standard_edge_readiness": automatic_entry.get(
                     "standard_edge_readiness"
@@ -1431,6 +1463,7 @@ class AnalysisEngine:
         observed_at: str,
         model_up_probability: float,
         selected_side: str,
+        margin_volatility: dict[str, Any] | None = None,
     ) -> int:
         return self.db.execute(
             """
@@ -1439,8 +1472,9 @@ class AnalysisEngine:
                 model_probability,market_probability,edge,expected_value,
                 suggested_fraction,suggested_dollars,suggested_contracts,model_version,
                 input_json,btc_state_json,kalshi_state_json,material_reason,
-                forecast_signal,forecast_explanation
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                forecast_signal,forecast_explanation,margin_volatility_index,
+                margin_cushion_ratio,margin_volatility_max
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 observed_at, ticker, decision.signal, decision.reason_code,
@@ -1451,6 +1485,9 @@ class AnalysisEngine:
                 json.dumps({"features": features, "selected_side": selected_side}),
                 json.dumps(btc), json.dumps(market), reason,
                 forecast.signal, forecast.explanation,
+                (margin_volatility or {}).get("mvi"),
+                (margin_volatility or {}).get("cushion_ratio"),
+                float(self.db.settings().get("maximum_margin_volatility", 0)),
             ),
         )
 
@@ -1558,6 +1595,12 @@ class AnalysisEngine:
                 "realized_pnl": trade.get("realized_pnl"),
                 "available_cash_after": trade.get("available_cash_after"),
                 "settlement_margin": trade.get("settlement_margin"),
+                "margin_volatility_index": (
+                    trade.get("entries") or [{}]
+                )[-1].get("margin_volatility_index"),
+                "margin_cushion_ratio": (
+                    trade.get("entries") or [{}]
+                )[-1].get("margin_cushion_ratio"),
             }
             for trade in portfolio.get("trades", [])[:10]
         ]
@@ -1663,10 +1706,10 @@ class AnalysisEngine:
             (row["model_probability"], row["result"]) for row in observations
         )
 
-    def chart(self, minutes: int) -> list[dict[str, Any]]:
+    def chart(self, minutes: int) -> dict[str, Any]:
         minutes = max(5, min(360, int(minutes)))
         since = (datetime.now(UTC) - timedelta(minutes=minutes)).isoformat()
-        return self.db.fetch_all(
+        points = self.db.fetch_all(
             """
             SELECT observed_at, composite_price AS price, dispersion_pct,
                    volatility_15m FROM btc_ticks
@@ -1674,6 +1717,13 @@ class AnalysisEngine:
             """,
             (since,),
         )
+        return {
+            "points": points,
+            "volatility_points": self.margin_volatility.chart(since),
+            "maximum_margin_volatility": float(
+                self.db.settings().get("maximum_margin_volatility", 0)
+            ),
+        }
 
     def _degrade(self, error: str) -> None:
         current = self.dashboard.get("current")

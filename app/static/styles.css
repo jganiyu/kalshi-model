@@ -271,6 +271,7 @@ nav { display: grid; gap: 2px; }
 .chart-timer-icon { width: 15px; height: 15px; flex: 0 0 15px; overflow: visible; transform: translateY(-1px); fill: none; stroke: currentColor; stroke-linecap: round; stroke-linejoin: round; stroke-width: 1.25; }
 .chart-timer-icon .chart-timer-sand { fill: currentColor; stroke: none; }
 .chart-tools { display: flex; min-width: 188px; align-items: flex-end; flex-direction: column; gap: 5px; }
+.chart-mode-switch button { min-width: 64px; }
 .chart-tools p, .chart-tools > span { max-width: 260px; margin: 0; overflow: hidden; color: var(--muted); font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
 .chart-tools > span { color: var(--faint); }
 .chart-wrap { position: relative; width: 100%; height: 292px; min-height: 240px; }
@@ -279,6 +280,8 @@ nav { display: grid; gap: 2px; }
 .chart-legend span { display: flex; align-items: center; gap: 6px; }
 .chart-legend i { display: inline-block; width: 16px; height: 2px; background: var(--chart-line); }
 .chart-legend .legend-strike { background: var(--chart-threshold); }
+.chart-legend .legend-volatility { background: var(--hud-warning); }
+.chart-legend .legend-volatility-max { height: 1px; background: var(--red); }
 
 .countdown { color: var(--ink); font-size: 12px; font-weight: 500; }
 .threshold-block { margin: 22px 0 16px; padding: 17px; border: 1px solid var(--line); border-radius: 6px; background: var(--surface-soft); }
@@ -320,6 +323,7 @@ nav { display: grid; gap: 2px; }
 .standard-edge-hud-gates b { display: flex; align-items: center; gap: 4px; overflow: visible; color: var(--muted); font-size: 8px; font-weight: 700; }
 .standard-edge-hud-gates small { overflow: hidden; text-overflow: ellipsis; }
 .standard-edge-hud-gates small { margin-top: 2px; color: var(--faint); font-family: var(--number-font); font-size: 8px; font-variant-numeric: tabular-nums; }
+.standard-edge-hud-cushion { margin: 12px 0 0; color: var(--muted); font-family: var(--number-font); font-size: 8px; font-variant-numeric: tabular-nums; }
 .standard-edge-hud-blocker { display: flex; min-height: 28px; align-items: flex-start; gap: 6px; margin: 18px 0 0; color: var(--amber); font-size: 9px; line-height: 1.45; }
 .standard-edge-hud[data-status="ready"] .standard-edge-hud-blocker, .standard-edge-hud[data-status="entered"] .standard-edge-hud-blocker { color: var(--green); }
 .standard-edge-hud[data-status="blocked"] .standard-edge-hud-blocker { color: var(--red); }
@@ -564,6 +568,10 @@ nav { display: grid; gap: 2px; }
 .calibration-results .report-item summary { display: grid; grid-template-columns: 1fr; gap: 4px; padding: 10px 0; }
 .calibration-results .report-body { padding: 0 0 12px; }
 .strategy-results { display: grid; gap: 3px; margin-top: 12px; }
+.mvi-evidence { display: grid; gap: 6px; margin-top: 12px; }
+.mvi-evidence-row { display: grid; grid-template-columns: 40px repeat(3, 1fr); gap: 8px; padding: 6px 0; border-bottom: 1px solid var(--line); color: var(--muted); font-size: 8px; }
+.mvi-evidence-row strong { color: var(--ink); font-family: var(--number-font); font-size: 9px; font-variant-numeric: tabular-nums; }
+.mvi-evidence-note { margin: 7px 0 0; color: var(--muted); font-size: 9px; line-height: 1.4; }
 .strategy-result-row { display: grid; grid-template-columns: minmax(0, 1fr) repeat(2, auto); align-items: center; gap: 12px; padding: 9px 0; border-top: 1px solid var(--line); }
 .strategy-result-row:first-child { border-top: 0; }
 .strategy-result-row strong, .strategy-result-row small { display: block; }

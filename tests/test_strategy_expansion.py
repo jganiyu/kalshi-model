@@ -934,7 +934,11 @@ def test_dashboard_markup_has_one_book_and_paper_trade_history() -> None:
     assert 'id="standard-edge-hud"' in markup
     assert 'id="standard-edge-confirmation-track"' in markup
     assert 'id="standard-edge-quality-gate"' in markup
-    assert markup.count('class="hud-help"') == 12
+    assert markup.count('class="hud-help"') == 13
+    assert 'id="standard-edge-volatility-gate"' in markup
+    assert 'id="standard-edge-cushion"' in markup
+    assert 'data-chart-mode="volatility"' in markup
+    assert 'id: "maximum_margin_volatility"' in script
     assert 'data-tooltip="The model probability' in markup
     assert 'aria-label="About risk controls"' in markup
     assert markup.count("v={{ asset_version }}") == 2

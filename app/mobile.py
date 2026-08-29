@@ -67,6 +67,8 @@ def mobile_snapshot(dashboard: dict[str, Any]) -> dict[str, Any]:
         "realized_pnl",
         "available_cash_after",
         "settlement_margin",
+        "margin_volatility_index",
+        "margin_cushion_ratio",
     }
     recent_trades = [
         {

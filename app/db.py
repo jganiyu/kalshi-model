@@ -587,6 +587,44 @@ MIGRATIONS: list[tuple[int, str]] = [
         WHERE available_cash_after IS NULL;
         """,
     ),
+    (
+        13,
+        """
+        CREATE TABLE margin_volatility_observations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            observed_at TEXT NOT NULL,
+            ticker TEXT NOT NULL,
+            threshold REAL NOT NULL,
+            btc_proxy REAL NOT NULL,
+            margin REAL NOT NULL,
+            raw_realized_volatility REAL,
+            movement_intensity REAL,
+            reversal_component REAL,
+            raw_score REAL,
+            mvi REAL,
+            expected_remaining_move REAL,
+            cushion_ratio REAL,
+            seconds_remaining REAL,
+            coverage REAL NOT NULL DEFAULT 0,
+            reliable INTEGER NOT NULL DEFAULT 0,
+            reliability_state TEXT NOT NULL,
+            calculation_version TEXT NOT NULL,
+            UNIQUE(observed_at, calculation_version)
+        );
+        CREATE INDEX idx_margin_volatility_time
+            ON margin_volatility_observations(observed_at);
+        CREATE INDEX idx_margin_volatility_version_score
+            ON margin_volatility_observations(calculation_version, reliable, raw_score);
+
+        ALTER TABLE signal_snapshots ADD COLUMN margin_volatility_index REAL;
+        ALTER TABLE signal_snapshots ADD COLUMN margin_cushion_ratio REAL;
+        ALTER TABLE signal_snapshots ADD COLUMN margin_volatility_max REAL;
+        ALTER TABLE paper_entries ADD COLUMN margin_volatility_index REAL;
+        ALTER TABLE paper_entries ADD COLUMN margin_cushion_ratio REAL;
+        ALTER TABLE broker_order_intents ADD COLUMN margin_volatility_index REAL;
+        ALTER TABLE broker_order_intents ADD COLUMN margin_cushion_ratio REAL;
+        """,
+    ),
 ]
 
 

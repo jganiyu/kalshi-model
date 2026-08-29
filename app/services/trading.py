@@ -676,6 +676,12 @@ class TradingCoordinator:
                 "reason": reason,
                 "assessment": assessment,
                 "strategy_metadata": strategy_metadata or {},
+                "margin_volatility_index": (strategy_metadata or {}).get(
+                    "margin_volatility_index"
+                ),
+                "margin_cushion_ratio": (strategy_metadata or {}).get(
+                    "margin_cushion_ratio"
+                ),
             },
             risk_snapshot={
                 "spread": assessment.get("spread"),

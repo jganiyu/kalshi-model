@@ -109,7 +109,7 @@ async def live(websocket: WebSocket) -> None:
 
 @app.get("/api/chart")
 async def chart(minutes: int = Query(default=5, ge=5, le=360)) -> dict[str, Any]:
-    return {"minutes": minutes, "points": engine.chart(minutes)}
+    return {"minutes": minutes, **engine.chart(minutes)}
 
 
 @app.get("/api/paper")
@@ -378,6 +378,7 @@ async def calibration() -> dict[str, Any]:
         "strategy_results": engine.trading.broker(mode).portfolio().get(
             "strategy_results", {}
         ),
+        "margin_volatility_report": engine.margin_volatility.report(mode),
         "reports": report_rows(db),
         "configuration_snapshots": db.configuration_snapshots(),
     }
@@ -480,6 +481,7 @@ def clean_settings_payload(payload: dict[str, Any]) -> dict[str, Any]:
         "automatic_confirmation_seconds": (1.0, 120.0),
         "automatic_buy_duration_pct": (0.50, 1.0),
         "threshold_margin_gate_dollars": (0.0, 100_000.0),
+        "maximum_margin_volatility": (0.0, 10.0),
         "early_bankroll_pct": (0.0, 1.0),
         "early_min_probability": (0.50, 0.99),
         "early_min_net_ev": (0.0, 0.50),
@@ -680,6 +682,7 @@ async def database_info() -> dict[str, Any]:
         "calibration_reports", "model_versions",
         "broker_order_intents", "broker_orders", "broker_fills",
         "broker_positions", "broker_settlements", "broker_audit_events",
+        "margin_volatility_observations",
     ):
         counts[table] = db.fetch_one(f"SELECT COUNT(*) AS count FROM {table}")["count"]
     return {

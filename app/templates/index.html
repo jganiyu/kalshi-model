@@ -89,6 +89,10 @@
                 </div>
               </div>
               <div class="chart-tools">
+                <div class="segmented chart-mode-switch" aria-label="Chart metric">
+                  <button class="active" data-chart-mode="btc">BTC</button>
+                  <button data-chart-mode="volatility">Volatility</button>
+                </div>
                 <div class="segmented" aria-label="Chart window">
                   <button class="active" data-window="5">5m</button>
                   <button data-window="15">15m</button>
@@ -101,8 +105,10 @@
             </div>
             <div class="chart-wrap"><canvas id="price-chart" aria-label="Live Bitcoin proxy price chart"></canvas></div>
             <div class="chart-legend">
-              <span><i class="legend-price"></i>BTC proxy</span>
+              <span id="price-legend"><i class="legend-price"></i>BTC proxy</span>
               <span id="threshold-legend"><i class="legend-strike" id="threshold-legend-swatch"></i>Current threshold</span>
+              <span id="volatility-legend" hidden><i class="legend-volatility"></i>Margin volatility</span>
+              <span id="volatility-max-legend" hidden><i class="legend-volatility-max"></i>Configured maximum</span>
             </div>
           </section>
         </div>
@@ -225,8 +231,10 @@
                 <span id="standard-edge-data-gate"><i></i><b>Data <button class="hud-help" type="button" aria-label="About data quality" data-tooltip="Whether critical feeds are current, reliable, mutually consistent, and the market is active.">i</button></b><small>--</small></span>
                 <span id="standard-edge-quality-gate"><i></i><b>Quality <button class="hud-help" type="button" aria-label="About entry quality" data-tooltip="Current decision strength versus the minimum confidence required for automatic Standard Edge entries.">i</button></b><small>--</small></span>
                 <span id="standard-edge-threshold-gate"><i></i><b>Threshold <button class="hud-help" type="button" aria-label="About threshold margin" data-tooltip="Up entries require the BTC proxy above the configured threshold band; Down entries require it below the band.">i</button></b><small>--</small></span>
+                <span id="standard-edge-volatility-gate"><i></i><b>Volatility <button class="hud-help" type="button" aria-label="About margin volatility" data-tooltip="Current Margin Volatility Index versus your configured maximum. Zero turns this gate off; low volatility never blocks.">i</button></b><small>Off</small></span>
                 <span id="standard-edge-risk-gate"><i></i><b>Risk <button class="hud-help" type="button" aria-label="About risk controls" data-tooltip="Whether bankroll, drawdown, position, duplicate-entry, and sizing controls permit an automatic entry.">i</button></b><small>--</small></span>
               </div>
+              <p class="standard-edge-hud-cushion" id="standard-edge-cushion">Cushion --</p>
               <p class="standard-edge-hud-blocker"><button class="hud-help" type="button" aria-label="About the primary blocker" data-tooltip="The first requirement currently preventing Standard Edge confirmation or entry.">i</button><span id="standard-edge-hud-blocker">Waiting for live trade data.</span></p>
               <button class="standard-edge-hud-arm" id="hud-arm-trading" data-arm-session type="button" hidden>Arm session</button>
             </div>
@@ -280,6 +288,10 @@
             <section class="compact-result-section">
               <div class="section-heading"><div><h3>Strategy results</h3><p id="strategy-results-subtitle">Forward Paper performance</p></div></div>
               <div id="strategy-results" class="strategy-results"><p class="empty-state">No strategy entries yet.</p></div>
+            </section>
+            <section class="compact-result-section">
+              <div class="section-heading"><div><h3>Margin volatility evidence</h3><p id="mvi-evidence-subtitle">Building reliable 30-minute windows</p></div></div>
+              <div id="mvi-evidence" class="mvi-evidence"><p class="empty-state">No reliable observations yet.</p></div>
             </section>
             <section class="compact-result-section">
               <div class="section-heading"><div><h3>Predicted vs actual</h3><p>Settlement frequency</p></div></div>

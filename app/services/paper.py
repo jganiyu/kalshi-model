@@ -10,6 +10,7 @@ from typing import Any, Callable
 from app.db import Database
 from app.domain import iso_now, kalshi_fee, parse_time
 from app.services.decision import Decision
+from app.services.margin_volatility import MarginVolatilityService
 
 
 _USE_DEFAULT_STOP = object()
@@ -689,8 +690,9 @@ class PaperTradingService:
                         trade_id,order_id,ticker,side,opened_at,entry_price,
                         initial_contracts,remaining_contracts,entry_cost,entry_fees,
                         stop_loss_price,stop_status,source,status,strategy,
-                        model_probability,expected_value,entry_reason
-                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                        model_probability,expected_value,entry_reason,
+                        margin_volatility_index,margin_cushion_ratio
+                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                     """,
                     (
                         trade_id, order["id"], order["ticker"], order["side"],
@@ -699,6 +701,8 @@ class PaperTradingService:
                         order["source"], "open", order.get("strategy") or "MANUAL",
                         market.get("model_probability"), market.get("expected_value"),
                         market.get("entry_reason"),
+                        market.get("margin_volatility_index"),
+                        market.get("margin_cushion_ratio"),
                     ),
                 )
                 affected_entry_ids.append(int(entry_cursor.lastrowid))
@@ -1166,6 +1170,12 @@ class PaperTradingService:
                 "market_probability": decision.market_probability,
                 "expected_value": decision.expected_value,
                 "entry_reason": decision.explanation,
+                "margin_volatility_index": getattr(
+                    self, "_entry_volatility", {}
+                ).get("mvi"),
+                "margin_cushion_ratio": getattr(
+                    self, "_entry_volatility", {}
+                ).get("cushion_ratio"),
             },
         )
         trade = self.db.fetch_one(
@@ -1384,6 +1394,7 @@ class PaperTradingService:
         execution_block_reason: str | None = None,
         execution_risk_by_side: dict[str, dict[str, Any]] | None = None,
         threshold_margin_dollars: float | None = None,
+        margin_volatility: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Describe Standard Edge using the same inputs that drive execution."""
         settings = self.db.settings()
@@ -1442,6 +1453,7 @@ class PaperTradingService:
         threshold_gate = self._threshold_margin_gate(
             settings, side=side, margin_dollars=threshold_margin_dollars
         )
+        volatility_gate = MarginVolatilityService.gate(settings, margin_volatility)
 
         probability_passed = bool(
             probability_value is not None
@@ -1539,6 +1551,7 @@ class PaperTradingService:
             and data_passed
             and confidence_ok
             and threshold_gate["passed"]
+            and volatility_gate["passed"]
             and risk_passed
         )
         confirmation_progress = (
@@ -1566,6 +1579,7 @@ class PaperTradingService:
             or not data_passed
             or not confidence_ok
             or not threshold_gate["passed"]
+            or not volatility_gate["passed"]
             or not risk_passed
         ):
             status = "BLOCKED"
@@ -1584,6 +1598,8 @@ class PaperTradingService:
             blocker = data_detail
         elif not threshold_gate["passed"]:
             blocker = str(threshold_gate["detail"])
+        elif not volatility_gate["passed"]:
+            blocker = str(volatility_gate["detail"])
         elif not risk_passed:
             blocker = risk_detail
         elif not spread_passed:
@@ -1672,6 +1688,7 @@ class PaperTradingService:
                     "detail": quality_detail,
                 },
                 "threshold_margin": threshold_gate,
+                "volatility": volatility_gate,
                 "risk": {
                     "passed": risk_passed,
                     "detail": risk_detail,
@@ -1810,6 +1827,12 @@ class PaperTradingService:
                 "market_probability": assessment.get("market_probability"),
                 "expected_value": expected_value,
                 "entry_reason": reason,
+                "margin_volatility_index": getattr(
+                    self, "_entry_volatility", {}
+                ).get("mvi"),
+                "margin_cushion_ratio": getattr(
+                    self, "_entry_volatility", {}
+                ).get("cushion_ratio"),
             },
         )
         if strategy == "SWING":
@@ -2111,6 +2134,7 @@ class PaperTradingService:
         settlement_window: dict[str, Any],
         z_distance: float,
         threshold_margin_dollars: float | None = None,
+        margin_volatility: dict[str, Any] | None = None,
         model_version: str,
         portfolio: dict[str, Any] | None = None,
         now: float | None = None,
@@ -2123,6 +2147,7 @@ class PaperTradingService:
         fixed_entry_handler: Callable[..., tuple[bool, float]] | None = None,
     ) -> dict[str, Any]:
         settings = self.db.settings()
+        self._entry_volatility = dict(margin_volatility or {})
         current_time = time.monotonic() if now is None else float(now)
         empty = {"armed": False, "progress": 0.0, "entered": False}
         result: dict[str, Any] = {
@@ -2179,6 +2204,7 @@ class PaperTradingService:
                 execution_block_reason=execution_block_reason,
                 execution_risk_by_side=execution_risk_by_side,
                 threshold_margin_dollars=threshold_margin_dollars,
+                margin_volatility=margin_volatility,
             )
             result["swing_readiness"] = self._swing_entry_readiness(
                 ticker=ticker,
@@ -2214,6 +2240,12 @@ class PaperTradingService:
         if not status_open:
             self.reset_automatic_confirmation()
             result["blocked_reason"] = "The market is not active."
+            return finish(blocked_reason=result["blocked_reason"])
+
+        volatility_gate = MarginVolatilityService.gate(settings, margin_volatility)
+        if not volatility_gate["passed"]:
+            self.reset_automatic_confirmation()
+            result["blocked_reason"] = str(volatility_gate["detail"])
             return finish(blocked_reason=result["blocked_reason"])
 
         def margin_gate(side: str) -> dict[str, Any]:
@@ -2282,6 +2314,13 @@ class PaperTradingService:
                     bankroll_fraction=float(settings.get("early_bankroll_pct", 0.03)),
                     model_version=model_version,
                     reason="Stable pre-open threshold remained underpriced after activation.",
+                    strategy_metadata={
+                        "margin_volatility_index": self._entry_volatility.get("mvi"),
+                        "margin_cushion_ratio": self._entry_volatility.get("cushion_ratio"),
+                        "margin_volatility_version": self._entry_volatility.get(
+                            "calculation_version"
+                        ),
+                    },
                 )
                 result["entered"] = entered
                 result["effective_bankroll_allocation"] = effective
@@ -2364,6 +2403,13 @@ class PaperTradingService:
                     bankroll_fraction=float(settings.get("late_bankroll_pct", 0.03)),
                     model_version=model_version,
                     reason="High-probability late outcome retained positive Buy EV.",
+                    strategy_metadata={
+                        "margin_volatility_index": self._entry_volatility.get("mvi"),
+                        "margin_cushion_ratio": self._entry_volatility.get("cushion_ratio"),
+                        "margin_volatility_version": self._entry_volatility.get(
+                            "calculation_version"
+                        ),
+                    },
                 )
                 result["entered"] = entered
                 result["effective_bankroll_allocation"] = effective
@@ -2450,6 +2496,13 @@ class PaperTradingService:
                         ),
                         "confirmation_seconds": float(
                             settings.get("swing_confirmation_seconds", 0)
+                        ),
+                        "margin_volatility_index": self._entry_volatility.get("mvi"),
+                        "margin_cushion_ratio": self._entry_volatility.get(
+                            "cushion_ratio"
+                        ),
+                        "margin_volatility_version": self._entry_volatility.get(
+                            "calculation_version"
                         ),
                     },
                 )

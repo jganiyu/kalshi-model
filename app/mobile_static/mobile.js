@@ -146,6 +146,15 @@ function renderHud(readiness) {
     ? `-- / ${signedMoney(threshold.required)}`
     : `${signedMoney(threshold.current)} / ${signedMoney(threshold.required)}`;
   setGate("#gate-threshold", threshold, thresholdLabel);
+  const volatility = gates.volatility || {};
+  const volatilityLabel = volatility.enabled === false ? "Off" : volatility.current == null
+    ? `${volatility.status === "LEARNING" ? "Learning" : "--"} / ${Number(volatility.required || 0).toFixed(1)}`
+    : `${Number(volatility.current).toFixed(1)} / ${Number(volatility.required || 0).toFixed(1)}`;
+  setGate("#gate-volatility", volatility, volatilityLabel);
+  const cushion = Number(volatility.cushion_ratio);
+  $("#hud-cushion").textContent = Number.isFinite(cushion)
+    ? `Cushion ${cushion > 99 ? ">99" : cushion.toFixed(1)}× expected move`
+    : "Cushion --";
   setGate("#gate-risk", gates.risk, gates.risk?.passed ? "Clear" : "Blocked");
   $("#hud-blocker").textContent = readiness?.blocker || "Waiting for live trade data.";
 }

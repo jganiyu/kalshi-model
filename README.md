@@ -6,8 +6,8 @@ A local macOS research and trading app for Kalshi's 15-minute Bitcoin Up or Down
 
 <table>
   <tr>
-    <td width="50%"><img src="docs/screenshots/dashboard-wide-hud-light-20260826.jpg" alt="Kalshi Model dashboard and Standard Edge HUD in light mode"></td>
-    <td width="50%"><img src="docs/screenshots/dashboard-wide-hud-dark-20260826.jpg" alt="Kalshi Model dashboard and Standard Edge HUD in dark mode"></td>
+    <td width="50%"><img src="docs/screenshots/dashboard-mvi-light-20260829.jpg" alt="Kalshi Model dashboard with the Margin Volatility chart and Standard Edge HUD in light mode"></td>
+    <td width="50%"><img src="docs/screenshots/dashboard-mvi-dark-20260829.jpg" alt="Kalshi Model dashboard with the Margin Volatility chart and Standard Edge HUD in dark mode"></td>
   </tr>
   <tr>
     <td align="center"><strong>Light</strong></td>
@@ -17,7 +17,7 @@ A local macOS research and trading app for Kalshi's 15-minute Bitcoin Up or Down
 
 ## Features
 
-- **Dashboard:** Live BTC proxy, outcome forecast, Standard Edge HUD, order book, positions, and manual controls.
+- **Dashboard:** Live BTC proxy, outcome forecast, Standard Edge HUD, margin volatility, positions, and manual controls.
 - **BTC proxy:** Median Coinbase, Kraken, and Bitstamp price with learned BRTI uncertainty.
 - **Three modes:** Paper, isolated Kalshi Demo, and deliberately armed Kalshi Live.
 - **Mobile Monitor:** Read-only HUD, market metrics, and recent trades on iPhone through Tailscale.
@@ -36,18 +36,20 @@ A local macOS research and trading app for Kalshi's 15-minute Bitcoin Up or Down
 
 ## Standard Edge HUD
 
-![Standard Edge entry-readiness HUD](docs/screenshots/standard-edge-hud-light-20260826.jpg)
+![Standard Edge entry-readiness HUD](docs/screenshots/standard-edge-mvi-light-20260829.jpg)
 
 - Win chance and net EV fill toward their configured targets; confirmation starts only after every entry requirement passes.
-- Spread, liquidity, data, quality, and risk show what is blocking an automatic entry.
+- Spread, liquidity, data, quality, threshold, volatility, and risk show what is blocking an automatic entry.
+- **MVI** scores 30-minute threshold-margin volatility from 0–10; cushion compares today’s margin with the expected remaining move.
 - Hover over an info icon for a plain-language explanation of any metric.
 
 ## Calibration
 
-![Calibration page](docs/screenshots/calibration-strategies-20260824.jpg)
+![Calibration page](docs/screenshots/calibration-mvi-20260829.jpg)
 
 - Apply saves one auditable configuration snapshot; Discard and Restore are reversible.
 - Results show settled samples, Brier score, and calibration in 10-point probability ranges.
+- Margin Volatility has one maximum setting; `0` leaves the gate off while evidence accumulates.
 - Automatic entries still require a valid price, positive Buy EV, confirmation, liquidity, and risk approval.
 
 ## Kalshi credentials
@@ -104,7 +106,9 @@ Only one automatic strategy may enter each market. Swing runs last so it cannot 
 
 ### Risk and learning
 
-Every entry must pass price, liquidity, data, confirmation, allocation, and risk checks.
+Every entry must pass price, liquidity, data, threshold, volatility, confirmation, allocation, and risk checks.
+
+Margin Volatility measures how choppily the BTC proxy is moving around the threshold. Low readings never block; a reading above the configured maximum blocks automatic confirmation in every mode. Cushion is recorded for analysis but is not an entry gate.
 
 A global profit take exits at a configured executable bid—99¢ by default. Stop-losses are optional and off by default.
 
