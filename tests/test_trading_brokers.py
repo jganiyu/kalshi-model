@@ -358,7 +358,7 @@ def test_additive_migration_preserves_existing_paper_history(tmp_path: Path) -> 
         )
     db.initialize()
     assert db.fetch_one("SELECT side FROM paper_trades WHERE ticker='OLD'")["side"] == "NO"
-    assert db.fetch_one("SELECT MAX(version) version FROM schema_migrations")["version"] == 13
+    assert db.fetch_one("SELECT MAX(version) version FROM schema_migrations")["version"] == 14
     assert db.fetch_one("SELECT COUNT(*) count FROM broker_order_intents")["count"] == 0
 
 
@@ -1287,7 +1287,7 @@ def test_broker_cash_migration_preserves_history_and_backfills_nearby_snapshot(
     )
     assert fill and fill["available_cash_after"] == pytest.approx(99.59)
     assert settlement and settlement["available_cash_after"] == pytest.approx(100.59)
-    assert db.fetch_one("SELECT MAX(version) version FROM schema_migrations")["version"] == 13
+    assert db.fetch_one("SELECT MAX(version) version FROM schema_migrations")["version"] == 14
 
 
 @run_async

@@ -11,6 +11,7 @@ from app.db import Database
 from app.domain import iso_now, kalshi_fee, parse_time
 from app.services.decision import Decision
 from app.services.margin_volatility import MarginVolatilityService
+from app.services.trade_review import paper_trade_ref, review_metadata
 
 
 _USE_DEFAULT_STOP = object()
@@ -190,6 +191,12 @@ class PaperTradingService:
             "trades": [
                 {
                     **trade,
+                    **review_metadata(
+                        self.db,
+                        "PAPER",
+                        paper_trade_ref(trade["id"]),
+                        trade.get("status"),
+                    ),
                     "entries": [
                         {
                             **entry,

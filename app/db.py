@@ -625,6 +625,111 @@ MIGRATIONS: list[tuple[int, str]] = [
         ALTER TABLE broker_order_intents ADD COLUMN margin_cushion_ratio REAL;
         """,
     ),
+    (
+        14,
+        """
+        CREATE TABLE trade_review_sessions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            environment TEXT NOT NULL CHECK(environment IN ('PAPER','DEMO','LIVE')),
+            ticker TEXT NOT NULL,
+            market_open_time TEXT,
+            market_close_time TEXT,
+            recording_started_at TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            finalized_at TEXT,
+            status TEXT NOT NULL DEFAULT 'RECORDING',
+            settlement_result TEXT,
+            settlement_value REAL,
+            settlement_margin REAL,
+            expected_regular_points INTEGER NOT NULL DEFAULT 180,
+            regular_point_count INTEGER NOT NULL DEFAULT 0,
+            coverage REAL,
+            gap_count INTEGER NOT NULL DEFAULT 0,
+            calculation_version TEXT NOT NULL DEFAULT 'trade-review-1',
+            UNIQUE(environment,ticker)
+        );
+        CREATE INDEX idx_trade_review_sessions_environment_status
+            ON trade_review_sessions(environment,status,market_close_time);
+
+        CREATE TABLE trade_review_points (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id INTEGER NOT NULL,
+            observed_at TEXT NOT NULL,
+            sample_kind TEXT NOT NULL DEFAULT 'REGULAR',
+            seconds_remaining REAL,
+            threshold REAL,
+            btc_proxy REAL,
+            margin REAL,
+            yes_bid REAL,
+            yes_ask REAL,
+            no_bid REAL,
+            no_ask REAL,
+            spread REAL,
+            liquidity REAL,
+            open_interest REAL,
+            volume REAL,
+            up_probability REAL,
+            forecast_signal TEXT,
+            mvi REAL,
+            expected_remaining_move REAL,
+            cushion_ratio REAL,
+            data_reliable INTEGER,
+            readiness_status TEXT,
+            readiness_side TEXT,
+            readiness_blocker TEXT,
+            model_version TEXT,
+            configuration_snapshot_id INTEGER,
+            state_json TEXT NOT NULL,
+            FOREIGN KEY(session_id) REFERENCES trade_review_sessions(id) ON DELETE CASCADE,
+            FOREIGN KEY(configuration_snapshot_id) REFERENCES configuration_snapshots(id),
+            UNIQUE(session_id,observed_at,sample_kind)
+        );
+        CREATE INDEX idx_trade_review_points_session_time
+            ON trade_review_points(session_id,observed_at);
+
+        CREATE TABLE trade_review_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id INTEGER NOT NULL,
+            observed_at TEXT NOT NULL,
+            event_type TEXT NOT NULL,
+            environment TEXT NOT NULL CHECK(environment IN ('PAPER','DEMO','LIVE')),
+            trade_ref TEXT,
+            side TEXT,
+            action TEXT,
+            price REAL,
+            contracts REAL,
+            fees REAL,
+            detail_json TEXT NOT NULL DEFAULT '{}',
+            state_hash TEXT,
+            FOREIGN KEY(session_id) REFERENCES trade_review_sessions(id) ON DELETE CASCADE
+        );
+        CREATE INDEX idx_trade_review_events_session_time
+            ON trade_review_events(session_id,observed_at,id);
+        CREATE INDEX idx_trade_review_events_trade_ref
+            ON trade_review_events(environment,trade_ref,observed_at);
+
+        CREATE TABLE trade_review_links (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id INTEGER NOT NULL,
+            environment TEXT NOT NULL CHECK(environment IN ('PAPER','DEMO','LIVE')),
+            trade_ref TEXT NOT NULL,
+            source_type TEXT NOT NULL,
+            source_id TEXT,
+            ticker TEXT NOT NULL,
+            side TEXT,
+            opened_at TEXT,
+            closed_at TEXT,
+            status TEXT,
+            strategy TEXT,
+            FOREIGN KEY(session_id) REFERENCES trade_review_sessions(id) ON DELETE CASCADE,
+            UNIQUE(environment,trade_ref)
+        );
+        CREATE INDEX idx_trade_review_links_environment_ref
+            ON trade_review_links(environment,trade_ref);
+        CREATE INDEX idx_trade_review_links_ticker
+            ON trade_review_links(environment,ticker,opened_at);
+        """,
+    ),
 ]
 
 

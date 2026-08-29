@@ -20,6 +20,7 @@ from app.services.kalshi_trading import (
     book_to_outcome,
     normalize_order_price,
 )
+from app.services.trade_review import broker_trade_ref, review_metadata
 from app.services.paper import PaperTradingService
 
 
@@ -600,6 +601,7 @@ class KalshiBroker(Broker):
                 next(iter(sources)) if len(sources) == 1
                 else "mixed" if sources else "external"
             )
+            trade_ref = broker_trade_ref(self.mode, key[0], key[1])
             ledger.append(
                 {
                     "ticker": key[0],
@@ -623,6 +625,7 @@ class KalshiBroker(Broker):
                     "margin_cushion_ratio": (
                         entry_evidence.get(key) or {}
                     ).get("margin_cushion_ratio"),
+                    **review_metadata(self.db, self.mode, trade_ref, status),
                 }
             )
         return sorted(

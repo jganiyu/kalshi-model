@@ -26,6 +26,10 @@ const state = {
     mode: "PAPER", pendingConfirmation: null, switching: false,
     armConfirmation: { mode: null, confirming: false, submitting: false, timer: null },
   },
+  tradeReview: {
+    tradeRef: null, mode: null, data: null, chartMode: "btc",
+    selectedIndex: null, requestToken: 0,
+  },
   calibration: { saved: null, defaults: null, dirty: false },
 };
 
@@ -127,6 +131,15 @@ function shortDate(value) {
   return new Intl.DateTimeFormat("en-US", {
     month: "short", day: "numeric", hour: "numeric", minute: "2-digit",
   }).format(new Date(value));
+}
+
+function escapeHtml(value) {
+  return String(value ?? "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#039;");
 }
 
 function countdown(seconds) {
@@ -1624,6 +1637,302 @@ async function restoreConfiguration(snapshotId) {
   } catch (error) { showToast("Configuration not restored", error.message); }
 }
 
+function historicalReviewSummary(review) {
+  const trade = review.trade || {};
+  const session = review.session || {};
+  const coverage = session.coverage == null ? "--" : percent(session.coverage, 0);
+  const resultClass = Number(trade.realized_pnl) > 0 ? "positive" : Number(trade.realized_pnl) < 0 ? "negative" : "";
+  return `
+    <div class="trade-review-summary">
+      <div><span>Environment / side</span><strong>${escapeHtml(review.environment)} · ${marketSideLabel(trade.side)}</strong><small>${escapeHtml(String(trade.strategy || "--").replaceAll("_", " "))}</small></div>
+      <div><span>Entry / exit</span><strong>${cents(trade.entry_price)} / ${trade.exit_price == null ? "--" : cents(trade.exit_price)}</strong><small>${shortDate(trade.opened_at)}</small></div>
+      <div><span>Quantity / fees</span><strong>${trade.contracts ?? "--"} / ${trade.fees == null ? "--" : money(trade.fees, 4)}</strong><small>Contracts / total fees</small></div>
+      <div><span>Entry probability / EV</span><strong>${trade.model_probability == null ? "--" : percent(trade.model_probability)} / ${trade.expected_value == null ? "--" : cents(trade.expected_value)}</strong><small>Saved at entry</small></div>
+      <div><span>Result</span><strong class="${resultClass}">${trade.realized_pnl == null ? "--" : signedMoney(trade.realized_pnl)}</strong><small>${escapeHtml(session.settlement_result || "--")}</small></div>
+      <div><span>Settlement margin</span><strong>${session.settlement_margin == null ? "--" : signedMoney(session.settlement_margin)}</strong><small>Price to threshold</small></div>
+      <div><span>Available after</span><strong>${trade.available_cash_after == null ? "--" : money(trade.available_cash_after)}</strong><small>Latest transaction</small></div>
+      <div><span>Coverage</span><strong>${coverage}</strong><small>${session.gap_count || 0} recorded gap${Number(session.gap_count) === 1 ? "" : "s"}</small></div>
+    </div>`;
+}
+
+function historicalReviewCoverageWarning(review) {
+  const session = review.session || {};
+  if (session.session_status === "FINALIZED" && !Number(session.gap_count)) return "";
+  const coverage = session.coverage == null ? "unknown" : percent(session.coverage, 0);
+  return `<p class="trade-review-coverage-warning">Partial history: ${coverage} coverage with ${Number(session.gap_count || 0)} recorded gap${Number(session.gap_count) === 1 ? "" : "s"}. Missing values are shown as gaps and were not reconstructed.</p>`;
+}
+
+function reviewMetricContent(point) {
+  const snapshot = point?.state || {};
+  const forecast = snapshot.forecast || {};
+  const assessments = snapshot.trade_assessments || {};
+  const readiness = snapshot.standard_edge_readiness || {};
+  const quality = snapshot.data_quality || {};
+  const selectedSide = state.tradeReview.data?.trade?.side || readiness.side || "YES";
+  const selected = assessments[selectedSide] || {};
+  const selectedBuy = selected.buy || {};
+  const gates = readiness.gates || {};
+  const gateSummary = Object.entries(gates)
+    .map(([name, detail]) => `${name.replaceAll("_", " ")} ${detail?.passed ? "✓" : "×"}`)
+    .join(" · ") || "--";
+  return `
+    <div><span>Time / remaining</span><strong>${point ? `${new Date(point.observed_at).toLocaleTimeString([], { hour: "numeric", minute: "2-digit", second: "2-digit" })} / ${countdown(point.seconds_remaining)}` : "Move across chart"}</strong></div>
+    <div><span>BTC / threshold</span><strong>${point ? `${money(point.btc_proxy)} / ${money(point.threshold)}` : "--"}</strong></div>
+    <div><span>Margin</span><strong>${point?.margin == null ? "--" : signedMoney(point.margin)}</strong></div>
+    <div><span>Up bid / ask</span><strong>${point ? `${cents(point.yes_bid)} / ${cents(point.yes_ask)}` : "--"}</strong></div>
+    <div><span>Down bid / ask</span><strong>${point ? `${cents(point.no_bid)} / ${cents(point.no_ask)}` : "--"}</strong></div>
+    <div><span>Up / Down</span><strong>${forecast.up_probability == null ? "--" : `${percent(forecast.up_probability)} / ${percent(forecast.down_probability)}`}</strong></div>
+    <div><span>Forecast</span><strong>${escapeHtml(String(point?.forecast_signal || "--").replaceAll("_", " "))}</strong></div>
+    <div><span>${marketSideLabel(selectedSide)} executable / EV</span><strong>${selectedBuy.executable_price == null ? "--" : cents(selectedBuy.executable_price)} / ${selectedBuy.expected_value == null ? "--" : cents(selectedBuy.expected_value)}</strong></div>
+    <div><span>MVI / expected / cushion</span><strong>${point?.mvi == null ? "--" : Number(point.mvi).toFixed(2)} / ${point?.expected_remaining_move == null ? "--" : money(point.expected_remaining_move)} / ${point?.cushion_ratio == null ? "--" : Number(point.cushion_ratio).toFixed(2)}</strong></div>
+    <div><span>Spread / liquidity</span><strong>${point ? `${cents(point.spread)} / ${compact(point.liquidity)}` : "--"}</strong></div>
+    <div class="wide"><span>Data / gates</span><strong>${quality.reliable ? "Reliable" : "Blocked"} · ${escapeHtml(gateSummary)}</strong></div>
+    <div class="wide"><span>Readiness / blocker</span><strong>${escapeHtml(readiness.status || "--")} · ${escapeHtml(readiness.blocker || "--")}</strong></div>`;
+}
+
+function reviewTooltipContent(point) {
+  if (!point) return "";
+  const snapshot = point.state || {};
+  const readiness = snapshot.standard_edge_readiness || {};
+  const assessments = snapshot.trade_assessments || {};
+  const side = state.tradeReview.data?.trade?.side || readiness.side || "YES";
+  const assessment = assessments[side] || {};
+  const buy = assessment.buy || {};
+  const forecast = snapshot.forecast || {};
+  const gateSummary = Object.entries(readiness.gates || {})
+    .map(([name, detail]) => `<span class="${detail?.passed ? "pass" : "fail"}">${escapeHtml(name.replaceAll("_", " "))}</span>`)
+    .join("");
+  return `<strong>${new Date(point.observed_at).toLocaleTimeString([], { hour: "numeric", minute: "2-digit", second: "2-digit" })} · ${countdown(point.seconds_remaining)} left</strong>
+    <dl>
+      <div><dt>BTC / threshold</dt><dd>${money(point.btc_proxy)} / ${money(point.threshold)}</dd></div>
+      <div><dt>Margin</dt><dd>${point.margin == null ? "--" : signedMoney(point.margin)}</dd></div>
+      <div><dt>Up / Down quote</dt><dd>${cents(point.yes_bid)}–${cents(point.yes_ask)} / ${cents(point.no_bid)}–${cents(point.no_ask)}</dd></div>
+      <div><dt>Up / Down chance</dt><dd>${percent(forecast.up_probability)} / ${percent(forecast.down_probability)}</dd></div>
+      <div><dt>Forecast</dt><dd>${escapeHtml(String(point.forecast_signal || "--").replaceAll("_", " "))}</dd></div>
+      <div><dt>${marketSideLabel(side)} executable / EV</dt><dd>${buy.executable_price == null ? "--" : cents(buy.executable_price)} / ${buy.expected_value == null ? "--" : cents(buy.expected_value)}</dd></div>
+      <div><dt>MVI / expected / cushion</dt><dd>${point.mvi == null ? "--" : Number(point.mvi).toFixed(2)} / ${point.expected_remaining_move == null ? "--" : money(point.expected_remaining_move)} / ${point.cushion_ratio == null ? "--" : Number(point.cushion_ratio).toFixed(2)}</dd></div>
+      <div><dt>Spread / liquidity</dt><dd>${cents(point.spread)} / ${compact(point.liquidity)}</dd></div>
+      <div><dt>Data quality</dt><dd>${snapshot.data_quality?.reliable ? "Reliable" : "Blocked"}</dd></div>
+    </dl><div class="trade-review-tooltip-gates">${gateSummary}</div><p>${escapeHtml(readiness.blocker || "No blocker recorded.")}</p>`;
+}
+
+function historicalReviewPoints() {
+  return (state.tradeReview.data?.points || [])
+    .filter((point) => point.sample_kind === "REGULAR")
+    .map((point) => ({ ...point, timestamp: new Date(point.observed_at).getTime() }))
+    .filter((point) => Number.isFinite(point.timestamp));
+}
+
+function historicalReviewSelectablePoints() {
+  return (state.tradeReview.data?.points || [])
+    .map((point) => ({ ...point, timestamp: new Date(point.observed_at).getTime() }))
+    .filter((point) => Number.isFinite(point.timestamp));
+}
+
+function drawHistoricalTradeReview() {
+  const panel = document.querySelector(".trade-review-expanded");
+  const canvas = panel?.querySelector(".trade-review-canvas");
+  const review = state.tradeReview.data;
+  if (!canvas || !review) return;
+  const points = historicalReviewPoints();
+  const selectablePoints = historicalReviewSelectablePoints();
+  const box = canvas.getBoundingClientRect();
+  const ratio = window.devicePixelRatio || 1;
+  const width = Math.max(1, box.width);
+  const height = Math.max(1, box.height);
+  canvas.width = Math.floor(width * ratio);
+  canvas.height = Math.floor(height * ratio);
+  const context = canvas.getContext("2d");
+  context.setTransform(ratio, 0, 0, ratio, 0, 0);
+  context.clearRect(0, 0, width, height);
+  const styles = getComputedStyle(document.documentElement);
+  const color = (name) => styles.getPropertyValue(name).trim();
+  const left = 12; const right = 68; const top = 18; const bottom = 34;
+  const chartWidth = width - left - right;
+  const chartHeight = height - top - bottom;
+  const session = review.session || {};
+  const start = new Date(session.market_open_time || points[0]?.observed_at).getTime();
+  const end = new Date(session.market_close_time || points.at(-1)?.observed_at).getTime();
+  if (!points.length || !Number.isFinite(start) || !Number.isFinite(end) || end <= start) {
+    context.fillStyle = color("--muted"); context.textAlign = "center";
+    context.fillText("Historical points are unavailable.", width / 2, height / 2);
+    return;
+  }
+  const x = (timestamp) => left + ((timestamp - start) / (end - start)) * chartWidth;
+  const volatility = state.tradeReview.chartMode === "volatility";
+  const values = volatility
+    ? points.map((point) => Number(point.mvi)).filter(Number.isFinite)
+    : points.flatMap((point) => [Number(point.btc_proxy), Number(point.threshold)]).filter(Number.isFinite);
+  let low = volatility ? 0 : Math.min(...values);
+  let high = volatility ? 10 : Math.max(...values);
+  if (!volatility) {
+    const padding = Math.max((high - low) * 0.14, 4);
+    low -= padding; high += padding;
+  }
+  const y = (value) => top + (1 - (value - low) / Math.max(high - low, 1e-9)) * chartHeight;
+  context.strokeStyle = color("--chart-grid");
+  context.fillStyle = color("--chart-label");
+  context.font = `10px ${color("--number-font")}`;
+  for (let index = 0; index < 5; index += 1) {
+    const value = low + ((high - low) * index) / 4;
+    const rowY = y(value);
+    context.beginPath(); context.moveTo(left, rowY); context.lineTo(width - right, rowY); context.stroke();
+    context.fillText(volatility ? value.toFixed(1) : money(value, 0), width - right + 8, rowY + 3);
+  }
+  [0, 5, 10, 15].forEach((minute) => {
+    const timestamp = start + minute * 60000;
+    const columnX = x(timestamp);
+    context.beginPath(); context.moveTo(columnX, top); context.lineTo(columnX, top + chartHeight); context.stroke();
+    context.textAlign = minute === 0 ? "left" : minute === 15 ? "right" : "center";
+    context.fillText(chartTimeLabel(timestamp, false), columnX, height - 9);
+  });
+  (review.gaps || []).forEach((gap) => {
+    const gapStart = x(new Date(gap.from).getTime());
+    const gapEnd = x(new Date(gap.to).getTime());
+    context.fillStyle = color("--red-soft");
+    context.fillRect(gapStart, top, Math.max(2, gapEnd - gapStart), chartHeight);
+  });
+  const drawSeries = (valueFor, stroke, dashed = false) => {
+    context.save(); context.strokeStyle = stroke; context.lineWidth = 2;
+    if (dashed) context.setLineDash([5, 4]);
+    context.beginPath();
+    let drawing = false; let previousTime = null;
+    points.forEach((point) => {
+      const value = valueFor(point);
+      if (!Number.isFinite(value)) { drawing = false; return; }
+      const hasGap = previousTime != null && point.timestamp - previousTime > 7500;
+      if (!drawing || hasGap) context.moveTo(x(point.timestamp), y(value));
+      else context.lineTo(x(point.timestamp), y(value));
+      drawing = true; previousTime = point.timestamp;
+    });
+    context.stroke(); context.restore();
+  };
+  if (volatility) drawSeries((point) => Number(point.mvi), color("--hud-warning"));
+  else {
+    drawSeries((point) => Number(point.btc_proxy), color("--chart-line"));
+    drawSeries((point) => Number(point.threshold), color("--chart-threshold"), true);
+  }
+  const eventColors = { ENTRY: color("--green"), PARTIAL_FILL: color("--green"), EXIT: color("--blue"), PARTIAL_EXIT: color("--blue"), SETTLEMENT: color("--red") };
+  (review.events || []).filter((event) => eventColors[event.event_type]
+    && (event.trade_ref === review.trade_ref
+      || (event.event_type === "SETTLEMENT" && !event.trade_ref))).forEach((event) => {
+    const eventX = x(new Date(event.observed_at).getTime());
+    if (eventX < left || eventX > width - right) return;
+    context.save(); context.strokeStyle = eventColors[event.event_type]; context.lineWidth = 1.25;
+    context.setLineDash([3, 3]); context.beginPath(); context.moveTo(eventX, top); context.lineTo(eventX, top + chartHeight); context.stroke();
+    context.fillStyle = eventColors[event.event_type]; context.beginPath();
+    context.moveTo(eventX, top); context.lineTo(eventX - 4, top + 7); context.lineTo(eventX + 4, top + 7); context.closePath(); context.fill(); context.restore();
+  });
+  const selectedIndex = state.tradeReview.selectedIndex;
+  if (selectedIndex != null && selectablePoints[selectedIndex]) {
+    const point = selectablePoints[selectedIndex]; const crosshairX = x(point.timestamp);
+    context.save(); context.strokeStyle = color("--muted"); context.lineWidth = 1;
+    context.beginPath(); context.moveTo(crosshairX, top); context.lineTo(crosshairX, top + chartHeight); context.stroke(); context.restore();
+    const value = volatility ? Number(point.mvi) : Number(point.btc_proxy);
+    if (Number.isFinite(value)) { context.beginPath(); context.arc(crosshairX, y(value), 3.5, 0, Math.PI * 2); context.fillStyle = volatility ? color("--hud-warning") : color("--chart-line"); context.fill(); }
+  }
+  state.tradeReview.geometry = {
+    left, right, width, start, end, points: selectablePoints,
+  };
+}
+
+function selectHistoricalPoint(index, pointerX = null) {
+  const points = historicalReviewSelectablePoints();
+  if (!points.length) return;
+  state.tradeReview.selectedIndex = Math.max(0, Math.min(points.length - 1, index));
+  const metrics = document.querySelector(".trade-review-metrics");
+  if (metrics) metrics.innerHTML = reviewMetricContent(points[state.tradeReview.selectedIndex]);
+  const tooltip = document.querySelector(".trade-review-tooltip");
+  const geometry = state.tradeReview.geometry;
+  if (tooltip && geometry) {
+    const point = points[state.tradeReview.selectedIndex];
+    tooltip.innerHTML = reviewTooltipContent(point);
+    tooltip.hidden = false;
+    const crosshairX = pointerX ?? geometry.left
+      + ((point.timestamp - geometry.start) / (geometry.end - geometry.start))
+      * (geometry.width - geometry.left - geometry.right);
+    const tooltipWidth = Math.min(310, geometry.width - 24);
+    const proposed = crosshairX > geometry.width * 0.62
+      ? crosshairX - tooltipWidth - 12 : crosshairX + 12;
+    tooltip.style.left = `${Math.max(8, Math.min(geometry.width - tooltipWidth - 8, proposed))}px`;
+    tooltip.style.width = `${tooltipWidth}px`;
+  }
+  drawHistoricalTradeReview();
+}
+
+function bindHistoricalReviewPanel(panel) {
+  panel.querySelectorAll("[data-review-chart-mode]").forEach((button) => button.addEventListener("click", () => {
+    state.tradeReview.chartMode = button.dataset.reviewChartMode;
+    panel.querySelectorAll("[data-review-chart-mode]").forEach((item) => item.classList.toggle("active", item === button));
+    drawHistoricalTradeReview();
+  }));
+  const canvas = panel.querySelector(".trade-review-canvas");
+  canvas.addEventListener("pointermove", (event) => {
+    const geometry = state.tradeReview.geometry;
+    if (!geometry?.points?.length) return;
+    const rect = canvas.getBoundingClientRect();
+    const pointerX = event.clientX - rect.left;
+    const timestamp = geometry.start + ((pointerX - geometry.left) / (geometry.width - geometry.left - geometry.right)) * (geometry.end - geometry.start);
+    let nearest = 0;
+    geometry.points.forEach((point, index) => {
+      if (Math.abs(point.timestamp - timestamp) <= Math.abs(geometry.points[nearest].timestamp - timestamp)) nearest = index;
+    });
+    selectHistoricalPoint(nearest, pointerX);
+  });
+  canvas.addEventListener("pointerleave", () => {
+    const tooltip = panel.querySelector(".trade-review-tooltip");
+    if (tooltip) tooltip.hidden = true;
+  });
+  canvas.addEventListener("keydown", (event) => {
+    if (!["ArrowLeft", "ArrowRight"].includes(event.key)) return;
+    event.preventDefault();
+    selectHistoricalPoint((state.tradeReview.selectedIndex ?? 0) + (event.key === "ArrowRight" ? 1 : -1));
+  });
+}
+
+async function toggleHistoricalTradeReview(row) {
+  const tradeRef = row.dataset.reviewRef;
+  const mode = row.dataset.reviewMode;
+  if (!tradeRef || row.dataset.reviewAvailable !== "true") return;
+  if (
+    state.tradeReview.tradeRef === tradeRef
+    && state.tradeReview.mode === mode
+    && document.querySelector(".trade-review-row")
+  ) {
+    document.querySelector(".trade-review-row")?.remove();
+    state.tradeReview = { ...state.tradeReview, tradeRef: null, mode: null, data: null, selectedIndex: null };
+    row.setAttribute("aria-expanded", "false");
+    return;
+  }
+  document.querySelector(".trade-review-row")?.remove();
+  document.querySelectorAll(".trade-ledger-row[aria-expanded='true']").forEach((item) => item.setAttribute("aria-expanded", "false"));
+  row.setAttribute("aria-expanded", "true");
+  const reviewRow = document.createElement("tr");
+  reviewRow.className = "trade-review-row";
+  reviewRow.innerHTML = '<td colspan="10"><div class="trade-review-loading">Loading saved market history…</div></td>';
+  row.after(reviewRow);
+  const token = ++state.tradeReview.requestToken;
+  state.tradeReview = { ...state.tradeReview, tradeRef, mode, data: null, chartMode: "btc", selectedIndex: null, requestToken: token };
+  try {
+    const review = await api(`/api/trading/${mode}/reviews/${encodeURIComponent(tradeRef)}`, { cache: "no-store" });
+    if (token !== state.tradeReview.requestToken || !reviewRow.isConnected) return;
+    state.tradeReview.data = review;
+    reviewRow.innerHTML = `<td colspan="10"><section class="trade-review-expanded" aria-label="Historical trade review">
+      <div class="trade-review-header"><div><p class="eyebrow">HISTORICAL TRADE REVIEW</p><h3>${escapeHtml(review.trade?.ticker || tradeRef)} · ${marketSideLabel(review.trade?.side)}</h3></div>
+        <div class="segmented trade-review-switch"><button class="active" type="button" data-review-chart-mode="btc">BTC</button><button type="button" data-review-chart-mode="volatility">Volatility</button></div></div>
+      ${historicalReviewSummary(review)}
+      ${historicalReviewCoverageWarning(review)}
+      <div class="trade-review-chart-shell"><canvas class="trade-review-canvas" tabindex="0" aria-label="Historical market chart. Use left and right arrow keys to inspect saved points."></canvas><div class="trade-review-tooltip" hidden></div></div>
+      <div class="trade-review-legend"><span><i class="btc"></i>BTC proxy</span><span><i class="threshold"></i>Threshold</span><span><i class="entry"></i>Entry</span><span><i class="exit"></i>Exit</span><span><i class="settlement"></i>Settlement</span><small>Crosshair snaps to saved 5-second observations. Shaded areas are explicit recording gaps.</small></div>
+      <div class="trade-review-metrics">${reviewMetricContent(null)}</div>
+    </section></td>`;
+    bindHistoricalReviewPanel(reviewRow.querySelector(".trade-review-expanded"));
+    drawHistoricalTradeReview();
+  } catch (error) {
+    reviewRow.innerHTML = `<td colspan="10"><div class="trade-review-loading error">${escapeHtml(error.message)}</div></td>`;
+  }
+}
+
 async function loadPaper() {
   const trading = await api("/api/trading");
   const mode = trading.selected_mode || "PAPER";
@@ -1669,13 +1978,23 @@ async function loadPaper() {
       statCard("Actual fees", money(data.actual_fees, 4), "Account fill history"),
     ].join("");
   const trades = mode === "PAPER" ? data.trades || [] : data.ledger || [];
-  $("#trade-table").innerHTML = trades.length ? trades.map((trade) => `
-    <tr><td>${shortDate(trade.activity_at || trade.opened_at || trade.filled_at)}</td><td>${trade.ticker}</td><td>${marketSideLabel(trade.side)}</td>
+  $("#trade-table").innerHTML = trades.length ? trades.map((trade) => {
+    const reviewAvailable = Boolean(trade.review_available);
+    const reviewRecording = trade.review_status === "RECORDING";
+    const reviewUnavailable = !reviewAvailable && !reviewRecording
+      && !["OPEN", "UNSETTLED", "PARTIALLY CLOSED"].includes(String(trade.status || "").toUpperCase());
+    const reviewTitle = reviewAvailable
+      ? "Open historical trade review"
+      : reviewRecording || String(trade.status || "").toUpperCase() === "OPEN"
+        ? "Review becomes available after settlement"
+        : "Historical review was not recorded for this trade";
+    return `
+    <tr class="trade-ledger-row ${reviewAvailable ? "review-available" : ""}" data-review-ref="${escapeHtml(trade.review_ref || "")}" data-review-mode="${mode}" data-review-available="${reviewAvailable}" tabindex="${reviewAvailable ? "0" : "-1"}" aria-expanded="false" title="${escapeHtml(reviewTitle)}"><td>${shortDate(trade.activity_at || trade.opened_at || trade.filled_at)}${reviewUnavailable ? '<small class="review-unavailable">Historical review unavailable</small>' : ""}</td><td>${escapeHtml(trade.ticker)}</td><td>${marketSideLabel(trade.side)}</td>
     <td>${cents(trade.entry_price ?? trade.price)}</td><td>${trade.contracts}</td><td>${String(trade.strategy || trade.source || "automatic").replaceAll("_", " ").toUpperCase()}${(trade.entries || []).some((entry) => entry.stop_status === "active") ? " · STOP ACTIVE" : ""}</td><td>${mode === "PAPER" ? points(trade.edge) : "—"}</td>
     <td><span class="status-pill ${String(trade.display_status || trade.status || "filled").toLowerCase()}">${String(trade.display_status || trade.status || trade.action || "FILLED").toUpperCase()}</span></td>
     <td class="${Number(trade.realized_pnl) > 0 ? "positive" : Number(trade.realized_pnl) < 0 ? "negative" : ""}">${trade.realized_pnl == null ? "--" : money(trade.realized_pnl)}</td>
     <td>${trade.available_cash_after == null ? "—" : money(trade.available_cash_after)}</td></tr>
-  `).join("") : `<tr><td colspan="10" class="empty-state">No ${mode === "PAPER" ? "paper trades" : "confirmed fills"} yet.</td></tr>`;
+  `; }).join("") : `<tr><td colspan="10" class="empty-state">No ${mode === "PAPER" ? "paper trades" : "confirmed fills"} yet.</td></tr>`;
   if (mode !== "PAPER") {
     const profitTake = data.profit_take_state || {};
     const stopState = data.stop_loss_state || {};
@@ -2146,6 +2465,17 @@ function bindEvents() {
       await loadPaper();
     } catch (error) { showToast("Unable to cancel order", error.message); }
   });
+  $("#trade-table").addEventListener("click", (event) => {
+    const row = event.target.closest(".trade-ledger-row.review-available");
+    if (row) toggleHistoricalTradeReview(row);
+  });
+  $("#trade-table").addEventListener("keydown", (event) => {
+    const row = event.target.closest(".trade-ledger-row.review-available");
+    if (row && ["Enter", " "].includes(event.key)) {
+      event.preventDefault();
+      toggleHistoricalTradeReview(row);
+    }
+  });
   $("#calibration-controls").addEventListener("input", markCalibrationDirty);
   $("#calibration-controls").addEventListener("change", markCalibrationDirty);
   $("#apply-calibration").addEventListener("click", applyCalibration);
@@ -2164,7 +2494,10 @@ function bindEvents() {
   themeMedia.addEventListener("change", () => {
     if (state.themePreference === "system") applyTheme("system");
   });
-  window.addEventListener("resize", drawChart);
+  window.addEventListener("resize", () => {
+    drawChart();
+    drawHistoricalTradeReview();
+  });
 }
 
 document.addEventListener("DOMContentLoaded", async () => {

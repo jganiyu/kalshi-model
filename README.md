@@ -23,7 +23,8 @@ A local macOS research and trading app for Kalshi's 15-minute Bitcoin Up or Down
 - **Mobile Monitor:** Read-only HUD, market metrics, and recent trades on iPhone through Tailscale.
 - **Strategies:** Standard Edge, Early Threshold, Late Conviction, and Swing.
 - **Calibration:** Tune strategies, exits, allocation, and mode-specific hard limits.
-- **Local data:** Settings, evidence, trades, snapshots, reports, and backups stay in SQLite on your Mac.
+- **Trade review:** Expand a settled trade to replay its BTC, probability, MVI, readiness, and execution history.
+- **Local data:** Settings, evidence, trades, review snapshots, reports, and backups stay in SQLite on your Mac.
 
 ## Outcome forecast
 
@@ -136,6 +137,24 @@ Demo and Live default to a 100% eligible-funds cap, but strategy sizing and hard
 All exchange orders are price-limited and may fill partially. A kill switch blocks new submissions and attempts to cancel resting orders. After a restart or disconnect, the app reconciles with Kalshi and requires rearming.
 
 Stop-losses and the global profit take are app-managed in Demo and Live. They work only while the app is running, connected, authenticated, reconciled, and armed; execution is not guaranteed.
+
+## Historical trade review
+
+<table>
+  <tr>
+    <td width="50%"><img src="docs/screenshots/trade-review-light-20260829.png" alt="Expanded Historical Trade Review in light mode"></td>
+    <td width="50%"><img src="docs/screenshots/trade-review-dark-20260829.png" alt="Expanded Historical Trade Review in dark mode"></td>
+  </tr>
+  <tr>
+    <td align="center"><strong>Light</strong></td>
+    <td align="center"><strong>Dark</strong></td>
+  </tr>
+</table>
+
+- Click a settled trade to open its full 15-minute review directly in the ledger.
+- Move across the chart for saved price, probability, MVI, EV, readiness, and data-quality readings.
+- Entry, exit, and settlement markers explain when the position changed; recording gaps stay visible.
+- Reviews are recorded only for traded markets; open and legacy trades do not invent history.
 
 ## Mobile Monitor
 

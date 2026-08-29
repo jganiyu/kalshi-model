@@ -51,6 +51,7 @@ from app.services.paper import PaperTradingService
 from app.services.streaming import BitcoinWebSocketFeeds, KalshiWebSocketFeed
 from app.services.training import ModelManager
 from app.services.trading import TradingCoordinator
+from app.services.trade_review import TradeReviewService
 
 
 logger = logging.getLogger(__name__)
@@ -66,6 +67,7 @@ class AnalysisEngine:
         self.kalshi_demo: KalshiPublicClient | None = None
         self.paper = PaperTradingService(db)
         self.margin_volatility = MarginVolatilityService(db)
+        self.trade_reviews = TradeReviewService(db)
         self.trading = TradingCoordinator(config, db, self.paper)
         self.models = ModelManager(db)
         self._benchmark_calibration: dict[str, Any] = {
@@ -89,6 +91,9 @@ class AnalysisEngine:
         self._kalshi_stream_task: asyncio.Task[None] | None = None
         self._subscribers: set[asyncio.Queue[None]] = set()
         self._publish_task: asyncio.Task[None] | None = None
+        self._trade_review_task: asyncio.Task[None] | None = None
+        self._pending_trade_review: tuple[dict[str, Any], str] | None = None
+        self._last_trade_review_key: tuple[str, int, str] | None = None
         self._live_refresh_task: asyncio.Task[None] | None = None
         self._stopping = asyncio.Event()
         self._update_lock = asyncio.Lock()
@@ -154,6 +159,7 @@ class AnalysisEngine:
             self._runner,
             self._bootstrap_task,
             self._publish_task,
+            self._trade_review_task,
             self._live_refresh_task,
             self._kalshi_stream_task,
             *self._stream_tasks,
@@ -289,6 +295,9 @@ class AnalysisEngine:
                 observed_at,
                 execution_market_state=execution_market_state,
             )
+            current_payload["btc_proxy"] = btc_state.get("price")
+            current_payload["btc_state"] = btc_state
+            self._schedule_trade_review(current_payload, observed_at)
             if self._previous_ticker and self._previous_ticker != ticker:
                 self._pending_settlements.add(self._previous_ticker)
             self._previous_ticker = ticker
@@ -307,6 +316,9 @@ class AnalysisEngine:
             current_payload = self._unreliable_current(
                 current_market, reason
             )
+            current_payload["btc_proxy"] = btc_state.get("price")
+            current_payload["btc_state"] = btc_state
+            self._schedule_trade_review(current_payload, observed_at)
         elif self._previous_ticker:
             self._market_state = None
             self._execution_market_state = None
@@ -709,6 +721,7 @@ class AnalysisEngine:
             observed_at,
             execution_market_state=execution_state,
         )
+        self._schedule_trade_review(current, observed_at)
         reliable = current["decision"]["reason_code"] != "DATA_UNRELIABLE"
         self.dashboard = {
             **self.dashboard,
@@ -722,6 +735,47 @@ class AnalysisEngine:
         }
         self._schedule_publish()
         self.trading.schedule_process(current)
+
+    def _schedule_trade_review(
+        self, current: dict[str, Any], observed_at: str
+    ) -> None:
+        parsed = parse_time(observed_at) or datetime.now(UTC)
+        bucket = int(parsed.timestamp()) // 5
+        readiness = current.get("standard_edge_readiness") or {}
+        signature = json.dumps(
+            {
+                "forecast": (current.get("forecast") or {}).get("signal"),
+                "side": readiness.get("side"),
+                "status": readiness.get("status"),
+                "gates": {
+                    key: bool((value or {}).get("passed"))
+                    for key, value in (readiness.get("gates") or {}).items()
+                },
+                "model": current.get("model_version"),
+                "entered": (current.get("automatic_entry") or {}).get("entered"),
+            },
+            sort_keys=True,
+        )
+        key = (str(current.get("ticker") or ""), bucket, signature)
+        if key == self._last_trade_review_key:
+            return
+        self._last_trade_review_key = key
+        payload = dict(current)
+        payload["btc_proxy"] = (self._latest_btc or {}).get("price")
+        payload["btc_state"] = self._latest_btc or {}
+        self._pending_trade_review = (payload, observed_at)
+        if not self._trade_review_task or self._trade_review_task.done():
+            self._trade_review_task = asyncio.create_task(
+                self._drain_trade_reviews()
+            )
+
+    async def _drain_trade_reviews(self) -> None:
+        while self._pending_trade_review is not None:
+            payload, observed_at = self._pending_trade_review
+            self._pending_trade_review = None
+            await asyncio.to_thread(
+                self.trade_reviews.observe, payload, observed_at
+            )
 
     def _save_bitcoin(
         self, composite: CompositeQuote, observed_at: str, *, persist: bool = True
@@ -1519,6 +1573,13 @@ class AnalysisEngine:
                 (market.get("status", "finalized"), market["result"], json.dumps(market), iso_now(), ticker),
             )
             self.paper.settle(ticker, result, settled_at)
+            await asyncio.to_thread(
+                self.trade_reviews.finalize,
+                ticker,
+                result=result,
+                settled_at=settled_at,
+                settlement_value=as_float(market.get("settlement_value_dollars")),
+            )
             self._pending_settlements.discard(ticker)
             if inserted:
                 self._benchmark_calibration = self.models.benchmark_calibration()

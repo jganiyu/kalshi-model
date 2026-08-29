@@ -7,7 +7,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from fastapi import Body, FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
+from fastapi import Body, FastAPI, HTTPException, Query, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -25,6 +25,7 @@ from app.services.credentials import (
 from app.services.broker import KalshiBroker, normalize_mode
 from app.services.kalshi_trading import KalshiTradingError
 from app.services.training import report_rows
+from app.services.trade_review import review_metadata
 from app.mobile import create_mobile_app, mobile_status
 
 
@@ -141,6 +142,86 @@ async def reset_paper_round() -> dict[str, Any]:
 @app.get("/api/trading")
 async def trading() -> dict[str, Any]:
     return engine.trading.summary()
+
+
+def _disable_financial_caching(response: Response) -> None:
+    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["Expires"] = "0"
+
+
+@app.get("/api/trading/{mode}/reviews/{trade_ref}/availability")
+async def trade_review_availability(
+    mode: str, trade_ref: str, response: Response
+) -> dict[str, Any]:
+    _disable_financial_caching(response)
+    try:
+        normalized = normalize_mode(mode)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return review_metadata(db, normalized, trade_ref, "SETTLED")
+
+
+@app.get("/api/trading/{mode}/reviews/{trade_ref}")
+async def historical_trade_review(
+    mode: str, trade_ref: str, response: Response
+) -> dict[str, Any]:
+    _disable_financial_caching(response)
+    try:
+        normalized = normalize_mode(mode)
+        return engine.trade_reviews.review(normalized, trade_ref)
+    except ValueError as exc:
+        detail = str(exc)
+        status = 409 if "after market settlement" in detail else 404
+        raise HTTPException(status_code=status, detail=detail) from exc
+
+
+def _review_section(mode: str, trade_ref: str) -> dict[str, Any]:
+    try:
+        return engine.trade_reviews.review(normalize_mode(mode), trade_ref)
+    except ValueError as exc:
+        detail = str(exc)
+        status = 409 if "after market settlement" in detail else 404
+        raise HTTPException(status_code=status, detail=detail) from exc
+
+
+@app.get("/api/trading/{mode}/reviews/{trade_ref}/metadata")
+async def historical_trade_review_metadata(
+    mode: str, trade_ref: str, response: Response
+) -> dict[str, Any]:
+    _disable_financial_caching(response)
+    review = _review_section(mode, trade_ref)
+    return {
+        "environment": review["environment"], "trade_ref": review["trade_ref"],
+        "session": review["session"], "gaps": review["gaps"],
+    }
+
+
+@app.get("/api/trading/{mode}/reviews/{trade_ref}/points")
+async def historical_trade_review_points(
+    mode: str, trade_ref: str, response: Response
+) -> dict[str, Any]:
+    _disable_financial_caching(response)
+    review = _review_section(mode, trade_ref)
+    return {"trade_ref": review["trade_ref"], "points": review["points"]}
+
+
+@app.get("/api/trading/{mode}/reviews/{trade_ref}/events")
+async def historical_trade_review_events(
+    mode: str, trade_ref: str, response: Response
+) -> dict[str, Any]:
+    _disable_financial_caching(response)
+    review = _review_section(mode, trade_ref)
+    return {"trade_ref": review["trade_ref"], "events": review["events"]}
+
+
+@app.get("/api/trading/{mode}/reviews/{trade_ref}/trade")
+async def historical_trade_review_trade(
+    mode: str, trade_ref: str, response: Response
+) -> dict[str, Any]:
+    _disable_financial_caching(response)
+    review = _review_section(mode, trade_ref)
+    return {"trade_ref": review["trade_ref"], "trade": review["trade"]}
 
 
 @app.get("/api/trading/{mode}/audit")
@@ -683,6 +764,8 @@ async def database_info() -> dict[str, Any]:
         "broker_order_intents", "broker_orders", "broker_fills",
         "broker_positions", "broker_settlements", "broker_audit_events",
         "margin_volatility_observations",
+        "trade_review_sessions", "trade_review_points", "trade_review_events",
+        "trade_review_links",
     ):
         counts[table] = db.fetch_one(f"SELECT COUNT(*) AS count FROM {table}")["count"]
     return {
