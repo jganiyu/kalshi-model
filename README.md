@@ -1,13 +1,13 @@
 # Kalshi Model
 
-A local macOS research and trading app for Kalshi's 15-minute Bitcoin Up or Down markets. Paper is the default; Demo and Live are optional.
+A local macOS research and trading app for Kalshi's 15-minute Bitcoin Up or Down markets. Think of each market as a fast hand of intelligent poker: read the board, estimate the odds, make only the small bets the edge earns, and fold when the table turns. The model prices probability first, sizes risk conservatively, and uses a Threshold Breach Exit to fold and close positions when the BTC proxy crosses the threshold.
 
 > Research only, not financial advice. Live trading can lose real money.
 
 <table>
   <tr>
-    <td width="50%"><img src="docs/screenshots/dashboard-open-trades-light-20260830.jpg" alt="Kalshi Model dashboard with Open Trades, Standard Edge, and Up and Down order books in light mode"></td>
-    <td width="50%"><img src="docs/screenshots/dashboard-open-trades-dark-20260830.jpg" alt="Kalshi Model dashboard with Open Trades, Standard Edge, and Up and Down order books in dark mode"></td>
+    <td width="50%"><img src="docs/screenshots/dashboard-threshold-breach-light-20260830.png" alt="Current Kalshi Model dashboard in light mode"></td>
+    <td width="50%"><img src="docs/screenshots/dashboard-threshold-breach-dark-20260830.png" alt="Current Kalshi Model dashboard in dark mode"></td>
   </tr>
   <tr>
     <td align="center"><strong>Light</strong></td>
@@ -22,13 +22,12 @@ A local macOS research and trading app for Kalshi's 15-minute Bitcoin Up or Down
 - **Three modes:** Paper, isolated Kalshi Demo, and deliberately armed Kalshi Live.
 - **Mobile Monitor:** Read-only HUD, market metrics, and recent trades on iPhone through Tailscale.
 - **Strategies:** Standard Edge, Early Threshold, Late Conviction, and Swing.
+- **Protective exits:** Configurable profit take, stop-loss, and Threshold Breach Exit rules.
 - **Calibration:** Tune strategies and review probability, volatility, and volume evidence.
 - **Trade review:** Expand a settled trade to replay its BTC, probability, MVI, readiness, and execution history.
 - **Local data:** Settings, evidence, trades, review snapshots, reports, and backups stay in SQLite on your Mac.
 
 ## Outcome forecast
-
-![Outcome forecast panel](docs/screenshots/outcome-forecast.jpg)
 
 - **Likely Up:** Up probability is 60% or higher.
 - **Uncertain:** Up probability is above 40% and below 60%.
@@ -37,7 +36,16 @@ A local macOS research and trading app for Kalshi's 15-minute Bitcoin Up or Down
 
 ## Standard Edge HUD
 
-![Standard Edge entry-readiness HUD](docs/screenshots/standard-edge-mvi-light-20260829.jpg)
+<table>
+  <tr>
+    <td width="50%"><img src="docs/screenshots/standard-edge-threshold-breach-light-20260830.png" alt="Open Trades and Standard Edge readiness in light mode"></td>
+    <td width="50%"><img src="docs/screenshots/standard-edge-threshold-breach-dark-20260830.png" alt="Open Trades and Standard Edge readiness in dark mode"></td>
+  </tr>
+  <tr>
+    <td align="center"><strong>Light</strong></td>
+    <td align="center"><strong>Dark</strong></td>
+  </tr>
+</table>
 
 - Win chance and net EV fill toward their configured targets; confirmation starts only after every entry requirement passes.
 - Spread, liquidity, data, quality, threshold, volatility, and risk show what is blocking an automatic entry.
@@ -46,7 +54,7 @@ A local macOS research and trading app for Kalshi's 15-minute Bitcoin Up or Down
 
 ## Calibration
 
-![Calibration page](docs/screenshots/calibration-mvi-20260829.jpg)
+![Calibration controls for Threshold Breach Exit](docs/screenshots/calibration-threshold-breach-dark-20260830.png)
 
 - Apply saves one auditable configuration snapshot; Discard and Restore are reversible.
 - Results show settled samples, Brier score, and calibration in 10-point probability ranges.
@@ -54,8 +62,6 @@ A local macOS research and trading app for Kalshi's 15-minute Bitcoin Up or Down
 - Automatic entries still require a valid price, positive Buy EV, confirmation, liquidity, and risk approval.
 
 ## Kalshi credentials
-
-![Kalshi credentials setup](docs/screenshots/credentials-setup.jpg)
 
 - Public REST works without credentials; a read key enables faster market-data streaming.
 - Demo and Live trading use separate write-enabled keys and separate account histories.
@@ -82,62 +88,48 @@ KALSHI_LIVE_PRIVATE_KEY_PATH=/absolute/path/to/live-key.pem
 
 ## How the model works
 
-The app answers two separate questions: **What is likely to happen?** and **Is the contract worth its price?**
+The model has one simple loop: estimate the odds, compare them with the price, then protect the hand.
 
-### Outcome forecast
+| Step | What it does |
+| --- | --- |
+| **1. Read the market** | Builds a clean BTC proxy from Coinbase, Kraken, and Bitstamp; then measures its distance from To Beat, time left, volatility, and data reliability. |
+| **2. Price the outcome** | Turns that context and settled-market history into an Up/Down probability. A forecast is a probability estimate—not a trade instruction. |
+| **3. Test the bet** | Compares probability with the executable contract price after fees and slippage. A likely outcome can still be a bad price. |
+| **4. Manage the hand** | Requires confirmation and gates before entry, limits size, and manages exits once a position exists. |
 
-It combines live Bitcoin prices, threshold distance, time, volatility, momentum, and settlement history to estimate the chance of Up.
+### What can open a trade
 
-- **Likely Up:** 60% or higher.
-- **Uncertain:** Between 40% and 60%.
-- **Likely Down:** 40% or lower.
+Standard Edge looks for a sustained pricing advantage. Early Threshold uses a threshold available before the market opens, Late Conviction looks near settlement, and Swing buys a deeply discounted early contract for a defined target exit. Only one automatic strategy can enter a market.
 
-### Volume signals — shadow phase
+Every entry must clear probability, EV, spread, liquidity, data, confidence, threshold distance, volatility, confirmation, allocation, and risk checks. The HUD shows these checks live so it is clear what the model is waiting on.
 
-Volume does not add a fixed probability bonus. The model learns whether each input improves settled-contract forecasts:
+### How it protects a trade
 
-- **Relative volume:** Compares one- and five-minute activity with normal activity; it measures conviction, not direction by itself.
-- **Signed BTC flow and CVD:** Tracks buyer- versus seller-initiated Coinbase and Kraken volume; buying pressure can support Up and selling pressure can support Down.
-- **Volume-confirmed momentum:** Gives more weight to directional price moves backed by participation and less to quiet moves.
-- **VWAP position:** Measures whether the BTC proxy is above or below its recent volume-weighted average, supporting Up or Down accordingly.
-- **Kalshi flow and turnover:** Tracks aggressive Up/Down trades and activity relative to open interest; agreement with BTC flow can reinforce a forecast, while disagreement can weaken it.
-- **Context and data quality:** Interprets volume alongside time remaining, threshold distance, volatility, and settlement progress; missing or conflicting feeds remain unavailable instead of becoming false evidence.
+Margin Volatility measures how choppily BTC is moving around To Beat. It can block automatic entries when the configured maximum is exceeded; its cushion is recorded for review, not used as an entry gate.
 
-These inputs are **shadow-only for now**. They are recorded and tested without changing the live probability until enough settled data shows better out-of-sample Brier score and calibration.
+Profit take exits at a configured executable bid—99¢ by default—and stop-losses remain optional. Threshold Breach Exit is the model's fold: for an Up position it exits when the BTC proxy moves to or below To Beat (plus any configured buffer); for Down, it does the inverse. These are safeguards, not guarantees of an exit price or fill.
 
-### Trade assessment
+### How it improves
 
-It then compares that probability with the selected Buy or Sell price after fees and slippage; a likely outcome can still be overpriced.
+Calibration compares forecasts with settled outcomes by strategy and mode. Judge it over many markets, not a short streak.
 
-### Trading strategies
+<details>
+<summary><strong>Volume signals — currently shadow-only</strong></summary>
 
-- **Standard edge:** Waits for a strong, sustained pricing advantage.
-- **Early threshold:** Uses a threshold seen before opening, but enters only if the opening ask still offers positive EV.
-- **Late conviction:** Buys a highly likely outcome near settlement only when Buy EV remains positive.
-- **Swing trade:** Buys a model-supported side at a low early ask, then sells when its executable bid reaches the configured target.
+The app records relative volume, signed BTC flow/CVD, volume-confirmed momentum, VWAP position, Kalshi flow/turnover, and cross-venue agreement. They are evaluated alongside time remaining, threshold distance, volatility, and data quality, but do not change live probability yet. They must first demonstrate better out-of-sample Brier score and calibration on enough settled markets.
 
-Only one automatic strategy may enter each market. Swing runs last so it cannot displace the existing strategies.
-
-### Risk and learning
-
-Every entry must pass price, liquidity, data, threshold, volatility, confirmation, allocation, and risk checks.
-
-Margin Volatility measures how choppily the BTC proxy is moving around the threshold. Low readings never block; a reading above the configured maximum blocks automatic confirmation in every mode. Cushion is recorded for analysis but is not an entry gate.
-
-A global profit take exits at a configured executable bid—99¢ by default. Stop-losses are optional and off by default.
-
-Calibration compares predicted probabilities with settled outcomes and reports each mode and strategy separately; judge results across many markets, not a short streak.
+</details>
 
 ## Paper, Demo, and Live
 
 <table>
   <tr>
-    <td width="50%"><img src="docs/screenshots/trading-demo-light-20260827.png" alt="Kalshi Demo account in light mode"></td>
-    <td width="50%"><img src="docs/screenshots/trading-demo-dark-20260827.png" alt="Kalshi Demo account in dark mode"></td>
+    <td width="50%"><img src="docs/screenshots/trading-account-light-20260830.png" alt="Current Kalshi Model trading ledger in light mode"></td>
+    <td width="50%"><img src="docs/screenshots/trading-account-dark-20260830.png" alt="Current Kalshi Model trading ledger in dark mode"></td>
   </tr>
   <tr>
-    <td align="center"><strong>Demo · Light</strong></td>
-    <td align="center"><strong>Demo · Dark</strong></td>
+    <td align="center"><strong>Trading · Light</strong></td>
+    <td align="center"><strong>Trading · Dark</strong></td>
   </tr>
 </table>
 
