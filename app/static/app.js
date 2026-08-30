@@ -30,7 +30,10 @@ const state = {
     tradeRef: null, mode: null, data: null, chartMode: "btc",
     selectedIndex: null, requestToken: 0,
   },
-  calibration: { saved: null, defaults: null, dirty: false },
+  calibration: {
+    saved: null, defaults: null, dirty: false, controlsRendered: false,
+    summary: null, evidence: null, evidenceUpdatedAt: 0, evidenceRequest: null,
+  },
 };
 
 const $ = (selector) => document.querySelector(selector);
@@ -1626,15 +1629,65 @@ function renderCalibrationResults(data) {
   }).join("") : '<p class="empty-state">No calibration reports yet.</p>';
 }
 
-async function loadCalibration() {
-  const [data, settings, defaults] = await Promise.all([
-    api("/api/calibration"), api("/api/settings"), api("/api/settings/defaults"),
-  ]);
+function renderCalibrationControlsOnce() {
+  if (state.calibration.controlsRendered) return;
   renderCalibrationControls();
-  state.calibration.saved = settings;
-  state.calibration.defaults = defaults;
-  setCalibrationValues(settings);
-  renderCalibrationResults(data);
+  state.calibration.controlsRendered = true;
+}
+
+function setCalibrationEvidenceLoading() {
+  if (state.calibration.evidence) return;
+  $("#mvi-evidence-subtitle").textContent = "Loading evidence in background";
+  $("#volume-signals-subtitle").textContent = "Loading evidence in background";
+}
+
+async function loadCalibrationEvidence({ force = false } = {}) {
+  const freshForMs = 30_000;
+  const fresh = state.calibration.evidence
+    && Date.now() - state.calibration.evidenceUpdatedAt < freshForMs;
+  if (!force && fresh) return state.calibration.evidence;
+  if (state.calibration.evidenceRequest) return state.calibration.evidenceRequest;
+  setCalibrationEvidenceLoading();
+  state.calibration.evidenceRequest = api("/api/calibration/evidence")
+    .then((evidence) => {
+      state.calibration.evidence = evidence;
+      state.calibration.evidenceUpdatedAt = Date.now();
+      if (state.activePage === "calibration") {
+        renderCalibrationResults({ ...state.calibration.summary, ...evidence });
+      }
+      return evidence;
+    })
+    .catch(() => {
+      if (!state.calibration.evidence && state.activePage === "calibration") {
+        $("#mvi-evidence-subtitle").textContent = "Evidence unavailable";
+        $("#volume-signals-subtitle").textContent = "Evidence unavailable";
+      }
+      return null;
+    })
+    .finally(() => { state.calibration.evidenceRequest = null; });
+  return state.calibration.evidenceRequest;
+}
+
+async function loadCalibration() {
+  renderCalibrationControlsOnce();
+  if (state.calibration.summary) {
+    renderCalibrationResults({ ...state.calibration.summary, ...state.calibration.evidence });
+  } else {
+    setCalibrationEvidenceLoading();
+  }
+  const [data, settings, defaults] = await Promise.all([
+    api("/api/calibration/summary"), api("/api/settings"), api("/api/settings/defaults"),
+  ]);
+  if (!state.calibration.dirty) {
+    state.calibration.saved = settings;
+    state.calibration.defaults = defaults;
+    setCalibrationValues(settings);
+  }
+  state.calibration.summary = data;
+  if (state.activePage === "calibration") {
+    renderCalibrationResults({ ...data, ...state.calibration.evidence });
+  }
+  void loadCalibrationEvidence();
 }
 
 async function applyCalibration() {
@@ -1646,7 +1699,9 @@ async function applyCalibration() {
     const settings = await api("/api/settings", { method: "PUT", body: JSON.stringify(values) });
     state.calibration.saved = settings;
     setCalibrationValues(settings);
-    renderCalibrationResults(await api("/api/calibration"));
+    state.calibration.summary = await api("/api/calibration/summary");
+    renderCalibrationResults({ ...state.calibration.summary, ...state.calibration.evidence });
+    void loadCalibrationEvidence({ force: true });
     await refreshDashboard();
     showToast("Calibration saved", "New decisions now use the applied configuration.");
   } catch (errorValue) { showToast("Calibration not saved", errorValue.message); markCalibrationDirty(); }
@@ -1968,11 +2023,13 @@ async function toggleHistoricalTradeReview(row) {
 }
 
 async function loadPaper() {
-  const trading = await api("/api/trading");
+  const trading = await api("/api/trading/selected");
   const mode = trading.selected_mode || "PAPER";
   const data = trading.selected || {};
   state.trading.mode = mode;
-  if (state.dashboard) state.dashboard.trading = trading;
+  if (state.dashboard) {
+    state.dashboard.trading = { ...state.dashboard.trading, ...trading };
+  }
   const readiness = data.readiness || {};
   $("#trading-page-title").textContent = modeLabel(mode);
   $("#trading-page-kicker").textContent = mode === "PAPER" ? "FORWARD TEST" : "KALSHI ACCOUNT";

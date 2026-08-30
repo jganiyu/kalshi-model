@@ -144,6 +144,12 @@ async def trading() -> dict[str, Any]:
     return engine.trading.summary()
 
 
+@app.get("/api/trading/selected")
+async def selected_trading() -> dict[str, Any]:
+    """Read the selected account for the Trading page without other modes."""
+    return engine.trading.selected_summary()
+
+
 def _disable_financial_caching(response: Response) -> None:
     response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
     response.headers["Pragma"] = "no-cache"
@@ -450,8 +456,7 @@ async def signal(signal_id: int) -> dict[str, Any]:
     return row
 
 
-@app.get("/api/calibration")
-async def calibration() -> dict[str, Any]:
+def calibration_summary_payload() -> dict[str, Any]:
     mode = engine.trading.selected_mode
     return {
         "mode": mode,
@@ -459,11 +464,34 @@ async def calibration() -> dict[str, Any]:
         "strategy_results": engine.trading.broker(mode).portfolio().get(
             "strategy_results", {}
         ),
-        "margin_volatility_report": engine.margin_volatility.report(mode),
-        "volume_signal_report": engine.volume_signals.report(engine.models.active()),
         "reports": report_rows(db),
         "configuration_snapshots": db.configuration_snapshots(),
     }
+
+
+def calibration_evidence_payload() -> dict[str, Any]:
+    mode = engine.trading.selected_mode
+    return {
+        "mode": mode,
+        "margin_volatility_report": engine.margin_volatility.report(mode),
+        "volume_signal_report": engine.volume_signals.report(engine.models.active()),
+    }
+
+
+@app.get("/api/calibration")
+async def calibration() -> dict[str, Any]:
+    """Legacy combined calibration response kept for API compatibility."""
+    return {**calibration_summary_payload(), **calibration_evidence_payload()}
+
+
+@app.get("/api/calibration/summary")
+async def calibration_summary() -> dict[str, Any]:
+    return calibration_summary_payload()
+
+
+@app.get("/api/calibration/evidence")
+async def calibration_evidence() -> dict[str, Any]:
+    return calibration_evidence_payload()
 
 
 @app.get("/api/models")

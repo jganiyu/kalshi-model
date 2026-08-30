@@ -262,3 +262,9 @@ def test_calibration_api_exposes_structured_volume_diagnostics(
     assert "current" in report
     assert "audit" in report
     assert "actual_trade_sources" in report["audit"]
+    summary = asyncio.run(main.calibration_summary())
+    evidence = asyncio.run(main.calibration_evidence())
+    assert "volume_signal_report" not in summary
+    assert "margin_volatility_report" not in summary
+    assert "volume_signal_report" in evidence
+    assert "margin_volatility_report" in evidence

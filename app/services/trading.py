@@ -280,6 +280,23 @@ class TradingCoordinator:
             "modes": modes,
         }
 
+    def selected_summary(self) -> dict[str, Any]:
+        """Return only the account currently shown on the Trading page.
+
+        The dashboard still needs all three mode summaries for its environment
+        switcher. The dedicated Trading page does not, so avoiding those two
+        extra portfolio builds keeps page navigation responsive without
+        changing account, risk, or reconciliation data.
+        """
+        mode = self.selected_mode
+        portfolio = self.brokers[mode].portfolio()
+        # These raw activity streams are used internally to build the ledger,
+        # but the Trading page renders the already-aggregated ledger instead.
+        # Omitting them materially reduces the local response size.
+        for key in ("fills", "intents", "settlements"):
+            portfolio.pop(key, None)
+        return {"selected_mode": mode, "selected": portfolio}
+
     async def reconcile(self, mode: str) -> dict[str, Any]:
         broker = self.broker(mode)
         return await broker.reconcile()

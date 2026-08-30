@@ -27,6 +27,12 @@ class ApiTrading:
             "modes": {"PAPER": {"mode": "PAPER"}, "DEMO": portfolio, "LIVE": {"mode": "LIVE"}},
         }
 
+    def selected_summary(self):
+        portfolio = self._broker.portfolio()
+        for key in ("fills", "intents", "settlements"):
+            portfolio.pop(key, None)
+        return {"selected_mode": "DEMO", "selected": portfolio}
+
 
 def test_trading_api_exposes_isolated_structured_account_state(
     tmp_path: Path, monkeypatch,
@@ -46,10 +52,11 @@ def test_trading_api_exposes_isolated_structured_account_state(
             transport=transport, base_url="http://test"
         ) as client:
             response = await client.get("/api/trading")
+            selected_response = await client.get("/api/trading/selected")
             audit = await client.get("/api/trading/DEMO/audit")
-        return response, audit
+        return response, selected_response, audit
 
-    response, audit = asyncio.run(request())
+    response, selected_response, audit = asyncio.run(request())
     assert response.status_code == 200
     payload = response.json()
     assert payload["selected_mode"] == "DEMO"
@@ -63,6 +70,11 @@ def test_trading_api_exposes_isolated_structured_account_state(
         assert field in selected
     assert payload["modes"]["PAPER"]["mode"] == "PAPER"
     assert payload["modes"]["LIVE"]["mode"] == "LIVE"
+    assert selected_response.status_code == 200
+    assert selected_response.json()["selected_mode"] == "DEMO"
+    assert "modes" not in selected_response.json()
+    for field in ("fills", "intents", "settlements"):
+        assert field not in selected_response.json()["selected"]
     assert audit.status_code == 200
     assert audit.json() == {"mode": "DEMO", "events": []}
 
@@ -103,6 +115,10 @@ def test_trading_ui_contains_mode_safety_and_confirmation_controls() -> None:
     assert 'id="volume-signals-evidence"' in template
     assert "volume_signal_report" in script
     assert "RVOL 1m / 5m" in script
+    assert 'api("/api/trading/selected")' in script
+    assert 'api("/api/calibration/summary")' in script
+    assert 'api("/api/calibration/evidence")' in script
+    assert "Loading evidence in background" in script
 
 
 def test_private_stream_accepts_current_singular_event_types() -> None:
