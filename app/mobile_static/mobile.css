@@ -77,6 +77,8 @@ h2 { font-size: 22px; letter-spacing: -.03em; }
 .section-heading { padding-bottom: 13px; }
 .section-heading > span { color: var(--muted); font-size: 9px; text-transform: uppercase; }
 .section-heading h2 { font-size: 17px; }
+.open-trades #open-trades-label { margin-bottom: 5px; font-size: 10px; font-weight: 720; letter-spacing: .08em; text-transform: uppercase; }
+.open-trades #open-trades-label[data-mode="LIVE"] { color: var(--red); }
 .available-reading { display: flex; align-items: flex-end; flex-direction: column; gap: 2px; color: var(--muted); font-size: 8px; text-transform: uppercase; }
 .available-reading strong { color: var(--ink); font-size: 11px; font-variant-numeric: tabular-nums; }
 .open-trade-list { display: grid; gap: 7px; }

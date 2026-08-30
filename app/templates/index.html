@@ -39,7 +39,14 @@
     <main class="main-content">
       <section class="page active" id="page-dashboard">
         <header class="page-header">
-          <div><p class="eyebrow">LIVE MARKET</p><h1>BTC 15 minute</h1></div>
+          <div class="dashboard-market-heading">
+            <div><p class="eyebrow">LIVE MARKET</p><h1>BTC 15 minute</h1></div>
+            <div class="trading-mode-selector dashboard-mode-selector segmented" aria-label="Trading environment">
+              <button type="button" data-trading-mode="PAPER" aria-pressed="false">Paper</button>
+              <button type="button" data-trading-mode="DEMO" aria-pressed="false">Demo</button>
+              <button type="button" data-trading-mode="LIVE" aria-pressed="false">Live</button>
+            </div>
+          </div>
           <div class="header-meta">
             <div class="header-status"><span class="live-dot"></span><span id="last-update">Connecting</span></div>
             <strong id="header-model-version">baseline-1.0</strong>
@@ -115,41 +122,24 @@
 
         <div class="dashboard-lower-stage">
           <div class="lower-grid">
-          <section class="contract-panel">
-            <div class="section-heading"><div><h3>Current contract</h3><p id="contract-ticker">--</p></div><strong class="countdown" id="countdown">--:--</strong></div>
-            <div class="threshold-block"><span>Threshold</span><strong id="threshold">--</strong><small id="distance-to-strike">--</small></div>
-            <dl class="metric-list">
-              <div><dt>UP bid / ask</dt><dd id="yes-market">--</dd></div>
-              <div><dt>DOWN bid / ask</dt><dd id="no-market">--</dd></div>
-              <div><dt>Spread</dt><dd id="spread">--</dd></div>
-              <div><dt>Open interest</dt><dd id="open-interest">--</dd></div>
-              <div><dt>Volume</dt><dd id="volume">--</dd></div>
-              <div><dt>Position</dt><dd id="position-size">--</dd></div>
-            </dl>
-            <div class="quality-row"><span id="quality-dot" class="quality-dot"></span><span id="quality-text">Checking feeds</span></div>
-          </section>
           <section class="paper-controller" aria-labelledby="paper-controller-title">
             <div class="section-heading paper-controller-heading">
-              <div><p class="eyebrow" id="dashboard-trading-label">PAPER TRADING</p><h3 id="paper-controller-title">Manual order</h3></div>
-              <span class="simulated-label" id="dashboard-environment-badge">SIMULATED</span>
+              <div><p class="eyebrow" id="dashboard-trading-label">PAPER TRADING</p><h3 id="paper-controller-title">Open Trades</h3></div>
+              <div class="open-trades-balances" aria-label="Selected account balances">
+                <span><small>Available</small><strong id="dashboard-available-balance">--</strong></span>
+                <span><small>Allocated</small><strong id="dashboard-allocated-balance">--</strong></span>
+              </div>
             </div>
-            <div class="trading-mode-selector segmented" aria-label="Trading environment">
-              <button type="button" data-trading-mode="PAPER">Paper</button>
-              <button type="button" data-trading-mode="DEMO">Demo</button>
-              <button type="button" data-trading-mode="LIVE">Live</button>
+            <div class="dashboard-open-trades" id="dashboard-open-trades" aria-live="polite">
+              <p class="dashboard-open-trades-empty">No open trades.</p>
             </div>
-            <div class="trading-account-strip" id="dashboard-account-strip">
-              <span><i></i><b id="dashboard-account-state">Paper account</b></span>
-              <span id="dashboard-allocation-state">-- available</span>
-            </div>
-            <span class="paper-permission" id="paper-permission" hidden></span>
             <section class="trade-assessment" aria-labelledby="trade-assessment-title">
               <div class="trade-assessment-heading"><strong id="trade-assessment-title">Trade assessment</strong><span id="trade-assessment-side">Selected: Up</span></div>
               <div class="trade-assessment-grid">
                 <div><span>Recommendation</span><strong id="trade-action">--</strong></div>
-                <div><span>Executable</span><strong id="trade-price">--</strong></div>
-                <div><span>Model chance</span><strong id="trade-model-probability">--</strong></div>
-                <div><span>Market chance</span><strong id="trade-market-probability">--</strong></div>
+                <div><span>Confidence</span><strong id="trade-confidence" title="Composite trade-confidence tier, not forecast probability">--</strong></div>
+                <div><span>Open interest</span><strong id="trade-open-interest">--</strong></div>
+                <div><span>Volume</span><strong id="trade-volume">--</strong></div>
                 <div><span>Fee</span><strong id="trade-fee">--</strong></div>
                 <div><span>Slippage</span><strong id="trade-slippage">--</strong></div>
                 <div><span>Edge</span><strong id="trade-edge">--</strong></div>
@@ -157,48 +147,49 @@
               </div>
               <p id="trade-explanation">Waiting for an executable quote.</p>
             </section>
-            <div class="paper-order-toolbar">
-              <div class="segmented order-action-picker" role="group" aria-label="Order action">
-                <button type="button" class="active" data-paper-action="BUY">Buy</button>
-                <button type="button" data-paper-action="SELL">Sell</button>
-              </div>
-              <label class="compact-toggle"><span>Limit order</span><input id="paper-limit-toggle" type="checkbox"><i></i></label>
-            </div>
             <div class="paper-side-picker" role="group" aria-label="Contract side">
-              <button type="button" class="active" data-paper-side="YES"><span>UP</span><strong id="paper-up-price">--</strong></button>
-              <button type="button" data-paper-side="NO"><span>DOWN</span><strong id="paper-down-price">--</strong></button>
+              <button type="button" class="active" data-paper-side="YES" aria-pressed="true"><span>UP</span><strong id="paper-up-price">--</strong></button>
+              <button type="button" data-paper-side="NO" aria-pressed="false"><span>DOWN</span><strong id="paper-down-price">--</strong></button>
             </div>
-            <div class="paper-market-fields" id="paper-market-fields">
-              <label for="paper-dollars">Amount</label>
-              <div class="paper-amount-input"><span>$</span><input id="paper-dollars" type="number" min="0" step="1" inputmode="decimal" placeholder="0"></div>
+            <div class="manual-order-ticket" id="manual-order-ticket" hidden>
+              <div class="paper-order-toolbar">
+                <div class="segmented order-action-picker" role="group" aria-label="Order action">
+                  <button type="button" class="active" data-paper-action="BUY">Buy</button>
+                  <button type="button" data-paper-action="SELL">Sell</button>
+                </div>
+                <label class="compact-toggle"><span>Limit order</span><input id="paper-limit-toggle" type="checkbox"><i></i></label>
+              </div>
+              <div class="paper-market-fields" id="paper-market-fields">
+                <label for="paper-dollars">Amount</label>
+                <div class="paper-amount-input"><span>$</span><input id="paper-dollars" type="number" min="0" step="1" inputmode="decimal" placeholder="0"></div>
+              </div>
+              <div class="paper-limit-fields" id="paper-limit-fields" hidden>
+                <label><span>Contracts</span><input id="paper-contracts" type="number" min="1" step="1" inputmode="numeric" placeholder="0"></label>
+                <label><span>Limit price</span><div><input id="paper-limit-price" type="number" min="1" max="99" step="1" inputmode="decimal" placeholder="0"><b>&cent;</b></div></label>
+              </div>
+              <label class="paper-stop-field" id="paper-stop-field" for="paper-stop-loss">
+                <span>Stop-loss <small>optional</small></span>
+                <div><input id="paper-stop-loss" type="number" min="0" max="99" step="1" inputmode="decimal" placeholder="0 = off"><b>&cent;</b></div>
+              </label>
+              <div class="paper-order-summary">
+                <span id="paper-best-price">Best ask --</span>
+                <strong id="paper-estimate">Enter an amount</strong>
+              </div>
+              <div class="paper-bankroll-row">
+                <span><small>Available</small><strong id="paper-bankroll">--</strong></span>
+                <span><small>Order value</small><strong id="paper-order-value">--</strong></span>
+                <span><small>Of bankroll</small><strong id="paper-bankroll-pct">--</strong></span>
+              </div>
+              <div class="open-paper-orders" id="open-paper-orders" hidden>
+                <div class="open-orders-label"><span>Open limit orders</span><small id="open-order-count">0</small></div>
+                <div id="open-order-list"></div>
+              </div>
+              <p class="paper-order-message" id="paper-order-message" role="alert"></p>
+              <button class="paper-submit" id="paper-submit" type="button" disabled>Buy Up</button>
             </div>
-            <div class="paper-limit-fields" id="paper-limit-fields" hidden>
-              <label><span>Contracts</span><input id="paper-contracts" type="number" min="1" step="1" inputmode="numeric" placeholder="0"></label>
-              <label><span>Limit price</span><div><input id="paper-limit-price" type="number" min="1" max="99" step="1" inputmode="decimal" placeholder="0"><b>&cent;</b></div></label>
-            </div>
-            <label class="paper-stop-field" id="paper-stop-field" for="paper-stop-loss">
-              <span>Stop-loss <small>optional</small></span>
-              <div><input id="paper-stop-loss" type="number" min="0" max="99" step="1" inputmode="decimal" placeholder="0 = off"><b>&cent;</b></div>
-            </label>
-            <div class="paper-order-summary">
-              <span id="paper-best-price">Best ask --</span>
-              <strong id="paper-estimate">Enter an amount</strong>
-            </div>
-            <div class="paper-bankroll-row">
-              <span><small>Available</small><strong id="paper-bankroll">--</strong></span>
-              <span><small>Order value</small><strong id="paper-order-value">--</strong></span>
-              <span><small>Of bankroll</small><strong id="paper-bankroll-pct">--</strong></span>
-            </div>
-            <p class="paper-order-message" id="paper-order-message" role="alert"></p>
-            <button class="paper-submit" id="paper-submit" type="button" disabled>Buy Up</button>
-            <div class="open-paper-orders" id="open-paper-orders" hidden>
-              <div class="open-orders-label"><span>Open limit orders</span><small id="open-order-count">0</small></div>
-              <div id="open-order-list"></div>
-            </div>
+            <button class="manual-order-toggle" id="manual-order-toggle" type="button" aria-expanded="false" aria-controls="manual-order-ticket">Manual order</button>
           </section>
-          </div>
-
-          <aside class="standard-edge-hud" id="standard-edge-hud" aria-label="Standard Edge entry readiness">
+          <section class="standard-edge-hud" id="standard-edge-hud" aria-label="Standard Edge entry readiness">
             <div class="standard-edge-hud-inner">
               <div class="standard-edge-hud-kicker">
                 <span>Standard Edge</span>
@@ -229,7 +220,7 @@
                 <span id="standard-edge-spread-gate"><i></i><b>Spread <button class="hud-help" type="button" aria-label="About spread" data-tooltip="Current bid-ask spread versus the maximum allowed for the required entry quality.">i</button></b><small>--</small></span>
                 <span id="standard-edge-liquidity-gate"><i></i><b>Liquidity <button class="hud-help" type="button" aria-label="About liquidity" data-tooltip="Contracts available at the executable ask versus the configured minimum.">i</button></b><small>--</small></span>
                 <span id="standard-edge-data-gate"><i></i><b>Data <button class="hud-help" type="button" aria-label="About data quality" data-tooltip="Whether critical feeds are current, reliable, mutually consistent, and the market is active.">i</button></b><small>--</small></span>
-                <span id="standard-edge-quality-gate"><i></i><b>Quality <button class="hud-help" type="button" aria-label="About entry quality" data-tooltip="Current decision strength versus the minimum confidence required for automatic Standard Edge entries.">i</button></b><small>--</small></span>
+                <span id="standard-edge-quality-gate"><i></i><b>Confidence <button class="hud-help" type="button" aria-label="About trade confidence" data-tooltip="Composite trade-confidence tier based on edge, spread, model agreement, and calibration evidence. It is separate from forecast probability.">i</button></b><small>--</small></span>
                 <span id="standard-edge-threshold-gate"><i></i><b>Threshold <button class="hud-help" type="button" aria-label="About threshold margin" data-tooltip="Up entries require the BTC proxy above the configured threshold band; Down entries require it below the band.">i</button></b><small>--</small></span>
                 <span id="standard-edge-volatility-gate"><i></i><b>Volatility <button class="hud-help" type="button" aria-label="About margin volatility" data-tooltip="Current Margin Volatility Index versus your configured maximum. Zero turns this gate off; low volatility never blocks.">i</button></b><small>Off</small></span>
                 <span id="standard-edge-risk-gate"><i></i><b>Risk <button class="hud-help" type="button" aria-label="About risk controls" data-tooltip="Whether bankroll, drawdown, position, duplicate-entry, and sizing controls permit an automatic entry.">i</button></b><small>--</small></span>
@@ -238,29 +229,46 @@
               <p class="standard-edge-hud-blocker"><button class="hud-help" type="button" aria-label="About the primary blocker" data-tooltip="The first requirement currently preventing Standard Edge confirmation or entry.">i</button><span id="standard-edge-hud-blocker">Waiting for live trade data.</span></p>
               <button class="standard-edge-hud-arm" id="hud-arm-trading" data-arm-session type="button" hidden>Arm session</button>
             </div>
-          </aside>
+          </section>
+          </div>
         </div>
 
         <div class="orderbook-grid">
           <section class="orderbook-panel">
             <div class="section-heading orderbook-heading">
-              <div><p class="eyebrow">KALSHI DEPTH</p><h3 id="orderbook-title">Up order book</h3></div>
-              <span class="book-live"><i></i><span id="orderbook-environment-label">Live</span></span>
+              <div><p class="eyebrow">KALSHI DEPTH</p><h3>Up order book</h3></div>
+              <span class="book-live"><i></i><span id="up-orderbook-environment-label">Live</span></span>
             </div>
             <div class="orderbook-table-wrap">
               <table class="orderbook-table">
                 <thead><tr><th>Price</th><th>Contracts</th><th>Total</th></tr></thead>
-                <tbody id="orderbook-rows"><tr><td class="book-empty" colspan="3">Waiting for live depth</td></tr></tbody>
+                <tbody id="up-orderbook-rows"><tr><td class="book-empty" colspan="3">Waiting for live depth</td></tr></tbody>
               </table>
             </div>
           </section>
           <section class="orderbook-panel">
+            <div class="section-heading orderbook-heading">
+              <div><p class="eyebrow">KALSHI DEPTH</p><h3>Down order book</h3></div>
+              <span class="book-live"><i></i><span id="down-orderbook-environment-label">Live</span></span>
+            </div>
+            <div class="orderbook-table-wrap">
+              <table class="orderbook-table">
+                <thead><tr><th>Price</th><th>Contracts</th><th>Total</th></tr></thead>
+                <tbody id="down-orderbook-rows"><tr><td class="book-empty" colspan="3">Waiting for live depth</td></tr></tbody>
+              </table>
+            </div>
+          </section>
+          <section class="orderbook-panel recent-trades-panel">
             <div class="section-heading orderbook-heading">
               <div><p class="eyebrow" id="recent-trades-label">PAPER TRADING</p><h3>Recent trades</h3></div>
               <span class="simulated-label" id="recent-trades-badge">SIMULATED</span>
             </div>
             <div class="orderbook-table-wrap">
               <table class="orderbook-table recent-trades-table">
+                <colgroup>
+                  <col class="recent-col-opened"><col class="recent-col-side"><col class="recent-col-price"><col class="recent-col-qty">
+                  <col class="recent-col-margin"><col class="recent-col-strategy"><col class="recent-col-result"><col class="recent-col-available">
+                </colgroup>
                 <thead><tr><th>Opened</th><th>Side</th><th>Price</th><th>Qty</th><th title="Settlement price minus threshold">Settle margin</th><th>Strategy</th><th>Result</th><th>Available after</th></tr></thead>
                 <tbody id="recent-paper-trades"><tr><td class="book-empty" colspan="8">No paper trades yet</td></tr></tbody>
               </table>

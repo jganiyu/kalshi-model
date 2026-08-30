@@ -75,6 +75,13 @@ function sideLabel(side) {
   return String(side || "").toUpperCase() === "YES" ? "Up" : String(side || "").toUpperCase() === "NO" ? "Down" : "--";
 }
 
+function modeLabel(mode) {
+  const normalized = String(mode || "PAPER").toUpperCase();
+  if (normalized === "LIVE") return "KALSHI LIVE";
+  if (normalized === "DEMO") return "KALSHI DEMO";
+  return "PAPER TRADING";
+}
+
 function escapeHtml(value) {
   return String(value ?? "").replace(/[&<>'"]/g, (character) => ({
     "&": "&amp;", "<": "&lt;", ">": "&gt;", "'": "&#39;", '"': "&quot;",
@@ -188,7 +195,9 @@ function renderTrades(trades, mode) {
 }
 
 function renderOpenTrades(trades, mode, availableCash, market) {
-  $("#open-trades-label").textContent = mode;
+  const accountLabel = $("#open-trades-label");
+  accountLabel.textContent = modeLabel(mode);
+  accountLabel.dataset.mode = String(mode || "PAPER").toUpperCase();
   $("#available-funds").textContent = money(availableCash);
   $("#current-up-price").textContent = cents(market?.up_price);
   $("#current-down-price").textContent = cents(market?.down_price);

@@ -435,4 +435,3 @@ def test_swing_controls_and_results_are_rendered() -> None:
     assert 'id: "swing_max_entry_price"' in script
     assert 'id: "swing_target_exit_price"' in script
     assert 'SWING: "Swing trade"' in script
-    assert "swing_readiness" in script

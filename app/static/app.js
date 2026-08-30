@@ -19,7 +19,7 @@ const state = {
   paperOrder: {
     side: localStorage.getItem("kalshi-display-side-v1") === "NO" ? "NO" : "YES",
     action: "BUY", limit: false, submitting: false,
-    stopInitialized: false, sideUpdating: false,
+    stopInitialized: false, sideUpdating: false, expanded: false,
   },
   paperReset: { confirming: false, resetting: false, timer: null },
   trading: {
@@ -200,15 +200,15 @@ function orderBookRows(levels, type, maxQuantity, reverse = false) {
 }
 
 function renderOrderBook(outcome, orderbook, environment = "LIVE") {
-  const prefix = outcome === "YES" ? "yes" : "no";
-  const target = $("#orderbook-rows");
+  const dataPrefix = outcome === "YES" ? "yes" : "no";
+  const viewPrefix = outcome === "YES" ? "up" : "down";
+  const target = $(`#${viewPrefix}-orderbook-rows`);
   if (!target) return;
   const source = String(environment || "LIVE").toUpperCase() === "DEMO" ? "Demo" : "Live";
-  const sourceLabel = $("#orderbook-environment-label");
+  const sourceLabel = $(`#${viewPrefix}-orderbook-environment-label`);
   if (sourceLabel) sourceLabel.textContent = source;
-  $("#orderbook-title").textContent = `${marketSideLabel(outcome)} order book`;
-  const bids = normalizeBookLevels(orderbook?.[`${prefix}_bids`]);
-  const asks = normalizeBookLevels(orderbook?.[`${prefix}_asks`]);
+  const bids = normalizeBookLevels(orderbook?.[`${dataPrefix}_bids`]);
+  const asks = normalizeBookLevels(orderbook?.[`${dataPrefix}_asks`]);
   if (!bids.length && !asks.length) {
     target.innerHTML = `<tr><td class="book-empty" colspan="3">No ${source} depth available</td></tr>`;
     return;
@@ -240,6 +240,55 @@ function renderRecentTrades(trades, mode = "PAPER") {
   `).join("") : `<tr><td class="book-empty" colspan="8">No ${mode === "PAPER" ? "paper trades" : "fills"} yet</td></tr>`;
 }
 
+function dashboardAllocatedCapital(mode, portfolio = {}) {
+  if (mode !== "PAPER") return numberOrNull(portfolio.allocated_capital) ?? 0;
+  const positionCapital = (portfolio.positions || []).reduce(
+    (total, position) => total + Number(position.committed_dollars || 0), 0,
+  );
+  return positionCapital + Number(portfolio.reserved_cash || 0);
+}
+
+function renderDashboardOpenTrades(mode, portfolio = {}) {
+  $("#dashboard-available-balance").textContent = money(portfolio.available_cash);
+  $("#dashboard-allocated-balance").textContent = money(
+    dashboardAllocatedCapital(mode, portfolio),
+  );
+  const positions = portfolio.positions || [];
+  const restingOrders = portfolio.open_orders || [];
+  const target = $("#dashboard-open-trades");
+  if (!positions.length && !restingOrders.length) {
+    target.innerHTML = '<p class="dashboard-open-trades-empty">No open trades.</p>';
+    return;
+  }
+  const positionRows = positions.map((position) => {
+    const side = String(position.side || "").toUpperCase();
+    const strategy = position.strategy
+      || position.source
+      || position.entries?.[0]?.strategy
+      || position.entries?.[0]?.source
+      || "Manual";
+    const entryPrice = position.entry_price ?? position.average_price;
+    const exposure = position.committed_dollars ?? position.market_exposure;
+    const status = position.display_status || position.status || "Open";
+    return `<article class="dashboard-open-trade">
+      <strong class="${side === "YES" ? "yes" : "no"}" title="${escapeHtml(position.ticker || "Current market")}">${escapeHtml(marketSideLabel(side))} · ${escapeHtml(String(strategy).replaceAll("_", " "))}</strong>
+      <small>${escapeHtml(status)}</small>
+      <p>${escapeHtml(compact(position.contracts))} contracts · ${escapeHtml(cents(entryPrice))} entry · ${escapeHtml(money(exposure))} exposure</p>
+    </article>`;
+  });
+  const orderRows = restingOrders.map((order) => {
+    const side = String(order.side || "").toUpperCase();
+    const quantity = order.remaining_contracts ?? order.requested_contracts;
+    const status = order.display_status || order.status || "Resting";
+    return `<article class="dashboard-open-trade resting">
+      <strong class="${side === "YES" ? "yes" : "no"}" title="${escapeHtml(order.ticker || "Current market")}">${escapeHtml(order.action || "Order")} ${escapeHtml(marketSideLabel(side))} · Limit</strong>
+      <small>${escapeHtml(status)}</small>
+      <p>${escapeHtml(compact(quantity))} contracts · ${escapeHtml(cents(order.limit_price))} limit</p>
+    </article>`;
+  });
+  target.innerHTML = [...positionRows, ...orderRows].join("");
+}
+
 function renderTradeAssessment() {
   const current = state.dashboard?.current;
   const side = state.paperOrder.side;
@@ -250,9 +299,10 @@ function renderTradeAssessment() {
   const economics = assessment?.[action];
   $("#trade-assessment-side").textContent = `Selected: ${marketSideLabel(side)}`;
   $("#trade-action").textContent = tradeActionLabel(decision);
-  $("#trade-price").textContent = cents(economics?.executable_price);
-  $("#trade-model-probability").textContent = percent(assessment?.model_probability, 1);
-  $("#trade-market-probability").textContent = percent(assessment?.market_probability, 1);
+  $("#trade-confidence").textContent = decision?.confidence
+    || assessment?.decision_confidence || "--";
+  $("#trade-open-interest").textContent = compact(current?.open_interest);
+  $("#trade-volume").textContent = compact(current?.volume);
   $("#trade-fee").textContent = economics?.fee_per_contract == null ? "--" : money(economics.fee_per_contract, 4);
   $("#trade-slippage").textContent = cents(economics?.slippage);
   $("#trade-edge").textContent = points(economics?.net_edge);
@@ -396,56 +446,14 @@ function renderDashboard(data) {
   pill.querySelectorAll("[data-signal-option]").forEach((option) => {
     option.classList.toggle("active", option.dataset.signalOption === position);
   });
-  const paperPermission = $("#paper-permission");
   const paper = trading.selected || {};
-  const automaticTradingEnabled = Boolean(paper.automatic_trading_enabled);
-  const paperBlocked = automaticTradingEnabled && paper.automatic_trade_allowed === false;
-  const automaticEntry = current?.automatic_entry || {};
-  const activeStrategy = automaticEntry.active_strategy;
-  const confirmation = activeStrategy
-    ? automaticEntry[activeStrategy.toLowerCase()] || {}
-    : {};
-  const automaticAllocation = Number(automaticEntry.effective_bankroll_allocation || 0);
-  const swingReadiness = automaticEntry.swing_readiness || current?.swing_readiness;
-  const allocationLabel = automaticAllocation > 0
-    ? ` · ${percent(automaticAllocation, 1)} bankroll`
-    : "";
-  const automaticTradingStatus = paperBlocked
-    ? `Automatic trading paused · ${paper.automatic_trade_block_reason || "Risk control active."}`
-    : automaticTradingEnabled
-      ? confirmation.armed
-        ? `${String(activeStrategy).replaceAll("_", " ")} armed · ${Math.round(Number(confirmation.progress || 0) * 100)}% confirmed${allocationLabel}`
-        : swingReadiness?.status === "OPEN"
-          ? `Swing position open · ${swingReadiness.blocker}`
-          : swingReadiness?.status !== "DISABLED" && swingReadiness?.blocker
-            ? `Automatic trading on · ${swingReadiness.blocker}`
-            : "Automatic trading on · waiting for entry window"
-      : "Automatic trading off";
   const modeName = modeLabel(trading.mode);
   const readiness = paper.readiness || {};
   $("#dashboard-trading-label").textContent = modeName.toUpperCase();
-  $("#dashboard-environment-badge").textContent = trading.mode === "PAPER"
-    ? "SIMULATED" : trading.mode;
-  $("#dashboard-environment-badge").classList.toggle("live", trading.mode === "LIVE");
   $("#recent-trades-label").textContent = modeName.toUpperCase();
   $("#recent-trades-badge").textContent = trading.mode === "PAPER" ? "SIMULATED" : trading.mode;
   $("#recent-trades-badge").classList.toggle("live", trading.mode === "LIVE");
-  $("#dashboard-account-state").textContent = trading.mode === "PAPER"
-    ? "Paper account"
-    : readiness.authenticated
-      ? `${modeName} · ${readiness.session_armed ? "Armed" : "Disarmed"}`
-      : `${modeName} · Not connected`;
-  $("#dashboard-account-strip").classList.toggle("ready", trading.mode === "PAPER" || readiness.reconciled);
-  $("#dashboard-account-strip").classList.toggle("live", trading.mode === "LIVE");
-  $("#dashboard-allocation-state").textContent = `${money(paper.available_cash)} available · ${money(paper.remaining_allocation ?? paper.available_cash)} allocation`;
-  paperPermission.hidden = false;
-  paperPermission.classList.toggle("on", automaticTradingEnabled && !paperBlocked);
-  paperPermission.classList.toggle("off", !automaticTradingEnabled);
-  paperPermission.classList.toggle("paused", paperBlocked);
-  paperPermission.textContent = trading.mode === "PAPER"
-    ? automaticTradingStatus
-    : readiness.blocker || automaticTradingStatus;
-  paperPermission.title = automaticTradingStatus;
+  renderDashboardOpenTrades(trading.mode, paper);
   $("#signal-explanation").textContent = forecast?.explanation || system.message || "Connecting to public feeds.";
   $("#up-probability").textContent = percent(forecast?.up_probability, 1);
   $("#down-probability").textContent = percent(forecast?.down_probability, 1);
@@ -465,30 +473,8 @@ function renderDashboard(data) {
     : "No composite available";
   $("#composite-source").textContent = btc.quotes?.map((quote) => quote.exchange).join(" · ") || "Multi-exchange median";
 
-  $("#contract-ticker").textContent = current?.ticker || "No active contract";
   state.closeTime = current?.close_time ? new Date(current.close_time) : null;
   updateCountdown();
-  $("#threshold").textContent = money(threshold);
-  $("#distance-to-strike").textContent = threshold === null
-    ? "Waiting for threshold"
-    : distance === null ? "--" : `${distance >= 0 ? "+" : ""}${money(distance)} from threshold`;
-  $("#yes-market").textContent = `${percent(current?.yes_bid, 1)} / ${percent(current?.yes_ask, 1)}`;
-  $("#no-market").textContent = `${percent(current?.no_bid, 1)} / ${percent(current?.no_ask, 1)}`;
-  $("#spread").textContent = points(current?.spread);
-  $("#open-interest").textContent = compact(current?.open_interest);
-  $("#volume").textContent = compact(current?.volume);
-  const positions = (paper.positions || []).filter((item) => item.ticker === current?.ticker);
-  $("#position-size").textContent = positions.length
-    ? positions.map((item) => {
-      const stops = (item.entries || []).filter((entry) => entry.stop_status === "active")
-        .map((entry) => `${entry.contracts} @ ${cents(entry.stop_loss_price)}`);
-      const directStop = item.stop_loss_price == null ? "" : ` · stop ${cents(item.stop_loss_price)}`;
-      return `${item.contracts} ${marketSideLabel(item.side)}${stops.length ? ` · stop ${stops.join(", ")}` : directStop}`;
-    }).join(" · ")
-    : "No position";
-  const quality = current?.data_quality || { reliable: false, reason: "Waiting for market" };
-  $("#quality-dot").className = `quality-dot ${quality.reliable ? "good" : "bad"}`;
-  $("#quality-text").textContent = quality.reason || "Checking feeds";
   const kalshiConnection = $("#kalshi-connection");
   const btcConnection = $("#btc-connection");
   if (kalshiConnection) {
@@ -507,11 +493,8 @@ function renderDashboard(data) {
   );
   syncArmButton(readiness, trading.mode);
   renderTradeAssessment();
-  renderOrderBook(
-    state.paperOrder.side,
-    current?.orderbook || {},
-    current?.execution_market_mode || "LIVE",
-  );
+  renderOrderBook("YES", current?.orderbook || {}, current?.execution_market_mode || "LIVE");
+  renderOrderBook("NO", current?.orderbook || {}, current?.execution_market_mode || "LIVE");
   const recent = trading.mode === "PAPER"
     ? data.paper?.recent_paper_trades || []
     : (paper.ledger || []).slice(0, 8);
@@ -651,7 +634,18 @@ function renderPaperController() {
   const { mode, selected: portfolio } = selectedTrading();
   const action = state.paperOrder.action;
   $$('[data-paper-action]').forEach((button) => button.classList.toggle("active", button.dataset.paperAction === action));
-  $$('[data-paper-side]').forEach((button) => button.classList.toggle("active", button.dataset.paperSide === state.paperOrder.side));
+  const expanded = Boolean(state.paperOrder.expanded);
+  const controller = $(".paper-controller");
+  controller.classList.toggle("manual-collapsed", !expanded);
+  $("#manual-order-ticket").hidden = !expanded;
+  const manualToggle = $("#manual-order-toggle");
+  manualToggle.textContent = expanded ? "Collapse manual order" : "Manual order";
+  manualToggle.setAttribute("aria-expanded", String(expanded));
+  $$('[data-paper-side]').forEach((button) => {
+    const selected = button.dataset.paperSide === state.paperOrder.side;
+    button.classList.toggle("active", expanded && selected);
+    button.setAttribute("aria-pressed", String(selected));
+  });
   $("#paper-limit-toggle").checked = state.paperOrder.limit;
   $("#paper-market-fields").hidden = state.paperOrder.limit;
   $("#paper-limit-fields").hidden = !state.paperOrder.limit;
@@ -792,11 +786,24 @@ function updateSelectedSide(side) {
   localStorage.setItem("kalshi-display-side-v1", side);
   renderPaperController();
   renderTradeAssessment();
-  renderOrderBook(
-    side,
-    state.dashboard?.current?.orderbook || {},
-    state.dashboard?.current?.execution_market_mode || "LIVE",
-  );
+}
+
+function toggleManualOrder(expanded = !state.paperOrder.expanded) {
+  state.paperOrder.expanded = Boolean(expanded);
+  renderPaperController();
+}
+
+function handlePaperSide(side) {
+  if (!state.paperOrder.expanded) {
+    updateSelectedSide(side);
+    toggleManualOrder(true);
+    return;
+  }
+  if (side === state.paperOrder.side) {
+    toggleManualOrder(false);
+    return;
+  }
+  updateSelectedSide(side);
 }
 
 async function selectTradingMode(mode) {
@@ -932,7 +939,6 @@ function updateCountdown() {
   const value = state.closeTime
     ? countdown((state.closeTime.getTime() - Date.now()) / 1000)
     : "--:--";
-  $("#countdown").textContent = value;
   $("#chart-countdown").textContent = value;
 }
 
@@ -2460,8 +2466,9 @@ function bindEvents() {
     renderTradeAssessment();
   }));
   $$('[data-paper-side]').forEach((button) => button.addEventListener("click", () => {
-    updateSelectedSide(button.dataset.paperSide);
+    handlePaperSide(button.dataset.paperSide);
   }));
+  $("#manual-order-toggle").addEventListener("click", () => toggleManualOrder());
   $("#paper-limit-toggle").addEventListener("change", (event) => {
     state.paperOrder.limit = event.target.checked;
     $("#paper-dollars").value = "";

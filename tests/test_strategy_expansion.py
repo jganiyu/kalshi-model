@@ -921,19 +921,39 @@ def test_old_default_risk_migrates_but_custom_value_survives(tmp_path: Path) -> 
     assert customized.settings()["max_risk_per_trade_pct"] == pytest.approx(0.02)
 
 
-def test_dashboard_markup_has_one_book_and_paper_trade_history() -> None:
+def test_dashboard_markup_has_two_fixed_books_and_paper_trade_history() -> None:
     root = Path(__file__).resolve().parents[1]
     markup = (root / "app/templates/index.html").read_text()
     script = (root / "app/static/app.js").read_text()
+    styles = (root / "app/static/styles.css").read_text()
 
-    assert markup.count('id="orderbook-rows"') == 1
-    assert "up-orderbook-rows" not in markup
-    assert "down-orderbook-rows" not in markup
+    assert 'id="orderbook-rows"' not in markup
+    assert markup.count('id="up-orderbook-rows"') == 1
+    assert markup.count('id="down-orderbook-rows"') == 1
     assert 'id="recent-paper-trades"' in markup
-    assert 'id="orderbook-environment-label"' in markup
+    assert 'id="up-orderbook-environment-label"' in markup
+    assert 'id="down-orderbook-environment-label"' in markup
+    assert 'const viewPrefix = outcome === "YES" ? "up" : "down";' in script
+    assert 'orderbook?.[`${dataPrefix}_bids`]' in script
+    assert 'renderOrderBook("YES",' in script
+    assert 'renderOrderBook("NO",' in script
     assert 'id="standard-edge-hud"' in markup
+    assert markup.index('class="paper-controller"') < markup.index('id="standard-edge-hud"')
+    assert '<h3>Current contract</h3>' not in markup
+    assert 'class="contract-panel"' not in markup
+    assert 'id="trade-confidence"' in markup
+    assert 'id="trade-open-interest"' in markup
+    assert 'id="trade-volume"' in markup
+    assert 'id="trade-price"' not in markup
+    assert 'id="trade-model-probability"' not in markup
+    assert 'id="trade-market-probability"' not in markup
+    assert 'class="orderbook-panel recent-trades-panel"' in markup
+    assert ".recent-trades-panel { grid-column: 1 / -1; }" in styles
+    assert ".recent-col-opened { width: 19%; }" in styles
+    assert ".recent-col-result { width: 15%; }" in styles
     assert 'id="standard-edge-confirmation-track"' in markup
     assert 'id="standard-edge-quality-gate"' in markup
+    assert '<b>Confidence <button class="hud-help"' in markup
     assert markup.count('class="hud-help"') == 13
     assert 'id="standard-edge-volatility-gate"' in markup
     assert 'id="standard-edge-cushion"' in markup
@@ -947,3 +967,36 @@ def test_dashboard_markup_has_one_book_and_paper_trade_history() -> None:
     assert "standard_edge_readiness" in script
     assert 'current?.execution_market_mode || "LIVE"' in script
     assert 'api("/api/model-side"' not in script
+
+
+def test_dashboard_open_trades_and_collapsible_manual_ticket_markup() -> None:
+    root = Path(__file__).resolve().parents[1]
+    markup = (root / "app/templates/index.html").read_text()
+    script = (root / "app/static/app.js").read_text()
+    styles = (root / "app/static/styles.css").read_text()
+
+    dashboard = markup[markup.index('id="page-dashboard"'):markup.index('id="page-paper"')]
+    assert dashboard.index('data-trading-mode="PAPER"') < dashboard.index('class="decision-band"')
+    assert dashboard.count('data-trading-mode="PAPER"') == 1
+    assert '<h3 id="paper-controller-title">Open Trades</h3>' in dashboard
+    assert 'id="dashboard-available-balance"' in dashboard
+    assert 'id="dashboard-allocated-balance"' in dashboard
+    assert 'id="dashboard-open-trades"' in dashboard
+    assert 'No open trades.' in dashboard
+    assert 'id="dashboard-environment-badge"' not in dashboard
+    assert 'id="dashboard-account-strip"' not in dashboard
+    assert 'id="paper-permission"' not in dashboard
+    assert 'id="manual-order-ticket" hidden' in dashboard
+    assert 'id="manual-order-toggle"' in dashboard
+    assert 'aria-expanded="false"' in dashboard
+    assert dashboard.index('id="paper-submit"') < dashboard.index('id="manual-order-toggle"')
+    assert 'function renderDashboardOpenTrades(mode, portfolio = {})' in script
+    assert 'function dashboardAllocatedCapital(mode, portfolio = {})' in script
+    assert 'function handlePaperSide(side)' in script
+    assert 'if (!state.paperOrder.expanded)' in script
+    assert 'if (side === state.paperOrder.side)' in script
+    assert 'manualToggle.textContent = expanded ? "Collapse manual order" : "Manual order";' in script
+    assert 'button.setAttribute("aria-pressed", String(selected));' in script
+    assert '.paper-controller.manual-collapsed .paper-side-picker button[data-paper-side="YES"]' in styles
+    assert '.paper-controller.manual-collapsed .paper-side-picker button[data-paper-side="NO"]' in styles
+    assert '.manual-order-toggle { width: 100%; height: 32px; margin-top: auto;' in styles

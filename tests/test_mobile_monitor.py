@@ -223,9 +223,15 @@ def test_mobile_frontend_supports_live_reconnect_theme_persistence_and_compact_l
     assert 'id="market-timer"' in template
     assert 'id="open-trade-list"' in template
     assert 'id="current-up-price"' in template
+    assert '<span>Confidence<small>--</small></span>' in template
     assert 'id="current-down-price"' in template
     assert 'id="available-funds"' in template
     assert "renderOpenTrades" in script
+    assert 'if (normalized === "LIVE") return "KALSHI LIVE";' in script
+    assert 'if (normalized === "DEMO") return "KALSHI DEMO";' in script
+    assert 'return "PAPER TRADING";' in script
+    assert 'accountLabel.dataset.mode = String(mode || "PAPER").toUpperCase();' in script
+    assert '.open-trades #open-trades-label[data-mode="LIVE"] { color: var(--red); }' in styles
     assert "settlement_margin" in script
     assert 'id="copy-mobile-monitor-command"' in (
         root / "app/templates/index.html"
