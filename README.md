@@ -147,8 +147,8 @@ Stop-losses and the global profit take are app-managed in Demo and Live. They wo
 
 <table>
   <tr>
-    <td width="50%"><img src="docs/screenshots/trade-review-light-20260829.png" alt="Expanded Historical Trade Review in light mode"></td>
-    <td width="50%"><img src="docs/screenshots/trade-review-dark-20260829.png" alt="Expanded Historical Trade Review in dark mode"></td>
+    <td width="50%"><img src="docs/screenshots/trade-review-latest-light-20260830.png" alt="Latest completed Historical Trade Review in light mode"></td>
+    <td width="50%"><img src="docs/screenshots/trade-review-latest-dark-20260830.png" alt="Latest completed Historical Trade Review in dark mode"></td>
   </tr>
   <tr>
     <td align="center"><strong>Light</strong></td>
