@@ -388,6 +388,9 @@ class KalshiBroker(Broker):
         open_orders = [order for order in orders if order.get("status") in OPEN_ORDER_STATES]
         settings = self.db.settings()
         profit_take_enabled = bool(settings.get("global_profit_take_enabled", True))
+        threshold_breach_enabled = bool(
+            settings.get("threshold_breach_exit_enabled", True)
+        )
         stop_positions = [
             position for position in positions
             if position.get("stop_loss_price") is not None
@@ -460,6 +463,17 @@ class KalshiBroker(Broker):
                 "warning": (
                     "Profit taking requires the app to remain running, connected, "
                     "authenticated, reconciled, and armed."
+                ),
+            },
+            "threshold_breach_exit_state": {
+                "enabled": threshold_breach_enabled,
+                "buffer_dollars": float(
+                    settings.get("threshold_breach_exit_buffer_dollars", 0.0)
+                ),
+                "managed_positions": len(managed_positions),
+                "warning": (
+                    "This is a side-aware exit based on the BTC proxy versus To Beat. "
+                    "It does not use contract price as the trigger."
                 ),
             },
         }
@@ -612,6 +626,10 @@ class KalshiBroker(Broker):
                     "contracts": total_contracts,
                     "strategy": strategy,
                     "source": source,
+                    "exit_reason": (
+                        str(last_exit.get("source") or "").upper()
+                        if last_exit else None
+                    ),
                     "status": status,
                     "display_status": "UNSETTLED" if status == "OPEN" else status,
                     "realized_pnl": realized_pnl,
@@ -1799,6 +1817,9 @@ class KalshiBroker(Broker):
                         """
                         UPDATE broker_positions SET contracts=0,market_exposure=0,
                             realized_pnl=?,fees=?,updated_at=?,status='closed'
+                            ,threshold_exit_status=CASE
+                                WHEN threshold_triggered_at IS NOT NULL THEN 'Exited'
+                                ELSE threshold_exit_status END
                         WHERE mode=? AND ticker=? AND status='open'
                         """,
                         (
@@ -1856,7 +1877,10 @@ class KalshiBroker(Broker):
             key = (str(row["ticker"]), str(row["side"]))
             if key not in active:
                 self.db.execute(
-                    "UPDATE broker_positions SET status='closed',contracts=0,updated_at=? WHERE mode=? AND ticker=? AND side=?",
+                    """UPDATE broker_positions SET status='closed',contracts=0,updated_at=?,
+                        threshold_exit_status=CASE WHEN threshold_triggered_at IS NOT NULL
+                            THEN 'Exited' ELSE threshold_exit_status END
+                        WHERE mode=? AND ticker=? AND side=?""",
                     (iso_now(), self.mode, *key),
                 )
 

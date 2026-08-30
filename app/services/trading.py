@@ -12,7 +12,7 @@ import httpx
 
 from app.config import AppConfig
 from app.db import Database
-from app.domain import kalshi_fee, parse_time
+from app.domain import kalshi_fee, parse_time, threshold_breach_exit_state
 from app.services.broker import (
     fill_aggregate,
     KalshiBroker,
@@ -52,11 +52,27 @@ def protective_exit_reason(
     bid: float,
     seconds_remaining: float,
     settings: dict[str, Any],
+    *,
+    btc_proxy: float | None = None,
+    threshold: float | None = None,
+    data_reliable: bool = True,
 ) -> tuple[str | None, int | None]:
     if settings.get("global_profit_take_enabled", True) and bid + 1e-12 >= float(
         settings.get("global_profit_take_price", 0.99)
     ):
         return "GLOBAL_PROFIT_TAKE", 0
+    threshold_exit = threshold_breach_exit_state(
+        str(position.get("side") or ""),
+        btc_proxy,
+        threshold,
+        enabled=bool(settings.get("threshold_breach_exit_enabled", True)),
+        buffer_dollars=float(
+            settings.get("threshold_breach_exit_buffer_dollars", 0.0)
+        ),
+        data_reliable=data_reliable,
+    )
+    if threshold_exit["breached"] and threshold_exit["status"] == "Breached":
+        return "THRESHOLD_BREACH_EXIT", 1
     if position.get("stop_loss_price") is not None and bid <= float(
         position["stop_loss_price"]
     ):
@@ -270,17 +286,21 @@ class TradingCoordinator:
 
         self._reconciliation_tasks[mode] = asyncio.create_task(run())
 
-    def summary(self) -> dict[str, Any]:
+    def summary(self, current: dict[str, Any] | None = None) -> dict[str, Any]:
         modes = {
             mode: self.brokers[mode].portfolio() for mode in ("PAPER", "DEMO", "LIVE")
         }
+        for mode, portfolio in modes.items():
+            self._annotate_threshold_breach_exits(mode, portfolio, current)
         return {
             "selected_mode": self.selected_mode,
             "selected": modes[self.selected_mode],
             "modes": modes,
         }
 
-    def selected_summary(self) -> dict[str, Any]:
+    def selected_summary(
+        self, current: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
         """Return only the account currently shown on the Trading page.
 
         The dashboard still needs all three mode summaries for its environment
@@ -290,12 +310,70 @@ class TradingCoordinator:
         """
         mode = self.selected_mode
         portfolio = self.brokers[mode].portfolio()
+        self._annotate_threshold_breach_exits(mode, portfolio, current)
         # These raw activity streams are used internally to build the ledger,
         # but the Trading page renders the already-aggregated ledger instead.
         # Omitting them materially reduces the local response size.
         for key in ("fills", "intents", "settlements"):
             portfolio.pop(key, None)
         return {"selected_mode": mode, "selected": portfolio}
+
+    def _annotate_threshold_breach_exits(
+        self,
+        mode: str,
+        portfolio: dict[str, Any],
+        current: dict[str, Any] | None,
+    ) -> None:
+        settings = self.db.settings()
+        enabled = bool(settings.get("threshold_breach_exit_enabled", True))
+        buffer_dollars = float(
+            settings.get("threshold_breach_exit_buffer_dollars", 0.0)
+        )
+        current = current or {}
+        quality = current.get("data_quality") or {}
+        data_reliable = bool(quality.get("reliable"))
+        pending = {
+            (str(order.get("ticker")), str(order.get("side")))
+            for order in portfolio.get("open_orders") or []
+            if str(order.get("action")).upper() == "SELL"
+            and str(order.get("source") or "").lower()
+            == "threshold_breach_exit"
+        }
+        readiness = portfolio.get("readiness") or {}
+        for position in portfolio.get("positions") or []:
+            entry = (position.get("entries") or [{}])[0]
+            ticker = str(position.get("ticker") or "")
+            side = str(position.get("side") or "")
+            blocked_reason = None
+            if ticker != str(current.get("ticker") or ""):
+                blocked_reason = "This position is not the active Kalshi market."
+            state = threshold_breach_exit_state(
+                side,
+                current.get("btc_proxy"),
+                current.get("strike"),
+                enabled=enabled,
+                buffer_dollars=buffer_dollars,
+                data_reliable=data_reliable,
+                pending=(ticker, side) in pending
+                or str(
+                    position.get("threshold_exit_status")
+                    or entry.get("threshold_exit_status")
+                    or ""
+                )
+                == "Exit pending",
+                blocked_reason=blocked_reason,
+            )
+            if (
+                mode != "PAPER"
+                and state["breached"]
+                and state["status"] == "Breached"
+                and not readiness.get("ready_for_manual")
+            ):
+                state["status"] = "Blocked"
+                state["reason"] = readiness.get("blocker") or (
+                    f"The {mode.title()} session is not ready for an exit."
+                )
+            position["threshold_breach_exit"] = state
 
     async def reconcile(self, mode: str) -> dict[str, Any]:
         broker = self.broker(mode)
@@ -808,8 +886,17 @@ class TradingCoordinator:
                         intent.fallback_exit_seconds, intent.mode, intent.ticker, intent.side,
                     ),
                 )
-        except (KalshiTradingError, ValueError):
+        except (KalshiTradingError, ValueError) as exc:
             if intent.action == "SELL":
+                if intent.source == "threshold_breach_exit":
+                    self.db.execute(
+                        """
+                        UPDATE broker_positions SET threshold_exit_status='Blocked',
+                            threshold_exit_block_reason=?
+                        WHERE mode=? AND ticker=? AND side=? AND status='open'
+                        """,
+                        (str(exc), intent.mode, intent.ticker, intent.side),
+                    )
                 try:
                     await broker.reconcile()
                 except (KalshiTradingError, ValueError):
@@ -919,16 +1006,63 @@ class TradingCoordinator:
         settings = self.db.settings()
         slippage = float(settings.get("slippage_cents", 0.5)) / 100
         seconds_remaining = float(current.get("time_remaining_seconds") or 0)
+        btc_proxy = current.get("btc_proxy")
+        threshold = current.get("strike")
+        quality = current.get("data_quality") or {}
+        data_reliable = bool(quality.get("reliable"))
         for position in broker.portfolio().get("positions", []):
             if position.get("ticker") != ticker:
                 continue
             side = str(position.get("side"))
+            threshold_exit = threshold_breach_exit_state(
+                side,
+                btc_proxy,
+                threshold,
+                enabled=bool(settings.get("threshold_breach_exit_enabled", True)),
+                buffer_dollars=float(
+                    settings.get("threshold_breach_exit_buffer_dollars", 0.0)
+                ),
+                data_reliable=data_reliable,
+            )
+            self.db.execute(
+                """
+                UPDATE broker_positions SET threshold_breach_enabled=?,
+                    threshold_exit_buffer=?,threshold_exit_level=?,
+                    threshold_exit_status=?,threshold_exit_block_reason=?
+                WHERE mode=? AND ticker=? AND side=? AND status='open'
+                """,
+                (
+                    int(bool(threshold_exit["enabled"])),
+                    threshold_exit["buffer_dollars"],
+                    threshold_exit["exit_level"],
+                    threshold_exit["status"],
+                    threshold_exit["reason"],
+                    broker.mode,
+                    ticker,
+                    side,
+                ),
+            )
             bid = current.get(f"{side.lower()}_bid")
             if bid is None:
+                if threshold_exit["breached"]:
+                    self.db.execute(
+                        """
+                        UPDATE broker_positions SET threshold_exit_status='Blocked',
+                            threshold_exit_block_reason='No executable bid is available.'
+                        WHERE mode=? AND ticker=? AND side=? AND status='open'
+                        """,
+                        (broker.mode, ticker, side),
+                    )
                 continue
             bid = float(bid)
             reason, priority = protective_exit_reason(
-                position, bid, seconds_remaining, settings
+                position,
+                bid,
+                seconds_remaining,
+                settings,
+                btc_proxy=float(btc_proxy) if btc_proxy is not None else None,
+                threshold=float(threshold) if threshold is not None else None,
+                data_reliable=data_reliable,
             )
             if reason is None:
                 continue
@@ -953,6 +1087,10 @@ class TradingCoordinator:
                     continue
             pending_key = (broker.mode, ticker, side)
             if pending_key in self._pending_exit_keys:
+                if reason == "THRESHOLD_BREACH_EXIT":
+                    self._mark_threshold_exit_pending(
+                        broker.mode, ticker, side, threshold_exit
+                    )
                 continue
             existing = self.db.fetch_one(
                 """
@@ -963,10 +1101,30 @@ class TradingCoordinator:
                 (broker.mode, ticker, side),
             )
             if existing:
+                if reason == "THRESHOLD_BREACH_EXIT":
+                    self._mark_threshold_exit_pending(
+                        broker.mode, ticker, side, threshold_exit
+                    )
                 continue
             contracts = math.floor(float(position.get("contracts") or 0))
             if contracts < 1:
                 continue
+            decision_snapshot: dict[str, Any] = {
+                "trigger": reason,
+                "executable_bid": bid,
+                "priority": priority,
+            }
+            if reason == "THRESHOLD_BREACH_EXIT":
+                decision_snapshot.update(
+                    {
+                        "threshold_breach_enabled": threshold_exit["enabled"],
+                        "threshold_exit_buffer": threshold_exit["buffer_dollars"],
+                        "threshold_exit_level": threshold_exit["exit_level"],
+                        "threshold_trigger_btc_proxy": btc_proxy,
+                        "threshold_trigger_threshold": threshold,
+                        "threshold_triggered_at": datetime_now(),
+                    }
+                )
             intent = OrderIntent(
                 mode=broker.mode,
                 ticker=ticker,
@@ -977,9 +1135,13 @@ class TradingCoordinator:
                 strategy=str(position.get("strategy") or "MANUAL"),
                 source=reason.lower(),
                 price_ranges=current.get("price_ranges"),
-                decision_snapshot={"trigger": reason, "executable_bid": bid, "priority": priority},
+                decision_snapshot=decision_snapshot,
                 risk_snapshot={"exchange_index": current.get("exchange_index")},
             )
+            if reason == "THRESHOLD_BREACH_EXIT":
+                self._mark_threshold_exit_pending(
+                    broker.mode, ticker, side, threshold_exit, triggered=True
+                )
             self._pending_exit_keys.add(pending_key)
             task = asyncio.create_task(self._submit_exit(intent, pending_key))
             self._track_task(task)
@@ -991,6 +1153,44 @@ class TradingCoordinator:
             await self._submit_and_attach_position(intent)
         finally:
             self._pending_exit_keys.discard(pending_key)
+
+    def _mark_threshold_exit_pending(
+        self,
+        mode: str,
+        ticker: str,
+        side: str,
+        state: dict[str, object],
+        *,
+        triggered: bool = False,
+    ) -> None:
+        self.db.execute(
+            """
+            UPDATE broker_positions SET threshold_breach_enabled=?,
+                threshold_exit_buffer=?,threshold_exit_level=?,
+                threshold_trigger_btc_proxy=CASE WHEN ? THEN ?
+                    ELSE threshold_trigger_btc_proxy END,
+                threshold_trigger_threshold=CASE WHEN ? THEN ?
+                    ELSE threshold_trigger_threshold END,
+                threshold_triggered_at=CASE WHEN ? THEN COALESCE(
+                    threshold_triggered_at,?) ELSE threshold_triggered_at END,
+                threshold_exit_status='Exit pending',threshold_exit_block_reason=NULL
+            WHERE mode=? AND ticker=? AND side=? AND status='open'
+            """,
+            (
+                int(bool(state["enabled"])),
+                state["buffer_dollars"],
+                state["exit_level"],
+                int(triggered),
+                state["btc_proxy"],
+                int(triggered),
+                state["threshold"],
+                int(triggered),
+                datetime_now(),
+                mode,
+                ticker,
+                side,
+            ),
+        )
 
     def _track_task(self, task: asyncio.Task[Any]) -> None:
         self._submission_tasks.add(task)

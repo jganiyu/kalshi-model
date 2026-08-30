@@ -307,3 +307,68 @@ def calibration_metrics(observations: Iterable[tuple[float, int]]) -> dict[str, 
         "calibration_error": weighted_error / len(rows),
         "buckets": buckets,
     }
+
+
+def threshold_breach_exit_state(
+    side: str,
+    btc_proxy: float | None,
+    threshold: float | None,
+    *,
+    enabled: bool = True,
+    buffer_dollars: float = 0.0,
+    data_reliable: bool = True,
+    pending: bool = False,
+    exited: bool = False,
+    blocked_reason: str | None = None,
+) -> dict[str, object]:
+    """Describe the side-aware BTC-proxy threshold protection for one position."""
+    normalized_side = str(side or "").upper()
+    buffer_value = max(0.0, float(buffer_dollars or 0.0))
+    proxy_value = float(btc_proxy) if btc_proxy is not None else None
+    threshold_value = float(threshold) if threshold is not None else None
+    exit_level = None
+    if threshold_value is not None and normalized_side in {"YES", "NO"}:
+        exit_level = threshold_value + (-buffer_value if normalized_side == "YES" else buffer_value)
+
+    breached = False
+    distance = None
+    if proxy_value is not None and exit_level is not None:
+        if normalized_side == "YES":
+            distance = proxy_value - exit_level
+            breached = proxy_value <= exit_level + 1e-9
+        elif normalized_side == "NO":
+            distance = exit_level - proxy_value
+            breached = proxy_value >= exit_level - 1e-9
+
+    reason = blocked_reason
+    if not enabled:
+        status = "Watching"
+        reason = reason or "Threshold Breach Exit is off."
+    elif exited:
+        status = "Exited"
+    elif pending:
+        status = "Exit pending"
+    elif reason:
+        status = "Blocked"
+    elif proxy_value is None or exit_level is None:
+        status = "Blocked"
+        reason = "Current BTC proxy or To Beat threshold is unavailable."
+    elif not data_reliable:
+        status = "Blocked"
+        reason = "BTC proxy data is not reliable enough to trigger an exit."
+    elif breached:
+        status = "Breached"
+    else:
+        status = "Watching"
+
+    return {
+        "enabled": bool(enabled),
+        "buffer_dollars": buffer_value,
+        "exit_level": exit_level,
+        "btc_proxy": proxy_value,
+        "threshold": threshold_value,
+        "distance_to_exit": distance,
+        "breached": breached,
+        "status": status,
+        "reason": reason,
+    }

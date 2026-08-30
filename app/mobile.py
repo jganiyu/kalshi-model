@@ -69,6 +69,7 @@ def mobile_snapshot(dashboard: dict[str, Any]) -> dict[str, Any]:
         "settlement_margin",
         "margin_volatility_index",
         "margin_cushion_ratio",
+        "exit_reason",
     }
     recent_trades = [
         {
@@ -91,6 +92,9 @@ def mobile_snapshot(dashboard: dict[str, Any]) -> dict[str, Any]:
             else position.get("market_exposure"),
             "strategy": position.get("strategy") or position.get("source"),
             "status": position.get("display_status") or position.get("status"),
+            "threshold_breach_exit": _safe_copy(
+                position.get("threshold_breach_exit")
+            ),
         }
         for position in (selected.get("positions") or [])
     ]

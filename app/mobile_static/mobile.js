@@ -168,7 +168,23 @@ function renderHud(readiness) {
 
 function tradeResult(trade) {
   const status = String(trade.display_status || trade.status || trade.action || "Open");
-  return trade.realized_pnl == null ? status : `${status} · ${money(trade.realized_pnl)}`;
+  const exitLabel = String(trade.exit_reason || "").toUpperCase() === "THRESHOLD_BREACH_EXIT"
+    ? " · Threshold breach exit" : "";
+  return trade.realized_pnl == null
+    ? `${status}${exitLabel}`
+    : `${status}${exitLabel} · ${money(trade.realized_pnl)}`;
+}
+
+function thresholdBreachExitText(protection = {}) {
+  const fields = [
+    `Threshold breach exit: ${protection.enabled === false ? "Off" : "On"}`,
+    `Exit level ${price(protection.exit_level)}`,
+    `Current BTC proxy ${price(protection.btc_proxy)}`,
+    `Distance to exit ${signedMoney(protection.distance_to_exit)}`,
+    `Status: ${protection.status || "Blocked"}`,
+  ];
+  if (protection.reason) fields.push(`Reason: ${protection.reason}`);
+  return fields.join(" · ");
 }
 
 function renderTrades(trades, mode) {
@@ -213,6 +229,7 @@ function renderOpenTrades(trades, mode, availableCash, market) {
       <div class="open-trade-head"><strong class="${sideClass}">${escapeHtml(sideLabel(trade.side))}</strong><span>${escapeHtml(strategy)}</span></div>
       <p title="${escapeHtml(trade.ticker)}">${escapeHtml(trade.ticker || "Current market")}</p>
       <div><span>${escapeHtml(compact(trade.contracts))} contracts</span><span>${escapeHtml(cents(trade.entry_price))} entry</span><span>${escapeHtml(money(trade.exposure))} exposure</span></div>
+      <p class="threshold-breach-state">${escapeHtml(thresholdBreachExitText(trade.threshold_breach_exit || {}))}</p>
     </article>`;
   }).join("");
 }

@@ -87,6 +87,7 @@ h2 { font-size: 22px; letter-spacing: -.03em; }
 .open-trade-head span { overflow: hidden; color: var(--muted); text-overflow: ellipsis; white-space: nowrap; }
 .open-trade p { overflow: hidden; margin: 6px 0; color: var(--muted); font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
 .open-trade > div:last-child { display: flex; flex-wrap: wrap; gap: 5px 12px; color: var(--muted); font-size: 9px; }
+.open-trade .threshold-breach-state { white-space: normal; line-height: 1.45; }
 .market-prices { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin-top: 11px; }
 .market-prices > div { display: flex; min-width: 0; min-height: 34px; align-items: center; justify-content: center; gap: 6px; border-radius: 6px; color: #fff; font-size: 10px; }
 .market-prices .up { background: var(--green); }

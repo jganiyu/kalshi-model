@@ -8,7 +8,7 @@ from datetime import date
 from typing import Any, Callable
 
 from app.db import Database
-from app.domain import iso_now, kalshi_fee, parse_time
+from app.domain import iso_now, kalshi_fee, parse_time, threshold_breach_exit_state
 from app.services.decision import Decision
 from app.services.margin_volatility import MarginVolatilityService
 from app.services.trade_review import paper_trade_ref, review_metadata
@@ -186,6 +186,18 @@ class PaperTradingService:
             "global_profit_take_price": float(
                 settings.get("global_profit_take_price", 0.99)
             ),
+            "threshold_breach_exit_state": {
+                "enabled": bool(
+                    settings.get("threshold_breach_exit_enabled", True)
+                ),
+                "buffer_dollars": float(
+                    settings.get("threshold_breach_exit_buffer_dollars", 0.0)
+                ),
+                "warning": (
+                    "This is a side-aware exit based on the BTC proxy versus To Beat. "
+                    "It does not use contract price as the trigger."
+                ),
+            },
             "active_stop_losses": active_stops,
             "strategy_results": self.strategy_results(),
             "trades": [
@@ -202,6 +214,30 @@ class PaperTradingService:
                             **entry,
                             "strategy_metadata": _strategy_metadata(
                                 entry.get("strategy_metadata_json")
+                            ),
+                            "threshold_breach_enabled": entry.get(
+                                "threshold_breach_enabled"
+                            ),
+                            "threshold_exit_buffer": entry.get(
+                                "threshold_exit_buffer"
+                            ),
+                            "threshold_exit_level": entry.get(
+                                "threshold_exit_level"
+                            ),
+                            "threshold_trigger_btc_proxy": entry.get(
+                                "threshold_trigger_btc_proxy"
+                            ),
+                            "threshold_trigger_threshold": entry.get(
+                                "threshold_trigger_threshold"
+                            ),
+                            "threshold_triggered_at": entry.get(
+                                "threshold_triggered_at"
+                            ),
+                            "threshold_exit_status": entry.get(
+                                "threshold_exit_status"
+                            ),
+                            "threshold_exit_block_reason": entry.get(
+                                "threshold_exit_block_reason"
                             ),
                         }
                         for entry in entries if entry["trade_id"] == trade["id"]
@@ -720,6 +756,7 @@ class PaperTradingService:
                 exit_reason = {
                     "stop_loss": "STOP_LOSS",
                     "profit_take": "PROFIT_TAKE",
+                    "threshold_breach_exit": "THRESHOLD_BREACH_EXIT",
                     "swing_target": "TARGET",
                     "swing_fallback": "FALLBACK",
                     "risk_exit": "RISK",
@@ -896,6 +933,7 @@ class PaperTradingService:
                         (iso_now(), str(exc), order["id"]),
                     )
         filled += self.process_profit_takes(ticker, market)
+        filled += self.process_threshold_breach_exits(ticker, market)
         filled += self.process_stop_losses(ticker, market)
         return filled + self.process_swing_exits(ticker, market)
 
@@ -962,6 +1000,170 @@ class PaperTradingService:
                     WHERE id=?
                     """,
                     (iso_now(), str(exc), order_id),
+                )
+        return closed
+
+    def process_threshold_breach_exits(
+        self, ticker: str, market: dict[str, Any]
+    ) -> int:
+        settings = self.db.settings()
+        enabled = bool(settings.get("threshold_breach_exit_enabled", True))
+        buffer_dollars = float(
+            settings.get("threshold_breach_exit_buffer_dollars", 0.0)
+        )
+        btc_proxy = market.get("btc_proxy")
+        threshold = market.get("strike")
+        quality = market.get("data_quality")
+        data_reliable = (
+            bool(quality.get("reliable"))
+            if isinstance(quality, dict)
+            else bool(btc_proxy is not None and threshold is not None)
+        )
+        entries = self.db.fetch_all(
+            """
+            SELECT * FROM paper_entries
+            WHERE ticker=? AND status='open' AND remaining_contracts>0
+            ORDER BY id ASC
+            """,
+            (ticker,),
+        )
+        if not entries:
+            return 0
+        slippage = float(settings.get("slippage_cents", 0.5)) / 100
+        closed = 0
+        liquidity: dict[str, int | None] = {}
+        for entry in entries:
+            side = str(entry["side"])
+            state = threshold_breach_exit_state(
+                side,
+                float(btc_proxy) if btc_proxy is not None else None,
+                float(threshold) if threshold is not None else None,
+                enabled=enabled,
+                buffer_dollars=buffer_dollars,
+                data_reliable=data_reliable,
+            )
+            self.db.execute(
+                """
+                UPDATE paper_entries SET threshold_breach_enabled=?,
+                    threshold_exit_buffer=?,threshold_exit_level=?,
+                    threshold_exit_status=?,threshold_exit_block_reason=?
+                WHERE id=?
+                """,
+                (
+                    int(enabled),
+                    buffer_dollars,
+                    state["exit_level"],
+                    state["status"],
+                    state["reason"],
+                    entry["id"],
+                ),
+            )
+            if state["status"] != "Breached":
+                continue
+            bid = self.executable_price(market, side, "SELL")
+            if bid is None:
+                self.db.execute(
+                    """
+                    UPDATE paper_entries SET threshold_exit_status='Blocked',
+                        threshold_exit_block_reason='No executable bid is available.'
+                    WHERE id=?
+                    """,
+                    (entry["id"],),
+                )
+                continue
+            if side not in liquidity:
+                bid_size = market.get(f"{side.lower()}_bid_size")
+                liquidity[side] = (
+                    max(0, int(float(bid_size))) if bid_size is not None else None
+                )
+            available = self.available_contracts(ticker, side)
+            quoted = liquidity[side]
+            contracts = min(int(entry["remaining_contracts"]), available)
+            if quoted is not None:
+                contracts = min(contracts, quoted)
+            if contracts < 1:
+                self.db.execute(
+                    """
+                    UPDATE paper_entries SET threshold_exit_status='Blocked',
+                        threshold_exit_block_reason='No executable bid liquidity is available.'
+                    WHERE id=?
+                    """,
+                    (entry["id"],),
+                )
+                continue
+            triggered_at = iso_now()
+            self.db.execute(
+                """
+                UPDATE paper_entries SET threshold_trigger_btc_proxy=?,
+                    threshold_trigger_threshold=?,threshold_triggered_at=COALESCE(
+                        threshold_triggered_at,?),threshold_exit_status='Exit pending',
+                    threshold_exit_block_reason=NULL WHERE id=?
+                """,
+                (btc_proxy, threshold, triggered_at, entry["id"]),
+            )
+            order_id = self.db.execute(
+                """
+                INSERT INTO paper_orders(
+                    ticker,side,action,order_type,status,created_at,limit_price,
+                    requested_contracts,source,entry_id,strategy
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    ticker,
+                    side,
+                    "SELL",
+                    "MARKET",
+                    "open",
+                    triggered_at,
+                    max(0.001, float(bid) - slippage),
+                    contracts,
+                    "threshold_breach_exit",
+                    entry["id"],
+                    entry.get("strategy") or "MANUAL",
+                ),
+            )
+            order = self.db.fetch_one(
+                "SELECT * FROM paper_orders WHERE id=?", (order_id,)
+            )
+            if not order:
+                continue
+            try:
+                self._fill_order(
+                    order, max(0.001, float(bid) - slippage), market
+                )
+                closed += 1
+                if quoted is not None:
+                    liquidity[side] = quoted - contracts
+                remaining = self.db.fetch_one(
+                    "SELECT remaining_contracts,status FROM paper_entries WHERE id=?",
+                    (entry["id"],),
+                ) or {}
+                self.db.execute(
+                    """
+                    UPDATE paper_entries SET threshold_exit_status=?,
+                        threshold_exit_block_reason=NULL WHERE id=?
+                    """,
+                    (
+                        "Exited"
+                        if str(remaining.get("status")) == "closed"
+                        else "Exit pending",
+                        entry["id"],
+                    ),
+                )
+            except ValueError as exc:
+                self.db.execute(
+                    """
+                    UPDATE paper_orders SET status='canceled',canceled_at=?,error=?
+                    WHERE id=?
+                    """,
+                    (iso_now(), str(exc), order_id),
+                )
+                self.db.execute(
+                    """
+                    UPDATE paper_entries SET threshold_exit_status='Blocked',
+                        threshold_exit_block_reason=? WHERE id=?
+                    """,
+                    (str(exc), entry["id"]),
                 )
         return closed
 

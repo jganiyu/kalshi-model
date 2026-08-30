@@ -94,6 +94,8 @@ DEFAULT_SETTINGS: dict[str, object] = {
     "default_stop_loss_cents": None,
     "global_profit_take_enabled": True,
     "global_profit_take_price": 0.99,
+    "threshold_breach_exit_enabled": True,
+    "threshold_breach_exit_buffer_dollars": 0.0,
     "automatic_entry_window_minutes": 15,
     "automatic_confirmation_seconds": 5,
     "automatic_buy_duration_pct": 0.50,

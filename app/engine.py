@@ -311,6 +311,7 @@ class AnalysisEngine:
             )
             current_payload["btc_proxy"] = btc_state.get("price")
             current_payload["btc_state"] = btc_state
+            self.paper.process_threshold_breach_exits(ticker, current_payload)
             self._schedule_trade_review(current_payload, observed_at)
             if self._previous_ticker and self._previous_ticker != ticker:
                 self._pending_settlements.add(self._previous_ticker)
@@ -357,7 +358,7 @@ class AnalysisEngine:
             "next": self._market_summary(next_market) if next_market else None,
             "notification": notification,
             "paper": self._portfolio_summary(),
-            "trading": self.trading.summary(),
+            "trading": self.trading.summary(current_payload),
             "calibration": self.calibration_summary(),
             "model": self.models.active(),
         }
@@ -738,6 +739,11 @@ class AnalysisEngine:
             observed_at,
             execution_market_state=execution_state,
         )
+        current["btc_proxy"] = self._latest_btc.get("price")
+        current["btc_state"] = self._latest_btc
+        self.paper.process_threshold_breach_exits(
+            str(self._current_market["ticker"]), current
+        )
         self._schedule_trade_review(current, observed_at)
         reliable = current["decision"]["reason_code"] != "DATA_UNRELIABLE"
         self.dashboard = {
@@ -748,7 +754,7 @@ class AnalysisEngine:
             "next": self._market_summary(self._next_market) if self._next_market else None,
             "notification": notification,
             "paper": self._portfolio_summary(),
-            "trading": self.trading.summary(),
+            "trading": self.trading.summary(current),
         }
         self._schedule_publish()
         self.trading.schedule_process(current)
@@ -1457,6 +1463,7 @@ class AnalysisEngine:
                 "benchmark_uncertainty_dollars": (
                     baseline.reference_price * benchmark_uncertainty
                 ),
+                "btc_proxy": btc.get("price"),
                 "model_variant_spread": variant_spread,
                 "data_quality": quality,
                 "forecast": forecast.as_dict(),
@@ -1698,6 +1705,14 @@ class AnalysisEngine:
                 "margin_cushion_ratio": (
                     trade.get("entries") or [{}]
                 )[-1].get("margin_cushion_ratio"),
+                "exit_reason": next(
+                    (
+                        entry.get("exit_reason")
+                        for entry in reversed(trade.get("entries") or [])
+                        if entry.get("exit_reason")
+                    ),
+                    None,
+                ),
             }
             for trade in portfolio.get("trades", [])[:10]
         ]

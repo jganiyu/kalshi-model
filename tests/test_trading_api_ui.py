@@ -19,7 +19,7 @@ class ApiTrading:
     def broker(self, mode: str | None = None):
         return self._broker
 
-    def summary(self):
+    def summary(self, _current=None):
         portfolio = self._broker.portfolio()
         return {
             "selected_mode": "DEMO",
@@ -27,7 +27,7 @@ class ApiTrading:
             "modes": {"PAPER": {"mode": "PAPER"}, "DEMO": portfolio, "LIVE": {"mode": "LIVE"}},
         }
 
-    def selected_summary(self):
+    def selected_summary(self, _current=None):
         portfolio = self._broker.portfolio()
         for key in ("fills", "intents", "settlements"):
             portfolio.pop(key, None)

@@ -139,6 +139,7 @@ def test_mobile_snapshot_matches_dashboard_hud_market_and_recent_trades() -> Non
         "ticker": "KXBTC15M-TEST", "side": "YES", "contracts": 10,
         "entry_price": 0.51, "exposure": 5.1,
         "strategy": "STANDARD_EDGE", "status": None,
+        "threshold_breach_exit": None,
     }]
 
 

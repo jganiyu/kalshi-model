@@ -141,13 +141,13 @@ async def reset_paper_round() -> dict[str, Any]:
 
 @app.get("/api/trading")
 async def trading() -> dict[str, Any]:
-    return engine.trading.summary()
+    return engine.trading.summary(engine.dashboard.get("current"))
 
 
 @app.get("/api/trading/selected")
 async def selected_trading() -> dict[str, Any]:
     """Read the selected account for the Trading page without other modes."""
-    return engine.trading.selected_summary()
+    return engine.trading.selected_summary(engine.dashboard.get("current"))
 
 
 def _disable_financial_caching(response: Response) -> None:
@@ -364,10 +364,12 @@ async def arm_trading(mode: str, payload: dict[str, Any] = Body(...)) -> dict[st
         broker = engine.trading.broker(mode)
         if not isinstance(broker, KalshiBroker):
             raise ValueError("Paper mode does not require arming.")
-        return broker.arm(
+        readiness = broker.arm(
             confirmation=str(payload.get("confirmation") or ""),
             automatic=bool(payload.get("automatic", False)),
         )
+        engine.trading.schedule_process(engine.dashboard.get("current"))
+        return readiness
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
@@ -587,6 +589,7 @@ def clean_settings_payload(payload: dict[str, Any]) -> dict[str, Any]:
         "max_session_drawdown_pct": (0.0, 1.0),
         "slippage_cents": (0.0, 10.0),
         "global_profit_take_price": (0.01, 0.99),
+        "threshold_breach_exit_buffer_dollars": (0.0, 100_000.0),
         "automatic_entry_window_minutes": (0.25, 15.0),
         "automatic_confirmation_seconds": (1.0, 120.0),
         "automatic_buy_duration_pct": (0.50, 1.0),
@@ -712,6 +715,7 @@ def clean_settings_payload(payload: dict[str, Any]) -> dict[str, Any]:
             "paper_trading_enabled", "risk_controls_enabled",
             "early_threshold_enabled", "late_conviction_enabled", "swing_enabled",
             "global_profit_take_enabled",
+            "threshold_breach_exit_enabled",
             "mobile_monitor_enabled",
             "demo_automatic_trading_enabled", "live_automatic_trading_enabled",
         }:

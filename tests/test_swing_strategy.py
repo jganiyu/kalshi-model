@@ -425,7 +425,7 @@ def test_swing_results_and_additive_migration(tmp_path: Path) -> None:
     assert "exit_reason" in columns
     assert legacy.fetch_one(
         "SELECT MAX(version) version FROM schema_migrations"
-        )["version"] == 15
+        )["version"] == 16
 
 
 def test_swing_controls_and_results_are_rendered() -> None:

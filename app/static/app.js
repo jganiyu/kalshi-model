@@ -238,7 +238,7 @@ function renderRecentTrades(trades, mode = "PAPER") {
     <td>${cents(trade.entry_price ?? trade.price)}</td><td>${trade.contracts}</td>
     <td class="${Number(trade.settlement_margin) > 0 ? "positive" : Number(trade.settlement_margin) < 0 ? "negative" : ""}">${signedMoney(trade.settlement_margin)}</td>
     <td>${String(trade.strategy || trade.source || "manual").replaceAll("_", " ")}</td>
-    <td class="${Number(trade.realized_pnl) > 0 ? "positive" : Number(trade.realized_pnl) < 0 ? "negative" : ""}">${String(trade.display_status || trade.status || (mode === "PAPER" ? "open" : trade.action || "filled"))}${trade.realized_pnl == null ? "" : ` · ${money(trade.realized_pnl)}`}</td>
+    <td class="${Number(trade.realized_pnl) > 0 ? "positive" : Number(trade.realized_pnl) < 0 ? "negative" : ""}">${String(trade.display_status || trade.status || (mode === "PAPER" ? "open" : trade.action || "filled"))}${thresholdExitResultLabel(trade)}${trade.realized_pnl == null ? "" : ` · ${money(trade.realized_pnl)}`}</td>
     <td>${trade.available_cash_after == null ? "—" : money(trade.available_cash_after)}</td></tr>
   `).join("") : `<tr><td class="book-empty" colspan="8">No ${mode === "PAPER" ? "paper trades" : "fills"} yet</td></tr>`;
 }
@@ -249,6 +249,26 @@ function dashboardAllocatedCapital(mode, portfolio = {}) {
     (total, position) => total + Number(position.committed_dollars || 0), 0,
   );
   return positionCapital + Number(portfolio.reserved_cash || 0);
+}
+
+function thresholdBreachExitText(protection = {}) {
+  const on = protection.enabled !== false;
+  const status = protection.status || "Blocked";
+  const fields = [
+    `Threshold breach exit: ${on ? "On" : "Off"}`,
+    `Exit level ${money(protection.exit_level)}`,
+    `Current BTC proxy ${money(protection.btc_proxy)}`,
+    `Distance to exit ${signedMoney(protection.distance_to_exit)}`,
+    `Status: ${status}`,
+  ];
+  if (protection.reason) fields.push(`Reason: ${protection.reason}`);
+  return fields.join(" · ");
+}
+
+function thresholdExitResultLabel(trade = {}) {
+  return String(trade.exit_reason || "").toUpperCase() === "THRESHOLD_BREACH_EXIT"
+    ? " · Threshold breach exit"
+    : "";
 }
 
 function renderDashboardOpenTrades(mode, portfolio = {}) {
@@ -273,10 +293,12 @@ function renderDashboardOpenTrades(mode, portfolio = {}) {
     const entryPrice = position.entry_price ?? position.average_price;
     const exposure = position.committed_dollars ?? position.market_exposure;
     const status = position.display_status || position.status || "Open";
+    const protection = position.threshold_breach_exit || {};
     return `<article class="dashboard-open-trade">
       <strong class="${side === "YES" ? "yes" : "no"}" title="${escapeHtml(position.ticker || "Current market")}">${escapeHtml(marketSideLabel(side))} · ${escapeHtml(String(strategy).replaceAll("_", " "))}</strong>
       <small>${escapeHtml(status)}</small>
       <p>${escapeHtml(compact(position.contracts))} contracts · ${escapeHtml(cents(entryPrice))} entry · ${escapeHtml(money(exposure))} exposure</p>
+      <p class="threshold-breach-state">${escapeHtml(thresholdBreachExitText(protection))}</p>
     </article>`;
   });
   const orderRows = restingOrders.map((order) => {
@@ -1420,10 +1442,13 @@ const calibrationGroups = [
     { id: "swing_min_liquidity_contracts", label: "Minimum liquidity", unit: "contracts", min: 1, max: 1000000, step: 1, integer: true, tip: "Minimum contracts available at the qualifying ask. Default: 1 contract." },
     { id: "swing_confirmation_seconds", label: "Confirmation period", unit: "seconds", min: 0, max: 120, step: .5, tip: "How long every Swing entry requirement must remain valid. Default: immediate." },
   ]],
-  ["Stops and Exits", [
+  ["Stops & Exits", [
     { id: "default_stop_loss_cents", label: "Default stop-loss", unit: "cents", min: 0, max: 99, step: 1, nullable: true, tip: "Optional absolute bid trigger prefilled on new Buy drafts. Use 0 or leave blank to turn it off; existing stops never change." },
     { id: "global_profit_take_enabled", label: "Global profit take", type: "toggle", tip: "Closes open positions in Paper, Demo, or Live when the executable bid reaches the configured level. Default: on." },
     { id: "global_profit_take_price", label: "Profit-take bid", unit: "cents", min: 1, max: 99, step: 1, scale: 100, tip: "Executable bid that triggers an exit for every strategy and manual trade. Demo and Live require the app to stay connected. Default: 99 cents." },
+    { type: "subsection", label: "Threshold Breach Exit", description: "This is a side-aware exit based on the BTC proxy versus To Beat. It does not use contract price as the trigger." },
+    { id: "threshold_breach_exit_enabled", label: "Enable Threshold Breach Exit", type: "toggle", tip: "Side-aware exit based on the BTC proxy versus To Beat. It does not use contract price as the trigger. Default: on." },
+    { id: "threshold_breach_exit_buffer_dollars", label: "Threshold exit buffer", unit: "dollars", min: 0, max: 100000, step: .25, tip: "Extra BTC movement beyond To Beat required before exiting against the held side. $0 exits at the threshold; $2 exits $2 beyond it. Default: $0." },
   ]],
   ["Position Sizing and Risk", [
     { id: "starting_bankroll", label: "Starting bankroll", unit: "dollars", min: 1, max: 100000000, step: 100, tip: "Paper capital used for sizing and performance. Default: $1,000." },
@@ -1476,12 +1501,15 @@ for (const [mode, label] of [["demo", "Demo"], ["live", "Live"]]) {
   ]]);
 }
 
-const calibrationControlMap = new Map(calibrationGroups.flatMap(([, controls]) => controls.map((control) => [control.id, control])));
+const calibrationControlMap = new Map(calibrationGroups.flatMap(([, controls]) => controls.filter((control) => control.id).map((control) => [control.id, control])));
 
 function renderCalibrationControls() {
   $("#calibration-controls").innerHTML = calibrationGroups.map(([group, controls]) => `
     <section class="calibration-group"><h2>${group}</h2>
       ${controls.map((control) => {
+        if (control.type === "subsection") {
+          return `<div class="calibration-subsection"><h3>${control.label}</h3><p>${control.description}</p></div>`;
+        }
         const tooltipId = `tip-${control.id}`;
         let field;
         if (control.type === "toggle") {
@@ -2082,19 +2110,21 @@ async function loadPaper() {
     return `
     <tr class="trade-ledger-row ${reviewAvailable ? "review-available" : ""}" data-review-ref="${escapeHtml(trade.review_ref || "")}" data-review-mode="${mode}" data-review-available="${reviewAvailable}" tabindex="${reviewAvailable ? "0" : "-1"}" aria-expanded="false" title="${escapeHtml(reviewTitle)}"><td>${shortDate(trade.activity_at || trade.opened_at || trade.filled_at)}${reviewUnavailable ? '<small class="review-unavailable">Historical review unavailable</small>' : ""}</td><td>${escapeHtml(trade.ticker)}</td><td>${marketSideLabel(trade.side)}</td>
     <td>${cents(trade.entry_price ?? trade.price)}</td><td>${trade.contracts}</td><td>${String(trade.strategy || trade.source || "automatic").replaceAll("_", " ").toUpperCase()}${(trade.entries || []).some((entry) => entry.stop_status === "active") ? " · STOP ACTIVE" : ""}</td><td>${mode === "PAPER" ? points(trade.edge) : "—"}</td>
-    <td><span class="status-pill ${String(trade.display_status || trade.status || "filled").toLowerCase()}">${String(trade.display_status || trade.status || trade.action || "FILLED").toUpperCase()}</span></td>
+    <td><span class="status-pill ${String(trade.display_status || trade.status || "filled").toLowerCase()}">${String(trade.display_status || trade.status || trade.action || "FILLED").toUpperCase()}${thresholdExitResultLabel(trade)}</span></td>
     <td class="${Number(trade.realized_pnl) > 0 ? "positive" : Number(trade.realized_pnl) < 0 ? "negative" : ""}">${trade.realized_pnl == null ? "--" : money(trade.realized_pnl)}</td>
     <td>${trade.available_cash_after == null ? "—" : money(trade.available_cash_after)}</td></tr>
   `; }).join("") : `<tr><td colspan="10" class="empty-state">No ${mode === "PAPER" ? "paper trades" : "confirmed fills"} yet.</td></tr>`;
   if (mode !== "PAPER") {
     const profitTake = data.profit_take_state || {};
     const stopState = data.stop_loss_state || {};
-    $("#protection-warning").textContent = `${stopState.warning || "Stop-loss execution requires the Kalshi Model to remain running and connected."} ${profitTake.warning || "Profit taking requires an armed, reconciled connection."}`;
+    const thresholdState = data.threshold_breach_exit_state || {};
+    $("#protection-warning").textContent = `${stopState.warning || "Stop-loss execution requires the Kalshi Model to remain running and connected."} ${profitTake.warning || "Profit taking requires an armed, reconciled connection."} ${thresholdState.warning || "Threshold Breach Exit uses the BTC proxy versus To Beat."}`;
     $("#position-table").innerHTML = (data.positions || []).length ? data.positions.map((position) => `
       <tr><td>${position.ticker}</td><td>${marketSideLabel(position.side)}</td><td>${position.contracts}</td>
       <td>${money(position.market_exposure)}</td><td>${position.stop_loss_price == null ? "Off" : cents(position.stop_loss_price)}</td>
-      <td>${profitTake.enabled === false ? "Off" : cents(profitTake.trigger_price ?? .99)}</td><td>${String(position.display_status || position.status).toUpperCase()}</td></tr>
-    `).join("") : '<tr><td colspan="7" class="empty-state">No unsettled positions.</td></tr>';
+      <td>${profitTake.enabled === false ? "Off" : cents(profitTake.trigger_price ?? .99)}</td>
+      <td class="threshold-breach-cell">${escapeHtml(thresholdBreachExitText(position.threshold_breach_exit || {}))}</td><td>${String(position.display_status || position.status).toUpperCase()}</td></tr>
+    `).join("") : '<tr><td colspan="8" class="empty-state">No unsettled positions.</td></tr>';
     $("#exchange-order-table").innerHTML = (data.orders || []).length ? data.orders.map((order) => `
       <tr><td>${shortDate(order.updated_at)}</td><td>${order.ticker}</td><td>${marketSideLabel(order.side)}</td><td>${order.action}</td>
       <td>${order.filled_contracts}</td><td>${order.remaining_contracts}</td><td>${cents(order.limit_price)}</td><td>${order.status}</td>

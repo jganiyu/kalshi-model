@@ -809,6 +809,28 @@ MIGRATIONS: list[tuple[int, str]] = [
         ALTER TABLE trade_review_points ADD COLUMN volume_signals_json TEXT;
         """,
     ),
+    (
+        16,
+        """
+        ALTER TABLE paper_entries ADD COLUMN threshold_breach_enabled INTEGER;
+        ALTER TABLE paper_entries ADD COLUMN threshold_exit_buffer REAL;
+        ALTER TABLE paper_entries ADD COLUMN threshold_exit_level REAL;
+        ALTER TABLE paper_entries ADD COLUMN threshold_trigger_btc_proxy REAL;
+        ALTER TABLE paper_entries ADD COLUMN threshold_trigger_threshold REAL;
+        ALTER TABLE paper_entries ADD COLUMN threshold_triggered_at TEXT;
+        ALTER TABLE paper_entries ADD COLUMN threshold_exit_status TEXT;
+        ALTER TABLE paper_entries ADD COLUMN threshold_exit_block_reason TEXT;
+
+        ALTER TABLE broker_positions ADD COLUMN threshold_breach_enabled INTEGER;
+        ALTER TABLE broker_positions ADD COLUMN threshold_exit_buffer REAL;
+        ALTER TABLE broker_positions ADD COLUMN threshold_exit_level REAL;
+        ALTER TABLE broker_positions ADD COLUMN threshold_trigger_btc_proxy REAL;
+        ALTER TABLE broker_positions ADD COLUMN threshold_trigger_threshold REAL;
+        ALTER TABLE broker_positions ADD COLUMN threshold_triggered_at TEXT;
+        ALTER TABLE broker_positions ADD COLUMN threshold_exit_status TEXT;
+        ALTER TABLE broker_positions ADD COLUMN threshold_exit_block_reason TEXT;
+        """,
+    ),
 ]
 
 

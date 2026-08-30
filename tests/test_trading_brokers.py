@@ -417,7 +417,7 @@ def test_additive_migration_preserves_existing_paper_history(tmp_path: Path) -> 
         )
     db.initialize()
     assert db.fetch_one("SELECT side FROM paper_trades WHERE ticker='OLD'")["side"] == "NO"
-    assert db.fetch_one("SELECT MAX(version) version FROM schema_migrations")["version"] == 15
+    assert db.fetch_one("SELECT MAX(version) version FROM schema_migrations")["version"] == 16
     assert db.fetch_one("SELECT COUNT(*) count FROM broker_order_intents")["count"] == 0
 
 
@@ -1346,7 +1346,7 @@ def test_broker_cash_migration_preserves_history_and_backfills_nearby_snapshot(
     )
     assert fill and fill["available_cash_after"] == pytest.approx(99.59)
     assert settlement and settlement["available_cash_after"] == pytest.approx(100.59)
-    assert db.fetch_one("SELECT MAX(version) version FROM schema_migrations")["version"] == 15
+    assert db.fetch_one("SELECT MAX(version) version FROM schema_migrations")["version"] == 16
 
 
 @run_async
@@ -1657,6 +1657,149 @@ def test_profit_take_thresholds_and_disabled_state() -> None:
     assert protective_exit_reason(
         position, 1.0, 30, {**settings, "global_profit_take_enabled": False}
     )[0] is None
+
+
+def test_threshold_breach_reason_is_side_aware_and_requires_reliable_data() -> None:
+    settings = {
+        "global_profit_take_enabled": False,
+        "threshold_breach_exit_enabled": True,
+        "threshold_breach_exit_buffer_dollars": 2.0,
+    }
+    assert protective_exit_reason(
+        {"side": "YES"}, .50, 30, settings,
+        btc_proxy=98.0, threshold=100.0, data_reliable=True,
+    )[0] == "THRESHOLD_BREACH_EXIT"
+    assert protective_exit_reason(
+        {"side": "NO"}, .50, 30, settings,
+        btc_proxy=102.0, threshold=100.0, data_reliable=True,
+    )[0] == "THRESHOLD_BREACH_EXIT"
+    assert protective_exit_reason(
+        {"side": "YES"}, .50, 30, settings,
+        btc_proxy=97.0, threshold=100.0, data_reliable=False,
+    )[0] is None
+
+
+@pytest.mark.parametrize(
+    ("mode", "side", "signed_position", "btc_proxy"),
+    [("DEMO", "YES", "4.00", 99.0), ("LIVE", "NO", "-4.00", 101.0)],
+)
+@run_async
+async def test_breached_exchange_position_uses_reduce_only_exit_once_after_arming(
+    tmp_path: Path,
+    mode: str,
+    side: str,
+    signed_position: str,
+    btc_proxy: float,
+) -> None:
+    db = make_db(tmp_path)
+    coordinator = TradingCoordinator(
+        AppConfig(database_path=db.path), db, PaperTradingService(db)
+    )
+    broker = coordinator.broker(mode)
+    assert isinstance(broker, KalshiBroker)
+    client = FakeTradingClient()
+    client.environment = mode
+    client.remote_positions = [{
+        "ticker": "BREACHED", "position_fp": signed_position,
+        "market_exposure_dollars": "2.00", "last_updated_ts": iso_now(),
+    }]
+    broker.set_client(client)  # type: ignore[arg-type]
+    await broker.reconcile()
+    db.update_settings({
+        "global_profit_take_enabled": False,
+        "threshold_breach_exit_enabled": True,
+        "threshold_breach_exit_buffer_dollars": 0.0,
+        f"{mode.lower()}_max_amount_per_order": 0.0,
+        f"{mode.lower()}_max_daily_order_count": 0,
+    })
+    current = {
+        "ticker": "BREACHED", "status": "active", "observed_at": iso_now(),
+        "time_remaining_seconds": 300, "yes_bid": .45, "no_bid": .55,
+        "btc_proxy": btc_proxy, "strike": 100.0,
+        "data_quality": {"reliable": True}, "exchange_index": 2,
+    }
+
+    await coordinator._process_exits(broker, current)
+    assert client.created == []
+    if mode == "LIVE":
+        db.execute(
+            "UPDATE broker_mode_state SET demo_verified_at=?,limits_reviewed_at=? "
+            "WHERE mode='LIVE'",
+            (iso_now(), iso_now()),
+        )
+        broker.arm(confirmation="ARM LIVE TRADING")
+    else:
+        broker.arm(confirmation="ARM DEMO TRADING")
+
+    await coordinator._process_exits(broker, current)
+    await asyncio.gather(*list(coordinator._submission_tasks))
+    assert len(client.created) == 1
+    assert client.created[0]["action"] == "SELL"
+    assert client.created[0]["side"] == side
+    assert client.created[0]["contracts"] == 4
+    assert client.created[0]["reduce_only"] is True
+    intent = db.fetch_one(
+        "SELECT * FROM broker_order_intents WHERE mode=? AND ticker='BREACHED'",
+        (mode,),
+    )
+    assert intent and intent["source"] == "threshold_breach_exit"
+    evidence = json.loads(intent["decision_snapshot_json"])
+    assert evidence["trigger"] == "THRESHOLD_BREACH_EXIT"
+    assert evidence["threshold_trigger_btc_proxy"] == btc_proxy
+    assert evidence["threshold_trigger_threshold"] == 100.0
+    position = db.fetch_one(
+        "SELECT * FROM broker_positions WHERE mode=? AND ticker='BREACHED'",
+        (mode,),
+    )
+    assert position and position["threshold_exit_status"] == "Exit pending"
+    displayed = coordinator.summary(current)["modes"][mode]["positions"][0][
+        "threshold_breach_exit"
+    ]
+    assert displayed["status"] == "Exit pending"
+    assert displayed["exit_level"] == 100.0
+    assert displayed["btc_proxy"] == btc_proxy
+
+    await coordinator._process_exits(broker, current)
+    await asyncio.gather(*list(coordinator._submission_tasks))
+    assert len(client.created) == 1
+
+
+@run_async
+async def test_rejected_threshold_exit_records_blocked_reason(tmp_path: Path) -> None:
+    db = make_db(tmp_path)
+    coordinator = TradingCoordinator(
+        AppConfig(database_path=db.path), db, PaperTradingService(db)
+    )
+    broker = coordinator.broker("DEMO")
+    assert isinstance(broker, KalshiBroker)
+    client = FakeTradingClient()
+    client.remote_positions = [{
+        "ticker": "BLOCKED-EXIT", "position_fp": "2.00",
+        "market_exposure_dollars": "1.00", "last_updated_ts": iso_now(),
+    }]
+    broker.set_client(client)  # type: ignore[arg-type]
+    await broker.reconcile()
+    broker.arm(confirmation="ARM DEMO TRADING")
+    client.reject_sells = True
+    db.update_settings({"global_profit_take_enabled": False})
+    await coordinator._process_exits(
+        broker,
+        {
+            "ticker": "BLOCKED-EXIT", "status": "active",
+            "observed_at": iso_now(), "time_remaining_seconds": 300,
+            "yes_bid": .45, "no_bid": .55, "btc_proxy": 99.0,
+            "strike": 100.0, "data_quality": {"reliable": True},
+        },
+    )
+    await asyncio.gather(*list(coordinator._submission_tasks))
+    position = db.fetch_one(
+        "SELECT threshold_exit_status,threshold_exit_block_reason "
+        "FROM broker_positions WHERE ticker='BLOCKED-EXIT'"
+    )
+    assert position == {
+        "threshold_exit_status": "Blocked",
+        "threshold_exit_block_reason": "invalid order",
+    }
 
 
 @run_async
