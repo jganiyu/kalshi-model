@@ -6,8 +6,8 @@ A local macOS research and trading app for Kalshi's 15-minute Bitcoin Up or Down
 
 <table>
   <tr>
-    <td width="50%"><img src="docs/screenshots/dashboard-mvi-light-20260829.jpg" alt="Kalshi Model dashboard with the Margin Volatility chart and Standard Edge HUD in light mode"></td>
-    <td width="50%"><img src="docs/screenshots/dashboard-mvi-dark-20260829.jpg" alt="Kalshi Model dashboard with the Margin Volatility chart and Standard Edge HUD in dark mode"></td>
+    <td width="50%"><img src="docs/screenshots/dashboard-open-trades-light-20260830.jpg" alt="Kalshi Model dashboard with Open Trades, Standard Edge, and Up and Down order books in light mode"></td>
+    <td width="50%"><img src="docs/screenshots/dashboard-open-trades-dark-20260830.jpg" alt="Kalshi Model dashboard with Open Trades, Standard Edge, and Up and Down order books in dark mode"></td>
   </tr>
   <tr>
     <td align="center"><strong>Light</strong></td>
@@ -17,7 +17,7 @@ A local macOS research and trading app for Kalshi's 15-minute Bitcoin Up or Down
 
 ## Features
 
-- **Dashboard:** Live BTC proxy, outcome forecast, Standard Edge HUD, margin volatility, positions, and manual controls.
+- **Dashboard:** Live BTC proxy, outcome forecast, Open Trades, Standard Edge HUD, dual order books, and recent trades.
 - **BTC proxy:** Median Coinbase, Kraken, and Bitstamp price with learned BRTI uncertainty.
 - **Three modes:** Paper, isolated Kalshi Demo, and deliberately armed Kalshi Live.
 - **Mobile Monitor:** Read-only HUD, market metrics, and recent trades on iPhone through Tailscale.
