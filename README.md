@@ -22,7 +22,7 @@ A local macOS research and trading app for Kalshi's 15-minute Bitcoin Up or Down
 - **Three modes:** Paper, isolated Kalshi Demo, and deliberately armed Kalshi Live.
 - **Mobile Monitor:** Read-only HUD, market metrics, and recent trades on iPhone through Tailscale.
 - **Strategies:** Standard Edge, Early Threshold, Late Conviction, and Swing.
-- **Calibration:** Tune strategies, exits, allocation, and mode-specific hard limits.
+- **Calibration:** Tune strategies and review probability, volatility, and volume evidence.
 - **Trade review:** Expand a settled trade to replay its BTC, probability, MVI, readiness, and execution history.
 - **Local data:** Settings, evidence, trades, review snapshots, reports, and backups stay in SQLite on your Mac.
 
@@ -92,6 +92,19 @@ It combines live Bitcoin prices, threshold distance, time, volatility, momentum,
 - **Uncertain:** Between 40% and 60%.
 - **Likely Down:** 40% or lower.
 
+### Volume signals — shadow phase
+
+Volume does not add a fixed probability bonus. The model learns whether each input improves settled-contract forecasts:
+
+- **Relative volume:** Compares one- and five-minute activity with normal activity; it measures conviction, not direction by itself.
+- **Signed BTC flow and CVD:** Tracks buyer- versus seller-initiated Coinbase and Kraken volume; buying pressure can support Up and selling pressure can support Down.
+- **Volume-confirmed momentum:** Gives more weight to directional price moves backed by participation and less to quiet moves.
+- **VWAP position:** Measures whether the BTC proxy is above or below its recent volume-weighted average, supporting Up or Down accordingly.
+- **Kalshi flow and turnover:** Tracks aggressive Up/Down trades and activity relative to open interest; agreement with BTC flow can reinforce a forecast, while disagreement can weaken it.
+- **Context and data quality:** Interprets volume alongside time remaining, threshold distance, volatility, and settlement progress; missing or conflicting feeds remain unavailable instead of becoming false evidence.
+
+These inputs are **shadow-only for now**. They are recorded and tested without changing the live probability until enough settled data shows better out-of-sample Brier score and calibration.
+
 ### Trade assessment
 
 It then compares that probability with the selected Buy or Sell price after fees and slippage; a likely outcome can still be overpriced.
@@ -152,7 +165,7 @@ Stop-losses and the global profit take are app-managed in Demo and Live. They wo
 </table>
 
 - Click a settled trade to open its full 15-minute review directly in the ledger.
-- Move across the chart for saved price, probability, MVI, EV, readiness, and data-quality readings.
+- Move across the chart for saved price, probability, MVI, volume flow, EV, readiness, and data-quality readings.
 - Entry, exit, and settlement markers explain when the position changed; recording gaps stay visible.
 - Reviews are recorded only for traded markets; open and legacy trades do not invent history.
 

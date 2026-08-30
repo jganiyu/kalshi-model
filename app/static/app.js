@@ -1582,6 +1582,24 @@ function renderCalibrationResults(data) {
   $("#mvi-evidence").innerHTML = evidenceBuckets.length
     ? `${evidenceBuckets.map((bucket) => `<div class="mvi-evidence-row"><strong>${bucket.label}</strong><span>${bucket.entries} entries</span><span>${bucket.settled} settled</span><span>${bucket.win_rate == null ? "--" : percent(bucket.win_rate, 0)} · ${money(bucket.realized_pnl || 0)}</span></div>`).join("")}<p class="mvi-evidence-note">${volatilityReport.guidance || "Sample sizes are shown before any limit is considered."}</p>`
     : `<p class="empty-state">${volatilityReport.guidance || "No reliable observations yet."}</p>`;
+  const volumeReport = data.volume_signal_report || {};
+  const volumeCurrent = volumeReport.current || {};
+  const volumeMetrics = volumeCurrent.metrics || {};
+  const volumeCandidate = volumeReport.candidate?.validation?.candidate
+    || volumeReport.candidate?.validation?.candidate_metrics || null;
+  const volumeContributions = volumeReport.active_volume_contributions || {};
+  $("#volume-signals-subtitle").textContent = `${String(volumeCurrent.status || "Unavailable").replaceAll("_", " ")} · ${volumeCurrent.availability || "shadow-only"}`;
+  const volumeRows = [
+    ["Relative volume", `${volumeMetrics.btc_rvol_1m == null ? "--" : Number(volumeMetrics.btc_rvol_1m).toFixed(2)} / ${volumeMetrics.btc_rvol_5m == null ? "--" : Number(volumeMetrics.btc_rvol_5m).toFixed(2)} · 1m / 5m`],
+    ["Signed BTC flow", `${percent(volumeMetrics.btc_flow_imbalance_1m, 1, true)} / ${percent(volumeMetrics.btc_flow_imbalance_5m, 1, true)}`],
+    ["Momentum confirmation", `${volumeMetrics.btc_volume_confirmation_1m == null ? "--" : Number(volumeMetrics.btc_volume_confirmation_1m).toFixed(5)} / ${volumeMetrics.btc_volume_confirmation_5m == null ? "--" : Number(volumeMetrics.btc_volume_confirmation_5m).toFixed(5)}`],
+    ["VWAP distance", `${percent(volumeMetrics.btc_vwap_distance_1m, 3, true)} / ${percent(volumeMetrics.btc_vwap_distance_5m, 3, true)}`],
+    ["Kalshi flow / turnover", `${percent(volumeMetrics.kalshi_flow_imbalance_1m, 1, true)} / ${percent(volumeMetrics.kalshi_turnover_5m, 2)}`],
+    ["Data / venue agreement", `${percent(volumeCurrent.data_completeness, 0)} / ${volumeCurrent.venue_agreement == null ? "--" : percent(volumeCurrent.venue_agreement, 0)}`],
+    ["Active volume inputs", Object.keys(volumeContributions).length ? `${Object.keys(volumeContributions).length} learned inputs` : "Shadow only"],
+    ["Shadow validation", volumeCandidate?.brier_score == null ? "Collecting settled samples" : `Brier ${Number(volumeCandidate.brier_score).toFixed(3)} · n=${volumeCandidate.validation_samples || 0}`],
+  ];
+  $("#volume-signals-evidence").innerHTML = `${volumeRows.map(([label, value]) => `<div class="volume-signal-row"><span>${label}</span><strong>${value}</strong></div>`).join("")}<p class="volume-signal-note">${escapeHtml(volumeCurrent.message || volumeReport.audit?.finding || "Volume inputs activate only after out-of-sample review.")}</p>`;
   const buckets = summary.buckets || [];
   $("#calibration-bars").innerHTML = buckets.length ? buckets.map((bucket) => `
     <div class="bucket">
@@ -1668,6 +1686,8 @@ function reviewMetricContent(point) {
   const assessments = snapshot.trade_assessments || {};
   const readiness = snapshot.standard_edge_readiness || {};
   const quality = snapshot.data_quality || {};
+  const volume = snapshot.volume_signals || {};
+  const volumeMetrics = volume.metrics || {};
   const selectedSide = state.tradeReview.data?.trade?.side || readiness.side || "YES";
   const selected = assessments[selectedSide] || {};
   const selectedBuy = selected.buy || {};
@@ -1685,6 +1705,9 @@ function reviewMetricContent(point) {
     <div><span>Forecast</span><strong>${escapeHtml(String(point?.forecast_signal || "--").replaceAll("_", " "))}</strong></div>
     <div><span>${marketSideLabel(selectedSide)} executable / EV</span><strong>${selectedBuy.executable_price == null ? "--" : cents(selectedBuy.executable_price)} / ${selectedBuy.expected_value == null ? "--" : cents(selectedBuy.expected_value)}</strong></div>
     <div><span>MVI / expected / cushion</span><strong>${point?.mvi == null ? "--" : Number(point.mvi).toFixed(2)} / ${point?.expected_remaining_move == null ? "--" : money(point.expected_remaining_move)} / ${point?.cushion_ratio == null ? "--" : Number(point.cushion_ratio).toFixed(2)}</strong></div>
+    <div><span>RVOL 1m / 5m</span><strong>${volumeMetrics.btc_rvol_1m == null ? "--" : Number(volumeMetrics.btc_rvol_1m).toFixed(2)} / ${volumeMetrics.btc_rvol_5m == null ? "--" : Number(volumeMetrics.btc_rvol_5m).toFixed(2)}</strong></div>
+    <div><span>BTC / Kalshi flow</span><strong>${percent(volumeMetrics.btc_flow_imbalance_1m, 1, true)} / ${percent(volumeMetrics.kalshi_flow_imbalance_1m, 1, true)}</strong></div>
+    <div><span>VWAP distance / volume data</span><strong>${percent(volumeMetrics.btc_vwap_distance_1m, 3, true)} / ${percent(volume.data_completeness, 0)}</strong></div>
     <div><span>Spread / liquidity</span><strong>${point ? `${cents(point.spread)} / ${compact(point.liquidity)}` : "--"}</strong></div>
     <div class="wide"><span>Data / gates</span><strong>${quality.reliable ? "Reliable" : "Blocked"} · ${escapeHtml(gateSummary)}</strong></div>
     <div class="wide"><span>Readiness / blocker</span><strong>${escapeHtml(readiness.status || "--")} · ${escapeHtml(readiness.blocker || "--")}</strong></div>`;
@@ -1699,6 +1722,8 @@ function reviewTooltipContent(point) {
   const assessment = assessments[side] || {};
   const buy = assessment.buy || {};
   const forecast = snapshot.forecast || {};
+  const volume = snapshot.volume_signals || {};
+  const volumeMetrics = volume.metrics || {};
   const gateSummary = Object.entries(readiness.gates || {})
     .map(([name, detail]) => `<span class="${detail?.passed ? "pass" : "fail"}">${escapeHtml(name.replaceAll("_", " "))}</span>`)
     .join("");
@@ -1711,6 +1736,9 @@ function reviewTooltipContent(point) {
       <div><dt>Forecast</dt><dd>${escapeHtml(String(point.forecast_signal || "--").replaceAll("_", " "))}</dd></div>
       <div><dt>${marketSideLabel(side)} executable / EV</dt><dd>${buy.executable_price == null ? "--" : cents(buy.executable_price)} / ${buy.expected_value == null ? "--" : cents(buy.expected_value)}</dd></div>
       <div><dt>MVI / expected / cushion</dt><dd>${point.mvi == null ? "--" : Number(point.mvi).toFixed(2)} / ${point.expected_remaining_move == null ? "--" : money(point.expected_remaining_move)} / ${point.cushion_ratio == null ? "--" : Number(point.cushion_ratio).toFixed(2)}</dd></div>
+      <div><dt>RVOL 1m / 5m</dt><dd>${volumeMetrics.btc_rvol_1m == null ? "--" : Number(volumeMetrics.btc_rvol_1m).toFixed(2)} / ${volumeMetrics.btc_rvol_5m == null ? "--" : Number(volumeMetrics.btc_rvol_5m).toFixed(2)}</dd></div>
+      <div><dt>BTC / Kalshi flow</dt><dd>${percent(volumeMetrics.btc_flow_imbalance_1m, 1, true)} / ${percent(volumeMetrics.kalshi_flow_imbalance_1m, 1, true)}</dd></div>
+      <div><dt>VWAP distance / volume data</dt><dd>${percent(volumeMetrics.btc_vwap_distance_1m, 3, true)} / ${percent(volume.data_completeness, 0)}</dd></div>
       <div><dt>Spread / liquidity</dt><dd>${cents(point.spread)} / ${compact(point.liquidity)}</dd></div>
       <div><dt>Data quality</dt><dd>${snapshot.data_quality?.reliable ? "Reliable" : "Blocked"}</dd></div>
     </dl><div class="trade-review-tooltip-gates">${gateSummary}</div><p>${escapeHtml(readiness.blocker || "No blocker recorded.")}</p>`;

@@ -730,6 +730,85 @@ MIGRATIONS: list[tuple[int, str]] = [
             ON trade_review_links(environment,ticker,opened_at);
         """,
     ),
+    (
+        15,
+        """
+        CREATE TABLE btc_volume_observations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            observed_at TEXT NOT NULL,
+            exchange TEXT NOT NULL,
+            cumulative_volume REAL,
+            price REAL,
+            source_window TEXT NOT NULL DEFAULT 'rolling_24h',
+            valid INTEGER NOT NULL DEFAULT 1,
+            reason TEXT,
+            UNIQUE(exchange, observed_at)
+        );
+        CREATE INDEX idx_btc_volume_exchange_time
+            ON btc_volume_observations(exchange, observed_at);
+
+        CREATE TABLE btc_trade_ticks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            observed_at TEXT NOT NULL,
+            exchange TEXT NOT NULL,
+            trade_id TEXT NOT NULL,
+            price REAL NOT NULL,
+            size REAL NOT NULL,
+            taker_side TEXT NOT NULL CHECK(taker_side IN ('BUY','SELL')),
+            signed_size REAL NOT NULL,
+            raw_json TEXT NOT NULL DEFAULT '{}',
+            UNIQUE(exchange, trade_id)
+        );
+        CREATE INDEX idx_btc_trade_ticks_time
+            ON btc_trade_ticks(observed_at, exchange);
+
+        CREATE TABLE kalshi_trade_ticks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            observed_at TEXT NOT NULL,
+            ticker TEXT NOT NULL,
+            trade_id TEXT NOT NULL,
+            price REAL,
+            contracts REAL NOT NULL,
+            taker_side TEXT CHECK(taker_side IN ('YES','NO')),
+            is_block_trade INTEGER NOT NULL DEFAULT 0,
+            raw_json TEXT NOT NULL DEFAULT '{}',
+            UNIQUE(ticker, trade_id)
+        );
+        CREATE INDEX idx_kalshi_trade_ticks_ticker_time
+            ON kalshi_trade_ticks(ticker, observed_at);
+
+        CREATE TABLE volume_signal_snapshots (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            observed_at TEXT NOT NULL,
+            ticker TEXT,
+            status TEXT NOT NULL,
+            calculation_version TEXT NOT NULL,
+            data_completeness REAL NOT NULL DEFAULT 0,
+            venue_agreement REAL,
+            btc_rvol_1m REAL,
+            btc_rvol_5m REAL,
+            btc_flow_imbalance_1m REAL,
+            btc_flow_imbalance_5m REAL,
+            btc_cvd_slope_1m REAL,
+            btc_cvd_slope_5m REAL,
+            btc_volume_confirmation_1m REAL,
+            btc_volume_confirmation_5m REAL,
+            btc_vwap_distance_1m REAL,
+            btc_vwap_distance_5m REAL,
+            btc_vwap_z_1m REAL,
+            btc_vwap_z_5m REAL,
+            kalshi_flow_imbalance_1m REAL,
+            kalshi_turnover_5m REAL,
+            kalshi_turnover_change REAL,
+            btc_kalshi_flow_agreement REAL,
+            values_json TEXT NOT NULL DEFAULT '{}'
+        );
+        CREATE INDEX idx_volume_signal_snapshots_time
+            ON volume_signal_snapshots(observed_at, ticker);
+
+        ALTER TABLE trade_review_points ADD COLUMN volume_signals_json TEXT;
+        """,
+    ),
 ]
 
 

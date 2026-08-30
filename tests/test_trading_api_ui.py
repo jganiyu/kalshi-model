@@ -100,6 +100,9 @@ def test_trading_ui_contains_mode_safety_and_confirmation_controls() -> None:
     assert "Settle margin" in template
     assert "threshold_margin_gate_dollars" in script
     assert "$$('[data-arm-session]')" in script
+    assert 'id="volume-signals-evidence"' in template
+    assert "volume_signal_report" in script
+    assert "RVOL 1m / 5m" in script
 
 
 def test_private_stream_accepts_current_singular_event_types() -> None:

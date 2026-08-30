@@ -460,6 +460,7 @@ async def calibration() -> dict[str, Any]:
             "strategy_results", {}
         ),
         "margin_volatility_report": engine.margin_volatility.report(mode),
+        "volume_signal_report": engine.volume_signals.report(engine.models.active()),
         "reports": report_rows(db),
         "configuration_snapshots": db.configuration_snapshots(),
     }
@@ -766,6 +767,8 @@ async def database_info() -> dict[str, Any]:
         "margin_volatility_observations",
         "trade_review_sessions", "trade_review_points", "trade_review_events",
         "trade_review_links",
+        "btc_volume_observations", "btc_trade_ticks", "kalshi_trade_ticks",
+        "volume_signal_snapshots",
     ):
         counts[table] = db.fetch_one(f"SELECT COUNT(*) AS count FROM {table}")["count"]
     return {

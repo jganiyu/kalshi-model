@@ -124,6 +124,7 @@ class TradeReviewService:
             "data_quality": quality,
             "standard_edge_readiness": readiness,
             "margin_volatility": mvi,
+            "volume_signals": current.get("volume_signals") or {},
             "settlement_window": current.get("settlement_window") or {},
             "benchmark_uncertainty_dollars": current.get(
                 "benchmark_uncertainty_dollars"
@@ -165,6 +166,11 @@ class TradeReviewService:
             "readiness_blocker": readiness.get("blocker"),
             "model_version": current.get("model_version"),
             "configuration_snapshot_id": self._configuration_snapshot_id(),
+            "volume_signals_json": json.dumps(
+                current.get("volume_signals") or {},
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
             "state_json": json.dumps(state, sort_keys=True, separators=(",", ":")),
         }
 
@@ -292,6 +298,7 @@ class TradeReviewService:
             point.get("readiness_status"), point.get("readiness_side"),
             point.get("readiness_blocker"), point.get("model_version"),
             point.get("configuration_snapshot_id"), point["state_json"],
+            point.get("volume_signals_json"),
         )
 
     def _insert_points(
@@ -305,8 +312,8 @@ class TradeReviewService:
                 open_interest,volume,up_probability,forecast_signal,mvi,
                 expected_remaining_move,cushion_ratio,data_reliable,
                 readiness_status,readiness_side,readiness_blocker,model_version,
-                configuration_snapshot_id,state_json
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                configuration_snapshot_id,state_json,volume_signals_json
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             [self._point_params(session_id, point, kind) for point in points],
         )

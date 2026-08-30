@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -16,7 +17,7 @@ from app.domain import (
 )
 
 
-FEATURE_NAMES = [
+LEGACY_FEATURE_NAMES = [
     "z_distance",
     "time_fraction",
     "volatility_5m",
@@ -32,6 +33,38 @@ FEATURE_NAMES = [
     "benchmark_uncertainty_pct",
 ]
 
+# Retained as the public legacy schema name. Existing promoted models keep using
+# the feature_names stored in their own parameters.
+FEATURE_NAMES = LEGACY_FEATURE_NAMES
+
+VOLUME_FEATURE_GROUPS = {
+    "btc_relative_volume": ["btc_rvol_1m", "btc_rvol_5m"],
+    "signed_order_flow": [
+        "btc_flow_imbalance_1m", "btc_flow_imbalance_5m",
+        "btc_cvd_slope_1m", "btc_cvd_slope_5m",
+    ],
+    "volume_confirmed_momentum": [
+        "btc_volume_confirmation_1m", "btc_volume_confirmation_5m",
+    ],
+    "vwap_position": [
+        "btc_vwap_distance_1m", "btc_vwap_distance_5m",
+        "btc_vwap_z_1m", "btc_vwap_z_5m",
+    ],
+    "kalshi_flow_turnover": [
+        "kalshi_flow_imbalance_1m", "kalshi_turnover_5m",
+        "kalshi_turnover_change", "btc_kalshi_flow_agreement",
+    ],
+    "context_interactions": [
+        "volume_time_interaction", "volume_margin_interaction",
+        "volume_volatility_interaction", "volume_settlement_interaction",
+    ],
+    "missingness": ["btc_volume_missing", "kalshi_volume_missing"],
+}
+VOLUME_FEATURE_NAMES = [
+    *LEGACY_FEATURE_NAMES,
+    *[name for group in VOLUME_FEATURE_GROUPS.values() for name in group],
+]
+
 MIN_CANDIDATE_OBSERVATIONS = 12
 MIN_PROMOTION_OBSERVATIONS = 120
 MIN_PROMOTION_DAYS = 7
@@ -40,9 +73,11 @@ MIN_BRIER_IMPROVEMENT = 0.005
 MAX_CALIBRATION_ERROR_REGRESSION = 0.01
 
 
-def feature_vector(features: dict[str, Any]) -> list[float]:
+def feature_vector(
+    features: dict[str, Any], feature_names: list[str] | None = None
+) -> list[float]:
     values = []
-    for name in FEATURE_NAMES:
+    for name in feature_names or FEATURE_NAMES:
         value = features.get(name, 0.0)
         values.append(float(value) if value is not None else 0.0)
     return values
@@ -54,7 +89,8 @@ def sigmoid(values: np.ndarray) -> np.ndarray:
 
 
 def fit_logistic(
-    x: np.ndarray, y: np.ndarray, regularization: float = 0.2, iterations: int = 1200
+    x: np.ndarray, y: np.ndarray, regularization: float = 0.2, iterations: int = 1200,
+    feature_names: list[str] | None = None,
 ) -> dict[str, Any]:
     mean = x.mean(axis=0)
     scale = x.std(axis=0)
@@ -69,7 +105,7 @@ def fit_logistic(
         gradient[1:] += regularization * weights[1:] / len(y)
         weights -= (learning_rate / (1.0 + step / 800.0)) * gradient
     return {
-        "feature_names": FEATURE_NAMES,
+        "feature_names": feature_names or FEATURE_NAMES,
         "mean": mean.tolist(),
         "scale": scale.tolist(),
         "intercept": float(weights[0]),
@@ -79,12 +115,78 @@ def fit_logistic(
 
 
 def predict_logistic(parameters: dict[str, Any], features: dict[str, Any]) -> float:
-    vector = np.asarray(feature_vector(features), dtype=float)
+    names = list(parameters.get("feature_names") or FEATURE_NAMES)
+    vector = np.asarray(feature_vector(features, names), dtype=float)
     mean = np.asarray(parameters["mean"], dtype=float)
     scale = np.asarray(parameters["scale"], dtype=float)
     coefficients = np.asarray(parameters["coefficients"], dtype=float)
     score = float(parameters["intercept"]) + float(((vector - mean) / scale) @ coefficients)
     return clamp(float(sigmoid(np.asarray([score]))[0]), 0.01, 0.99)
+
+
+def logarithmic_loss(predictions: list[tuple[float, int]]) -> float | None:
+    if not predictions:
+        return None
+    return -sum(
+        result * math.log(clamp(probability, 1e-9, 1 - 1e-9))
+        + (1 - result) * math.log(clamp(1 - probability, 1e-9, 1 - 1e-9))
+        for probability, result in predictions
+    ) / len(predictions)
+
+
+def walk_forward_evaluation(
+    observations: list[dict[str, Any]], feature_names: list[str]
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    if len(observations) < 12:
+        return None, None
+    x = np.asarray(
+        [feature_vector(row["features"], feature_names) for row in observations],
+        dtype=float,
+    )
+    y = np.asarray([row["result"] for row in observations], dtype=float)
+    minimum_train = max(8, len(observations) // 3)
+    predictions: list[tuple[float, int]] = []
+    for index in range(minimum_train, len(observations)):
+        fold = fit_logistic(
+            x[:index], y[:index], iterations=600, feature_names=feature_names
+        )
+        predictions.append(
+            (predict_logistic(fold, observations[index]["features"]), int(y[index]))
+        )
+    metrics = calibration_metrics(predictions)
+    metrics["log_loss"] = logarithmic_loss(predictions)
+    metrics["validation_samples"] = len(predictions)
+    if predictions:
+        errors = [(probability - result) ** 2 for probability, result in predictions]
+        if len(errors) > 1:
+            metrics["brier_standard_error"] = float(np.std(errors, ddof=1) / math.sqrt(len(errors)))
+    scored = observations[minimum_train:]
+
+    def sliced(labels: list[tuple[str, Any]]) -> dict[str, Any]:
+        return {
+            label: calibration_metrics(
+                predictions[index]
+                for index, row in enumerate(scored)
+                if predicate(row)
+            )
+            for label, predicate in labels
+        }
+
+    metrics["by_time_remaining"] = sliced(
+        [
+            ("10-15m", lambda row: float(row["features"].get("time_fraction", 0)) > 2 / 3),
+            ("5-10m", lambda row: 1 / 3 < float(row["features"].get("time_fraction", 0)) <= 2 / 3),
+            ("0-5m", lambda row: float(row["features"].get("time_fraction", 0)) <= 1 / 3),
+        ]
+    )
+    metrics["by_threshold_margin"] = sliced(
+        [
+            ("under-$25", lambda row: abs(float(row["features"].get("threshold_margin_dollars", 0))) < 25),
+            ("$25-$50", lambda row: 25 <= abs(float(row["features"].get("threshold_margin_dollars", 0))) < 50),
+            ("$50+", lambda row: abs(float(row["features"].get("threshold_margin_dollars", 0))) >= 50),
+        ]
+    )
+    return metrics, fit_logistic(x, y, feature_names=feature_names)
 
 
 class ModelManager:
@@ -103,11 +205,15 @@ class ModelManager:
 
     def predict(self, features: dict[str, Any], baseline_probability: float) -> tuple[float, str]:
         model = self.active()
-        if (
-            model.get("model_type") == "regularized-logistic"
-            and model.get("parameters", {}).get("feature_names") == FEATURE_NAMES
-        ):
-            return predict_logistic(model["parameters"], features), str(model["version"])
+        if model.get("model_type") == "regularized-logistic":
+            parameters = model.get("parameters", {})
+            names = parameters.get("feature_names")
+            coefficients = parameters.get("coefficients")
+            if (
+                isinstance(names, list) and isinstance(coefficients, list)
+                and len(names) == len(coefficients)
+            ):
+                return predict_logistic(parameters, features), str(model["version"])
         return baseline_probability, str(model.get("version", "baseline-1.1"))
 
     def benchmark_calibration(self, limit: int | None = None) -> dict[str, Any]:
@@ -227,6 +333,12 @@ class ModelManager:
         promotion_data_eligible = False
         parameters: dict[str, Any] | None = None
         validation_predictions: list[tuple[float, int]] = []
+        volume_shadow: dict[str, Any] = {
+            "status": "collecting",
+            "sample_size": 0,
+            "feature_schema": "volume-signals-1",
+            "promoted": False,
+        }
 
         minimum_candidate = int(settings.get("training_min_samples", MIN_CANDIDATE_OBSERVATIONS))
         minimum_promotion = int(settings.get("promotion_min_samples", MIN_PROMOTION_OBSERVATIONS))
@@ -323,6 +435,96 @@ class ModelManager:
                     (candidate_version,),
                 )
 
+        volume_observations = [
+            row for row in training_observations
+            if "btc_volume_missing" in row["features"]
+            and float(row["features"].get("btc_volume_missing", 1.0)) < 0.5
+        ]
+        volume_shadow["sample_size"] = len(volume_observations)
+        if len(volume_observations) >= minimum_candidate:
+            combined_metrics, shadow_parameters = walk_forward_evaluation(
+                volume_observations, VOLUME_FEATURE_NAMES
+            )
+            if combined_metrics and shadow_parameters:
+                shadow_parameters["feature_schema_version"] = "volume-signals-1"
+                ablations: dict[str, Any] = {}
+                base_metrics, _ = walk_forward_evaluation(
+                    volume_observations, LEGACY_FEATURE_NAMES
+                )
+                ablations["existing_model_inputs"] = base_metrics
+                for group, names in VOLUME_FEATURE_GROUPS.items():
+                    metrics, _ = walk_forward_evaluation(
+                        volume_observations, [*LEGACY_FEATURE_NAMES, *names]
+                    )
+                    ablations[group] = metrics
+                feature_completeness = {
+                    name: sum(
+                        1 for row in volume_observations
+                        if row["features"].get(name) is not None
+                        and not (
+                            (name.startswith("kalshi_") or name.startswith("btc_kalshi_"))
+                            and float(row["features"].get("kalshi_volume_missing", 1)) >= .5
+                        )
+                        and not (
+                            name.startswith("btc_")
+                            and not name.startswith("btc_kalshi_")
+                            and float(row["features"].get("btc_volume_missing", 1)) >= .5
+                        )
+                    ) / len(volume_observations)
+                    for name in VOLUME_FEATURE_NAMES
+                    if name not in LEGACY_FEATURE_NAMES
+                }
+                minimum_train = max(8, len(volume_observations) // 3)
+                incumbent_same_window = calibration_metrics(
+                    (row["model_probability"], row["result"])
+                    for row in volume_observations[minimum_train:]
+                )
+                shadow_version = (
+                    f"volume-shadow-{datetime.now(UTC).strftime('%Y%m%d-%H%M%S-%f')}"
+                )
+                validation = {
+                    "candidate": combined_metrics,
+                    "incumbent_same_window": incumbent_same_window,
+                    "ablations": ablations,
+                    "feature_completeness": feature_completeness,
+                    "method": (
+                        "Contract-level, time-ordered expanding-window validation; "
+                        "normalization and training use earlier contracts only."
+                    ),
+                    "promotion": (
+                        "Shadow only. Review is required before this feature schema can "
+                        "become active."
+                    ),
+                }
+                self.db.execute(
+                    """
+                    INSERT INTO model_versions(
+                        version,created_at,model_type,status,training_samples,
+                        validation_json,parameters_json,promoted_at,parent_version
+                    ) VALUES (?,?,?,?,?,?,?,?,?)
+                    """,
+                    (
+                        shadow_version, iso_now(), "regularized-logistic", "shadow",
+                        len(volume_observations), json.dumps(validation),
+                        json.dumps(shadow_parameters), None, self.active()["version"],
+                    ),
+                )
+                volume_shadow = {
+                    "status": "validated-shadow",
+                    "version": shadow_version,
+                    "sample_size": len(volume_observations),
+                    "feature_schema": "volume-signals-1",
+                    "candidate": combined_metrics,
+                    "incumbent_same_window": incumbent_same_window,
+                    "ablations": ablations,
+                    "feature_completeness": feature_completeness,
+                    "candidate_coefficients": dict(
+                        zip(VOLUME_FEATURE_NAMES, shadow_parameters["coefficients"])
+                    ),
+                    "promoted": False,
+                    "review_required": True,
+                }
+
         active = self.active()
         if n == 0:
             tldr = "No settled live observations yet. The analytical cold-start model remains active."
@@ -361,6 +563,7 @@ class ModelManager:
             "candidate_model": candidate_version,
             "feature_names": FEATURE_NAMES,
             "candidate_coefficients": parameters.get("coefficients") if parameters else None,
+            "volume_shadow": volume_shadow,
             "validation": (
                 "Rolling-window expanding, one-step-forward; no future rows enter a "
                 "training fold."
@@ -377,6 +580,7 @@ class ModelManager:
                 "Historical bootstrap uses Coinbase spot as a documented proxy for CF Benchmarks BRTI.",
                 "Kalshi historical order-book depth is not available from market candlesticks.",
                 "Probability buckets with small samples should be treated as descriptive only.",
+                "Volume features remain shadow-only until an explicit review approves promotion.",
             ],
             "signal_snapshot_ids": [row["id"] for row in training_observations],
         }

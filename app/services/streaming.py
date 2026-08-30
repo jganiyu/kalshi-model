@@ -16,13 +16,14 @@ from cryptography.hazmat.primitives.asymmetric import padding, rsa
 from websockets.asyncio.client import connect
 
 from app.services.kalshi import orderbook_metrics
-from app.services.market_data import ExchangeQuote
+from app.services.market_data import ExchangeQuote, ExchangeTrade
 
 
 logger = logging.getLogger(__name__)
 TLS_CONTEXT = ssl.create_default_context(cafile=certifi.where())
 
 QuoteHandler = Callable[[ExchangeQuote], Awaitable[None]]
+TradeHandler = Callable[[ExchangeTrade], Awaitable[None]]
 StatusHandler = Callable[[str, bool, str | None], Awaitable[None]]
 KalshiHandler = Callable[[dict[str, Any], dict[str, Any] | None], Awaitable[None]]
 PrivateKalshiHandler = Callable[[dict[str, Any]], Awaitable[None]]
@@ -124,9 +125,13 @@ class BitcoinWebSocketFeeds:
     coinbase_url = "wss://ws-feed.exchange.coinbase.com"
     kraken_url = "wss://ws.kraken.com/v2"
 
-    def __init__(self, on_quote: QuoteHandler, on_status: StatusHandler):
+    def __init__(
+        self, on_quote: QuoteHandler, on_status: StatusHandler,
+        on_trade: TradeHandler,
+    ):
         self.on_quote = on_quote
         self.on_status = on_status
+        self.on_trade = on_trade
 
     async def run_coinbase(self) -> None:
         await self._reconnecting("Coinbase", self._coinbase_connection)
@@ -163,25 +168,40 @@ class BitcoinWebSocketFeeds:
                     {
                         "type": "subscribe",
                         "product_ids": ["BTC-USD"],
-                        "channels": ["ticker", "heartbeat"],
+                        "channels": ["ticker", "heartbeat", "matches"],
                     }
                 )
             )
             await self.on_status("Coinbase", True, None)
             async for raw in websocket:
                 message = json.loads(raw)
-                if message.get("type") != "ticker" or message.get("product_id") != "BTC-USD":
+                if message.get("product_id") != "BTC-USD":
                     continue
-                await self.on_quote(
-                    ExchangeQuote(
-                        exchange="Coinbase",
-                        price=float(message["price"]),
-                        bid=self._optional_float(message.get("best_bid")),
-                        ask=self._optional_float(message.get("best_ask")),
-                        volume=self._optional_float(message.get("volume_24h")),
-                        latency_ms=0.0,
+                if message.get("type") == "ticker":
+                    await self.on_quote(
+                        ExchangeQuote(
+                            exchange="Coinbase",
+                            price=float(message["price"]),
+                            bid=self._optional_float(message.get("best_bid")),
+                            ask=self._optional_float(message.get("best_ask")),
+                            volume=self._optional_float(message.get("volume_24h")),
+                            latency_ms=0.0,
+                        )
                     )
-                )
+                elif message.get("type") == "match":
+                    maker_side = str(message.get("side") or "").upper()
+                    taker_side = "BUY" if maker_side == "SELL" else "SELL"
+                    await self.on_trade(
+                        ExchangeTrade(
+                            exchange="Coinbase",
+                            trade_id=str(message["trade_id"]),
+                            observed_at=str(message["time"]),
+                            price=float(message["price"]),
+                            size=float(message["size"]),
+                            taker_side=taker_side,
+                            raw=message,
+                        )
+                    )
 
     async def _kraken_connection(self) -> None:
         async with connect(
@@ -204,24 +224,53 @@ class BitcoinWebSocketFeeds:
                     }
                 )
             )
+            await websocket.send(
+                json.dumps(
+                    {
+                        "method": "subscribe",
+                        "params": {
+                            "channel": "trade",
+                            "symbol": ["BTC/USD"],
+                            "snapshot": False,
+                        },
+                        "req_id": 2,
+                    }
+                )
+            )
             await self.on_status("Kraken", True, None)
             async for raw in websocket:
                 message = json.loads(raw)
-                if message.get("channel") != "ticker" or not message.get("data"):
+                if not message.get("data"):
                     continue
-                payload = message["data"][0]
-                if payload.get("symbol") != "BTC/USD":
-                    continue
-                await self.on_quote(
-                    ExchangeQuote(
-                        exchange="Kraken",
-                        price=float(payload["last"]),
-                        bid=self._optional_float(payload.get("bid")),
-                        ask=self._optional_float(payload.get("ask")),
-                        volume=self._optional_float(payload.get("volume")),
-                        latency_ms=0.0,
+                if message.get("channel") == "ticker":
+                    payload = message["data"][0]
+                    if payload.get("symbol") != "BTC/USD":
+                        continue
+                    await self.on_quote(
+                        ExchangeQuote(
+                            exchange="Kraken",
+                            price=float(payload["last"]),
+                            bid=self._optional_float(payload.get("bid")),
+                            ask=self._optional_float(payload.get("ask")),
+                            volume=self._optional_float(payload.get("volume")),
+                            latency_ms=0.0,
+                        )
                     )
-                )
+                elif message.get("channel") == "trade":
+                    for payload in message["data"]:
+                        if payload.get("symbol") != "BTC/USD":
+                            continue
+                        await self.on_trade(
+                            ExchangeTrade(
+                                exchange="Kraken",
+                                trade_id=str(payload["trade_id"]),
+                                observed_at=str(payload["timestamp"]),
+                                price=float(payload["price"]),
+                                size=float(payload["qty"]),
+                                taker_side=str(payload["side"]).upper(),
+                                raw=payload,
+                            )
+                        )
 
     @staticmethod
     def _optional_float(value: Any) -> float | None:

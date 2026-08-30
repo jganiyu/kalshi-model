@@ -52,6 +52,7 @@ from app.services.streaming import BitcoinWebSocketFeeds, KalshiWebSocketFeed
 from app.services.training import ModelManager
 from app.services.trading import TradingCoordinator
 from app.services.trade_review import TradeReviewService
+from app.services.volume_signals import VolumeSignalService
 
 
 logger = logging.getLogger(__name__)
@@ -68,6 +69,7 @@ class AnalysisEngine:
         self.paper = PaperTradingService(db)
         self.margin_volatility = MarginVolatilityService(db)
         self.trade_reviews = TradeReviewService(db)
+        self.volume_signals = VolumeSignalService(db)
         self.trading = TradingCoordinator(config, db, self.paper)
         self.models = ModelManager(db)
         self._benchmark_calibration: dict[str, Any] = {
@@ -138,7 +140,8 @@ class AnalysisEngine:
         await self.collect_once()
         self._runner = asyncio.create_task(self._run_loop())
         bitcoin_streams = BitcoinWebSocketFeeds(
-            self._handle_stream_quote, self._handle_stream_status
+            self._handle_stream_quote, self._handle_stream_status,
+            self._handle_stream_trade,
         )
         self._stream_tasks.extend(
             [
@@ -277,7 +280,18 @@ class AnalysisEngine:
             self._record_threshold_observation(
                 current_market, observed_at, source="REST", event_type="poll"
             )
-            orderbook_payload = await self.kalshi.orderbook(ticker)
+            orderbook_payload, kalshi_trades = await asyncio.gather(
+                self.kalshi.orderbook(ticker),
+                self.kalshi.trades(
+                    ticker,
+                    min_ts=int((datetime.now(UTC) - timedelta(minutes=10)).timestamp()),
+                ),
+                return_exceptions=True,
+            )
+            if isinstance(orderbook_payload, BaseException):
+                raise orderbook_payload
+            if not isinstance(kalshi_trades, BaseException):
+                self.volume_signals.record_kalshi_trades(ticker, kalshi_trades)
             market_state = self._save_kalshi_snapshot(
                 current_market, orderbook_payload, observed_at
             )
@@ -480,6 +494,9 @@ class AnalysisEngine:
     async def _handle_stream_quote(self, quote: ExchangeQuote) -> None:
         self._latest_quotes[quote.exchange] = quote
         self._schedule_live_refresh()
+
+    async def _handle_stream_trade(self, trade: Any) -> None:
+        self.volume_signals.add_trade(trade)
 
     def _schedule_live_refresh(self) -> None:
         if self._live_refresh_task and not self._live_refresh_task.done():
@@ -787,6 +804,7 @@ class AnalysisEngine:
                 "errors": composite.errors,
             }
         if persist:
+            self.volume_signals.audit_cumulative(composite, observed_at)
             for quote in composite.quotes:
                 self.db.execute(
                     """
@@ -1148,6 +1166,22 @@ class AnalysisEngine:
             observed_window_seconds=float(settlement_window["elapsed_seconds"] or 0.0),
             benchmark_bias_pct=benchmark_bias,
         )
+        settlement_fraction = (
+            float(settlement_window["elapsed_seconds"] or 0.0)
+            / SETTLEMENT_WINDOW_SECONDS
+        )
+        volume_signals = self.volume_signals.snapshot(
+            observed_at=observed_at,
+            ticker=str(market["ticker"]),
+            btc_price=float(btc["price"]),
+            momentum_1m=float(btc.get("momentum_1m") or 0.0),
+            momentum_5m=float(btc.get("momentum_5m") or 0.0),
+            open_interest=market_state.get("open_interest"),
+            seconds_remaining=seconds_remaining,
+            threshold_margin=float(btc["price"]) - float(strike),
+            annualized_volatility=baseline.annualized_volatility,
+            settlement_window_fraction=settlement_fraction,
+        )
         market_mid = (
             (market_state["yes_bid"] + market_state["yes_ask"]) / 2
             if market_state["yes_bid"] is not None and market_state["yes_ask"] is not None
@@ -1166,10 +1200,11 @@ class AnalysisEngine:
             "orderbook_imbalance": market_state.get("imbalance") or 0.0,
             "market_probability": market_mid,
             "settlement_window_fraction": (
-                float(settlement_window["elapsed_seconds"] or 0.0)
-                / SETTLEMENT_WINDOW_SECONDS
+                settlement_fraction
             ),
             "benchmark_uncertainty_pct": benchmark_uncertainty,
+            "threshold_margin_dollars": float(btc["price"]) - float(strike),
+            **volume_signals.get("features", {}),
         }
         probability, model_version = self.models.predict(features, baseline.probability)
         forecast = make_forecast(probability)
@@ -1433,6 +1468,7 @@ class AnalysisEngine:
                 "trade_assessments": assessments,
                 "threshold_state": threshold_state,
                 "margin_volatility": margin_volatility,
+                "volume_signals": volume_signals,
                 "automatic_entry": automatic_entry,
                 "standard_edge_readiness": automatic_entry.get(
                     "standard_edge_readiness"

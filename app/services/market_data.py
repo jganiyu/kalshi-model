@@ -21,6 +21,17 @@ class ExchangeQuote:
 
 
 @dataclass(frozen=True)
+class ExchangeTrade:
+    exchange: str
+    trade_id: str
+    observed_at: str
+    price: float
+    size: float
+    taker_side: str
+    raw: dict[str, Any]
+
+
+@dataclass(frozen=True)
 class CompositeQuote:
     price: float | None
     dispersion_pct: float | None

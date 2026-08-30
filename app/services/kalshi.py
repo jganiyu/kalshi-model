@@ -107,6 +107,15 @@ class KalshiPublicClient:
         payload = await self._get(f"/markets/{ticker}")
         return payload.get("market", payload)
 
+    async def trades(
+        self, ticker: str, *, min_ts: int | None = None, limit: int = 1000
+    ) -> list[dict[str, Any]]:
+        params: dict[str, Any] = {"ticker": ticker, "limit": min(limit, 1000)}
+        if min_ts is not None:
+            params["min_ts"] = int(min_ts)
+        payload = await self._get("/markets/trades", params)
+        return payload.get("trades", [])
+
     async def settled_markets(self, limit: int = 250) -> list[dict[str, Any]]:
         payload = await self._get(
             "/markets",
