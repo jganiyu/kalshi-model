@@ -257,6 +257,65 @@ async def test_ambiguous_timeout_requires_reconciliation_without_retry(tmp_path:
 
 
 @run_async
+async def test_reconcile_clears_unseen_ambiguous_order_after_market_settlement(
+    tmp_path: Path,
+) -> None:
+    db, broker, client = await ready_broker(tmp_path)
+    db.execute(
+        """
+        INSERT INTO broker_positions(
+            mode,ticker,side,contracts,market_exposure,updated_at,status
+        ) VALUES ('DEMO','SETTLED','NO',1,.90,?,'open')
+        """,
+        (iso_now(),),
+    )
+    client.timeout = True
+    intent = OrderIntent("DEMO", "SETTLED", "NO", "SELL", 1, 0.90, "MANUAL", "manual")
+    with pytest.raises(AmbiguousSubmissionError):
+        await broker.submit(intent)
+
+    # This is the common restart path: the app already recorded Kalshi's
+    # settlement, but the next reconciliation response no longer lists the
+    # old market.
+    db.execute(
+        """
+        INSERT INTO broker_settlements(mode,ticker,settled_at,raw_json)
+        VALUES ('DEMO','SETTLED',?,'{}')
+        """,
+        (iso_now(),),
+    )
+    await broker.reconcile()
+
+    row = db.fetch_one(
+        "SELECT status,error FROM broker_order_intents WHERE client_order_id=?",
+        (intent.client_order_id,),
+    )
+    assert row == {
+        "status": "REJECTED",
+        "error": "Kalshi did not report this timed-out order before the market settled.",
+    }
+    assert broker.readiness()["reconciliation_required"] is False
+
+
+@run_async
+async def test_reconcile_keeps_active_ambiguous_order_blocked(tmp_path: Path) -> None:
+    db, broker, client = await ready_broker(tmp_path)
+    client.timeout = True
+    intent = OrderIntent("DEMO", "ACTIVE", "YES", "BUY", 1, 0.40, "MANUAL", "manual")
+    with pytest.raises(AmbiguousSubmissionError):
+        await broker.submit(intent)
+
+    await broker.reconcile()
+
+    row = db.fetch_one(
+        "SELECT status FROM broker_order_intents WHERE client_order_id=?",
+        (intent.client_order_id,),
+    )
+    assert row == {"status": "RECONCILIATION_REQUIRED"}
+    assert broker.readiness()["reconciliation_required"] is True
+
+
+@run_async
 async def test_partial_fills_have_weighted_average_and_no_duplicates(tmp_path: Path) -> None:
     db, broker, client = await ready_broker(tmp_path)
     intent = OrderIntent("DEMO", "TICKER", "YES", "BUY", 4, 0.50, "SWING", "automatic")

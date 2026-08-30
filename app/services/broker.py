@@ -1262,6 +1262,15 @@ class KalshiBroker(Broker):
                     exchange_order_id=str(remote.get("order_id") or "") or None,
                     error=None,
                 )
+            elif self._settled_without_matching_fill(intent, remote_settlements):
+                # The market is final and Kalshi returned neither this order nor
+                # a matching fill. At that point the timed-out request cannot
+                # still create exposure, so it is safe to clear the local hold.
+                self._set_intent(
+                    str(intent["client_order_id"]),
+                    "REJECTED",
+                    error="Kalshi did not report this timed-out order before the market settled.",
+                )
             elif intent.get("status") == "SUBMITTING":
                 self._set_intent(
                     str(intent["client_order_id"]),
@@ -1299,6 +1308,45 @@ class KalshiBroker(Broker):
             },
         )
         return self.portfolio()
+
+    def _settled_without_matching_fill(
+        self, intent: dict[str, Any], remote_settlements: list[dict[str, Any]]
+    ) -> bool:
+        """Whether an ambiguous submission is conclusively absent after settlement.
+
+        A missing order alone is not enough to clear an ambiguous request: an
+        active market could still hold an order or fill that has not appeared
+        in a response yet. Once Kalshi reports the contract settled, however,
+        the request cannot create new exposure. We clear it only if the
+        reconciled fill history also contains no matching side/action after the
+        request began.
+        """
+        ticker = str(intent.get("ticker") or "")
+        remotely_settled = any(
+            str(row.get("ticker") or row.get("market_ticker") or "") == ticker
+            for row in remote_settlements
+        )
+        previously_settled = bool(ticker) and self.db.fetch_one(
+            "SELECT 1 FROM broker_settlements WHERE mode=? AND ticker=? LIMIT 1",
+            (self.mode, ticker),
+        ) is not None
+        if not ticker or not (remotely_settled or previously_settled):
+            return False
+        matching_fill = self.db.fetch_one(
+            """
+            SELECT 1 FROM broker_fills
+            WHERE mode=? AND ticker=? AND side=? AND action=? AND filled_at>=?
+            LIMIT 1
+            """,
+            (
+                self.mode,
+                ticker,
+                str(intent.get("side") or ""),
+                str(intent.get("action") or ""),
+                str(intent.get("created_at") or ""),
+            ),
+        )
+        return matching_fill is None
 
     async def kill(self) -> dict[str, Any]:
         self.disarm("Kill switch activated.")
