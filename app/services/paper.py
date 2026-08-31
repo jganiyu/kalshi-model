@@ -16,6 +16,7 @@ from app.domain import (
     threshold_breach_exit_state,
 )
 from app.services.decision import Decision
+from app.services.directional_momentum import directional_gate
 from app.services.margin_volatility import MarginVolatilityService
 from app.services.trade_review import paper_trade_ref, review_metadata
 
@@ -1612,6 +1613,7 @@ class PaperTradingService:
         execution_risk_by_side: dict[str, dict[str, Any]] | None = None,
         threshold_margin_dollars: float | None = None,
         margin_volatility: dict[str, Any] | None = None,
+        directional_momentum: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Describe Standard Edge using the same inputs that drive execution."""
         settings = self.db.settings()
@@ -1671,6 +1673,9 @@ class PaperTradingService:
             settings, side=side, margin_dollars=threshold_margin_dollars
         )
         volatility_gate = MarginVolatilityService.gate(settings, margin_volatility)
+        direction_gate = directional_gate(
+            settings, directional_momentum, side=side
+        )
 
         probability_passed = bool(
             probability_value is not None
@@ -1768,6 +1773,7 @@ class PaperTradingService:
             and data_passed
             and confidence_ok
             and threshold_gate["passed"]
+            and direction_gate["passed"]
             and volatility_gate["passed"]
             and risk_passed
         )
@@ -1796,6 +1802,7 @@ class PaperTradingService:
             or not data_passed
             or not confidence_ok
             or not threshold_gate["passed"]
+            or not direction_gate["passed"]
             or not volatility_gate["passed"]
             or not risk_passed
         ):
@@ -1815,6 +1822,8 @@ class PaperTradingService:
             blocker = data_detail
         elif not threshold_gate["passed"]:
             blocker = str(threshold_gate["detail"])
+        elif not direction_gate["passed"]:
+            blocker = str(direction_gate["detail"])
         elif not volatility_gate["passed"]:
             blocker = str(volatility_gate["detail"])
         elif not risk_passed:
@@ -1905,6 +1914,7 @@ class PaperTradingService:
                     "detail": quality_detail,
                 },
                 "threshold_margin": threshold_gate,
+                "directional_momentum": direction_gate,
                 "volatility": volatility_gate,
                 "risk": {
                     "passed": risk_passed,
@@ -2352,6 +2362,7 @@ class PaperTradingService:
         z_distance: float,
         threshold_margin_dollars: float | None = None,
         margin_volatility: dict[str, Any] | None = None,
+        directional_momentum: dict[str, Any] | None = None,
         model_version: str,
         portfolio: dict[str, Any] | None = None,
         now: float | None = None,
@@ -2422,6 +2433,7 @@ class PaperTradingService:
                 execution_risk_by_side=execution_risk_by_side,
                 threshold_margin_dollars=threshold_margin_dollars,
                 margin_volatility=margin_volatility,
+                directional_momentum=directional_momentum,
             )
             result["swing_readiness"] = self._swing_entry_readiness(
                 ticker=ticker,
@@ -2471,6 +2483,9 @@ class PaperTradingService:
                 side=side,
                 margin_dollars=threshold_margin_dollars,
             )
+
+        def momentum_gate(side: str) -> dict[str, Any]:
+            return directional_gate(settings, directional_momentum, side=side)
         early_candidate = None
         threshold_ready = False
         if threshold_state and observed is not None and opened is not None:
@@ -2498,6 +2513,15 @@ class PaperTradingService:
                 minimum_liquidity=int(settings.get("early_min_liquidity_contracts", 1)),
             )
         if early_candidate:
+            direction_gate = momentum_gate(str(early_candidate["side"]))
+            if not direction_gate["passed"]:
+                self.reset_automatic_confirmation()
+                result["active_strategy"] = "EARLY_THRESHOLD"
+                result["blocked_reason"] = str(direction_gate["detail"])
+                return finish(
+                    priority_strategy="EARLY_THRESHOLD",
+                    blocked_reason=result["blocked_reason"],
+                )
             threshold_gate = margin_gate(str(early_candidate["side"]))
             if not threshold_gate["passed"]:
                 self.reset_automatic_confirmation()
@@ -2548,6 +2572,15 @@ class PaperTradingService:
         self._strategy_states.pop("EARLY_THRESHOLD", None)
 
         if standard is not None:
+            direction_gate = momentum_gate(str(standard.side))
+            if not direction_gate["passed"]:
+                self.reset_automatic_confirmation()
+                result["active_strategy"] = "STANDARD_EDGE"
+                result["blocked_reason"] = str(direction_gate["detail"])
+                return finish(
+                    priority_strategy="STANDARD_EDGE",
+                    blocked_reason=result["blocked_reason"],
+                )
             threshold_gate = margin_gate(str(standard.side))
             if not threshold_gate["passed"]:
                 self.reset_automatic_confirmation()
@@ -2589,6 +2622,15 @@ class PaperTradingService:
                 minimum_liquidity=int(settings.get("late_min_liquidity_contracts", 1)),
             )
         if late_candidate:
+            direction_gate = momentum_gate(str(late_candidate["side"]))
+            if not direction_gate["passed"]:
+                self.reset_automatic_confirmation()
+                result["active_strategy"] = "LATE_CONVICTION"
+                result["blocked_reason"] = str(direction_gate["detail"])
+                return finish(
+                    priority_strategy="LATE_CONVICTION",
+                    blocked_reason=result["blocked_reason"],
+                )
             threshold_gate = margin_gate(str(late_candidate["side"]))
             if not threshold_gate["passed"]:
                 self.reset_automatic_confirmation()
@@ -2648,6 +2690,15 @@ class PaperTradingService:
             and swing_candidate
             and portfolio_state.get("automatic_trade_allowed", True)
         ):
+            direction_gate = momentum_gate(str(swing_candidate["side"]))
+            if not direction_gate["passed"]:
+                self.reset_automatic_confirmation()
+                result["active_strategy"] = "SWING"
+                result["blocked_reason"] = str(direction_gate["detail"])
+                return finish(
+                    priority_strategy="SWING",
+                    blocked_reason=result["blocked_reason"],
+                )
             threshold_gate = margin_gate(str(swing_candidate["side"]))
             if not threshold_gate["passed"]:
                 self.reset_automatic_confirmation()

@@ -101,13 +101,13 @@ The model has one simple loop: estimate the odds, compare them with the price, t
 
 Standard Edge looks for a sustained pricing advantage. Early Threshold uses a threshold available before the market opens, Late Conviction looks near settlement, and Swing buys a deeply discounted early contract for a defined target exit. Only one automatic strategy can enter a market.
 
-Every entry must clear probability, EV, spread, liquidity, data, confidence, threshold distance, volatility, confirmation, allocation, and risk checks. The HUD shows these checks live so it is clear what the model is waiting on.
+Every entry must clear probability, EV, spread, liquidity, data, confidence, threshold distance, BTC directional momentum, volatility, confirmation, allocation, and risk checks. By default, a 15-second BTC-proxy regression must move at least $1 upward for Up or downward for Down. The HUD shows these checks live so it is clear what the model is waiting on.
 
 ### How it protects a trade
 
 Margin Volatility measures how choppily BTC is moving around To Beat. It can block automatic entries when the configured maximum is exceeded; its cushion is recorded for review, not used as an entry gate.
 
-Profit take exits at a configured executable bid—99¢ by default—and stop-losses remain optional. Threshold Breach Exit is the model's fold: for an Up position it exits when the BTC proxy moves to or below To Beat (plus any configured buffer); for Down, it does the inverse. These are safeguards, not guarantees of an exit price or fill.
+Profit take exits at a configured executable bid—99¢ by default—and stop-losses remain optional. Threshold Breach Exit is the model's fold: its signed buffer can trigger before To Beat or tolerate a configured adverse move beyond it before closing. These are safeguards, not guarantees of an exit price or fill.
 
 ### How it improves
 

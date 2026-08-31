@@ -32,6 +32,7 @@ def make_db(tmp_path: Path, **settings: object) -> Database:
             "early_threshold_enabled": False,
             "late_conviction_enabled": False,
             "threshold_margin_gate_dollars": 0,
+            "directional_momentum_gate_enabled": False,
             **settings,
         }
     )

@@ -72,18 +72,24 @@ def test_side_aware_threshold_math_and_exact_crossing() -> None:
     assert up["breached"] is True
     assert up["distance_to_exit"] == 0
 
-    buffered_up = threshold_breach_exit_state("YES", 98, 100, buffer_dollars=2)
-    buffered_down = threshold_breach_exit_state("NO", 102, 100, buffer_dollars=2)
+    buffered_up = threshold_breach_exit_state("YES", 98, 100, buffer_dollars=-2)
+    buffered_down = threshold_breach_exit_state("NO", 102, 100, buffer_dollars=-2)
     assert buffered_up["exit_level"] == 98
     assert buffered_up["breached"] is True
     assert buffered_down["exit_level"] == 102
     assert buffered_down["breached"] is True
     assert threshold_breach_exit_state(
-        "YES", 98.01, 100, buffer_dollars=2
+        "YES", 98.01, 100, buffer_dollars=-2
     )["breached"] is False
     assert threshold_breach_exit_state(
-        "NO", 101.99, 100, buffer_dollars=2
+        "NO", 101.99, 100, buffer_dollars=-2
     )["breached"] is False
+    assert threshold_breach_exit_state(
+        "YES", 102, 100, buffer_dollars=2
+    )["breached"] is True
+    assert threshold_breach_exit_state(
+        "NO", 98, 100, buffer_dollars=2
+    )["breached"] is True
 
 
 @pytest.mark.parametrize(
@@ -98,7 +104,7 @@ def test_paper_exits_up_and_down_at_buffered_boundary(
     exit_level: float,
 ) -> None:
     db, service = make_service(
-        tmp_path, threshold_breach_exit_buffer_dollars=2.0
+        tmp_path, threshold_breach_exit_buffer_dollars=-2.0
     )
     open_position(service, side)
 
@@ -227,8 +233,9 @@ def test_settings_defaults_validation_and_additive_columns(tmp_path: Path) -> No
         "threshold_breach_exit_enabled": False,
         "threshold_breach_exit_buffer_dollars": 2.0,
     }
-    with pytest.raises(Exception):
-        clean_settings_payload({"threshold_breach_exit_buffer_dollars": -0.01})
+    assert clean_settings_payload(
+        {"threshold_breach_exit_buffer_dollars": -2}
+    )["threshold_breach_exit_buffer_dollars"] == -2.0
     paper_columns = {
         row["name"] for row in db.fetch_all("PRAGMA table_info(paper_entries)")
     }

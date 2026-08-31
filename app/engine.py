@@ -33,6 +33,7 @@ from app.services.decision import (
     make_trade_assessment,
     material_change,
 )
+from app.services.directional_momentum import regression_momentum
 from app.services.forecast import Forecast, forecast_label, make_forecast
 from app.services.kalshi import (
     KalshiPublicClient,
@@ -1274,6 +1275,12 @@ class AnalysisEngine:
             seconds_remaining=seconds_remaining,
             source_reliable=mvi_source_reliable,
         )
+        directional_momentum = regression_momentum(
+            self._recent_btc_samples,
+            lookback_seconds=float(
+                settings.get("directional_momentum_lookback_seconds", 15)
+            ),
+        )
         execution_quality_by_side: dict[str, dict[str, Any]] = {}
         for side in ("YES", "NO"):
             execution_quality = dict(quality)
@@ -1440,6 +1447,7 @@ class AnalysisEngine:
             z_distance=baseline.z_distance,
             threshold_margin_dollars=float(btc["price"]) - float(strike),
             margin_volatility=margin_volatility,
+            directional_momentum=directional_momentum,
             model_version=model_version,
             portfolio=portfolio,
             **execution_kwargs,
@@ -1477,6 +1485,7 @@ class AnalysisEngine:
                 "trade_assessments": assessments,
                 "threshold_state": threshold_state,
                 "margin_volatility": margin_volatility,
+                "directional_momentum": directional_momentum,
                 "volume_signals": volume_signals,
                 "automatic_entry": automatic_entry,
                 "standard_edge_readiness": automatic_entry.get(

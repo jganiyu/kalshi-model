@@ -153,6 +153,11 @@ function renderHud(readiness) {
     ? `-- / ${signedMoney(threshold.required)}`
     : `${signedMoney(threshold.current)} / ${signedMoney(threshold.required)}`;
   setGate("#gate-threshold", threshold, thresholdLabel);
+  const direction = gates.directional_momentum || {};
+  const directionLabel = direction.enabled === false ? "Off" : direction.current == null
+    ? `-- / ${signedMoney(direction.required)}`
+    : `${signedMoney(direction.current)} / ${signedMoney(direction.required)}`;
+  setGate("#gate-direction", direction, directionLabel);
   const volatility = gates.volatility || {};
   const volatilityLabel = volatility.enabled === false ? "Off" : volatility.current == null
     ? `${volatility.status === "LEARNING" ? "Learning" : "--"} / ${Number(volatility.required || 0).toFixed(1)}`

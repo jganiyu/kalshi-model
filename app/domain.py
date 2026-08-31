@@ -335,12 +335,14 @@ def threshold_breach_exit_state(
 ) -> dict[str, object]:
     """Describe the side-aware BTC-proxy threshold protection for one position."""
     normalized_side = str(side or "").upper()
-    buffer_value = max(0.0, float(buffer_dollars or 0.0))
+    buffer_value = float(buffer_dollars or 0.0)
     proxy_value = float(btc_proxy) if btc_proxy is not None else None
     threshold_value = float(threshold) if threshold is not None else None
     exit_level = None
     if threshold_value is not None and normalized_side in {"YES", "NO"}:
-        exit_level = threshold_value + (-buffer_value if normalized_side == "YES" else buffer_value)
+        # The buffer is a signed, side-aware offset. A negative value tolerates
+        # an adverse move beyond To Beat; a positive value exits before To Beat.
+        exit_level = threshold_value + (buffer_value if normalized_side == "YES" else -buffer_value)
 
     breached = False
     distance = None

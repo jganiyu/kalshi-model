@@ -25,6 +25,7 @@ from app.services.decision import make_trade_assessment
 def make_db(tmp_path: Path) -> Database:
     db = Database(tmp_path / "mvi.db")
     db.initialize()
+    db.update_settings({"directional_momentum_gate_enabled": False})
     return db
 
 

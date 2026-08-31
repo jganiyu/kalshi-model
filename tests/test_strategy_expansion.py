@@ -18,7 +18,11 @@ def make_db(tmp_path: Path) -> Database:
     db = Database(tmp_path / "strategies.db")
     db.initialize()
     db.update_settings(
-        {"paper_trading_enabled": True, "threshold_margin_gate_dollars": 0}
+        {
+            "paper_trading_enabled": True,
+            "threshold_margin_gate_dollars": 0,
+            "directional_momentum_gate_enabled": False,
+        }
     )
     return db
 
@@ -960,11 +964,13 @@ def test_dashboard_markup_has_two_fixed_books_and_paper_trade_history() -> None:
     assert 'id="standard-edge-confirmation-track"' in markup
     assert 'id="standard-edge-quality-gate"' in markup
     assert '<b>Confidence <button class="hud-help"' in markup
-    assert markup.count('class="hud-help"') == 13
+    assert markup.count('class="hud-help"') == 14
+    assert 'id="standard-edge-direction-gate"' in markup
     assert 'id="standard-edge-volatility-gate"' in markup
     assert 'id="standard-edge-cushion"' in markup
     assert 'data-chart-mode="volatility"' in markup
     assert 'id: "maximum_margin_volatility"' in script
+    assert 'id: "directional_momentum_gate_enabled"' in script
     assert 'data-tooltip="The model probability' in markup
     assert 'aria-label="About risk controls"' in markup
     assert markup.count("v={{ asset_version }}") == 2

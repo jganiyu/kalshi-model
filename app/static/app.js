@@ -416,6 +416,13 @@ function renderStandardEdgeHud(readiness) {
       ? `-- / ${signedMoney(threshold.required, 0)}`
       : `${signedMoney(threshold.current, 0)} / ${signedMoney(threshold.required, 0)}`;
   renderReadinessGate("#standard-edge-threshold-gate", threshold, thresholdValue);
+  const direction = gates.directional_momentum || {};
+  const directionValue = direction.enabled === false
+    ? "Off"
+    : direction.current == null
+      ? `-- / ${signedMoney(direction.required, 0)}`
+      : `${signedMoney(direction.current, 1)} / ${signedMoney(direction.required, 0)}`;
+  renderReadinessGate("#standard-edge-direction-gate", direction, directionValue);
   const volatility = gates.volatility || {};
   state.maximumMvi = Number(volatility.required || 0);
   const volatilityValue = volatility.enabled === false
@@ -1410,6 +1417,10 @@ const calibrationGroups = [
     { id: "automatic_buy_duration_pct", label: "Required Buy duration", unit: "%", min: 50, max: 100, step: 1, scale: 100, tip: "Share of the confirmation period that must be spent in Buy. Default: 50%." },
     { id: "automatic_min_confidence", label: "Minimum edge strength", type: "select", options: ["Low", "Moderate", "High"], tip: "Lowest edge-strength label allowed for an automatic entry. Speculative assessments never enter automatically. Default: Moderate." },
     { id: "threshold_margin_gate_dollars", label: "Threshold margin", unit: "dollars", min: 0, max: 100000, step: 1, tip: "Directional BTC-proxy distance required for automatic entries: Up must be above the threshold and Down below it by this amount. Use 0 to turn it off. Default: $50." },
+    { type: "subsection", label: "BTC Directional Momentum", description: "Requires the BTC proxy's regression direction to agree with the side of every automatic entry." },
+    { id: "directional_momentum_gate_enabled", label: "Enable BTC Direction Gate", type: "toggle", tip: "Blocks automatic Up entries unless BTC is rising and Down entries unless BTC is falling across the configured regression window. Default: on." },
+    { id: "directional_momentum_lookback_seconds", label: "Regression lookback", unit: "seconds", min: 5, max: 120, step: 1, integer: true, tip: "Recent BTC-proxy window used for the least-squares direction calculation. Default: 15 seconds." },
+    { id: "directional_momentum_minimum_movement_dollars", label: "Minimum directional movement", unit: "dollars", min: 0, max: 100000, step: .25, tip: "Minimum fitted BTC move required across the lookback window in the entry direction. Default: $1." },
   ]],
   ["Margin Volatility", [
     { id: "maximum_margin_volatility", label: "Maximum Margin Volatility", unit: "MVI", min: 0, max: 10, step: .1, tip: "Maximum 30-minute Margin Volatility Index allowed for automatic confirmation in Paper, Demo, and Live. Low MVI is allowed; values above this maximum block. Use 0 to turn it off. Default: off." },
@@ -1457,7 +1468,7 @@ const calibrationGroups = [
     { id: "global_profit_take_price", label: "Profit-take bid", unit: "cents", min: 1, max: 99, step: 1, scale: 100, tip: "Executable bid that triggers an exit for every strategy and manual trade. Demo and Live require the app to stay connected. Default: 99 cents." },
     { type: "subsection", label: "Threshold Breach Exit", description: "This is a side-aware exit based on the BTC proxy versus To Beat. It does not use contract price as the trigger." },
     { id: "threshold_breach_exit_enabled", label: "Enable Threshold Breach Exit", type: "toggle", tip: "Side-aware exit based on the BTC proxy versus To Beat. It does not use contract price as the trigger. Default: on." },
-    { id: "threshold_breach_exit_buffer_dollars", label: "Threshold exit buffer", unit: "dollars", min: 0, max: 100000, step: .25, tip: "Extra BTC movement beyond To Beat required before exiting against the held side. $0 exits at the threshold; $2 exits $2 beyond it. Default: $0." },
+    { id: "threshold_breach_exit_buffer_dollars", label: "Threshold exit buffer", unit: "dollars", min: -100000, max: 100000, step: .25, tip: "Signed side-aware offset from To Beat. A negative value tolerates an adverse move beyond the threshold; -$2 exits an Up at $2 below To Beat or a Down at $2 above it. Positive values exit before the threshold. Default: $0." },
   ]],
   ["Position Sizing and Risk", [
     { id: "starting_bankroll", label: "Starting bankroll", unit: "dollars", min: 1, max: 100000000, step: 100, tip: "Paper capital used for sizing and performance. Default: $1,000." },
