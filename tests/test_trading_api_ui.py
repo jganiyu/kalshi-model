@@ -119,6 +119,7 @@ def test_trading_ui_contains_mode_safety_and_confirmation_controls() -> None:
     assert 'api("/api/calibration/summary")' in script
     assert 'api("/api/calibration/evidence")' in script
     assert "Loading evidence in background" in script
+    assert "if (!portfolio.readiness?.reconciled)" in script
 
 
 def test_private_stream_accepts_current_singular_event_types() -> None:

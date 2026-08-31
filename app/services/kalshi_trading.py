@@ -8,7 +8,7 @@ import time
 from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 import httpx
 from cryptography.hazmat.primitives import hashes, serialization
@@ -309,6 +309,12 @@ class KalshiTradingClient:
         return await self._all_pages(
             "/portfolio/settlements", "settlements", params=params
         )
+
+    async def market(self, ticker: str) -> dict[str, Any]:
+        """Return the authoritative market state used to resolve timed-out orders."""
+        payload = await self._request("GET", f"/markets/{quote(ticker, safe='')}")
+        market = payload.get("market")
+        return market if isinstance(market, dict) else payload
 
     async def order_by_client_id(self, client_order_id: str) -> dict[str, Any] | None:
         payload = await self.orders()

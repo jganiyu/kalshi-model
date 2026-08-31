@@ -857,7 +857,14 @@ async function reconcileSelectedTrading() {
   if (mode === "PAPER") return;
   resetArmConfirmation();
   try {
-    await api(`/api/trading/${mode}/reconcile`, { method: "POST" });
+    const portfolio = await api(`/api/trading/${mode}/reconcile`, { method: "POST" });
+    if (!portfolio.readiness?.reconciled) {
+      throw new Error(
+        portfolio.readiness?.last_error
+        || portfolio.readiness?.blocker
+        || "Account reconciliation is still incomplete."
+      );
+    }
     await refreshDashboard();
     await loadPaper();
     showToast(`${modeLabel(mode)} reconciled`, "Balances, positions, orders, and fills are synchronized.");

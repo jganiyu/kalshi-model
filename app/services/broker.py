@@ -1370,6 +1370,16 @@ class KalshiBroker(Broker):
         }
         for intent in ambiguous:
             remote = by_client.get(str(intent["client_order_id"]))
+            settled_without_fill = False
+            closed_without_fill = False
+            if not remote:
+                settled_without_fill = self._settled_without_matching_fill(
+                    intent, remote_settlements
+                )
+                closed_without_fill = (
+                    not settled_without_fill
+                    and await self._closed_without_matching_fill(intent)
+                )
             if remote:
                 self._set_intent(
                     str(intent["client_order_id"]),
@@ -1377,14 +1387,18 @@ class KalshiBroker(Broker):
                     exchange_order_id=str(remote.get("order_id") or "") or None,
                     error=None,
                 )
-            elif self._settled_without_matching_fill(intent, remote_settlements):
-                # The market is final and Kalshi returned neither this order nor
-                # a matching fill. At that point the timed-out request cannot
-                # still create exposure, so it is safe to clear the local hold.
+            elif settled_without_fill or closed_without_fill:
+                # A settled or closed market cannot create future exposure. If
+                # Kalshi also reports neither the order nor a matching fill, the
+                # timed-out request is conclusively absent and the safety hold
+                # can be cleared without waiting for settlement publication.
                 self._set_intent(
                     str(intent["client_order_id"]),
                     "REJECTED",
-                    error="Kalshi did not report this timed-out order before the market settled.",
+                    error=(
+                        "Kalshi did not report this timed-out order before the "
+                        f"market {'settled' if settled_without_fill else 'closed'}."
+                    ),
                 )
             elif intent.get("status") == "SUBMITTING":
                 self._set_intent(
@@ -1415,7 +1429,7 @@ class KalshiBroker(Broker):
         was_paused = self._reconciliation_paused
         self._reconciliation_paused = False
         self._audit(
-            "RECONCILED",
+            "RECONCILIATION_INCOMPLETE" if reconciliation_required else "RECONCILED",
             {
                 "orders": len(remote_orders),
                 "fills": len(remote_fills),
@@ -1433,6 +1447,54 @@ class KalshiBroker(Broker):
                 },
             )
         return self.portfolio()
+
+    async def _closed_without_matching_fill(self, intent: dict[str, Any]) -> bool:
+        """Resolve an ambiguous request once its market can no longer trade.
+
+        Kalshi can publish settlement after the next contract has already begun.
+        The market endpoint closes that gap: once the exchange says the market is
+        closed (or its close time has passed), an absent order with no matching
+        fill cannot create exposure later.
+        """
+        if self.client is None or self._has_matching_fill(intent):
+            return False
+        ticker = str(intent.get("ticker") or "")
+        if not ticker:
+            return False
+        try:
+            market = await self.client.market(ticker)
+        except (KalshiTradingError, ValueError):
+            return False
+        status = str(market.get("status") or "").lower()
+        try:
+            close_at = parse_time(
+                str(
+                    market.get("close_time")
+                    or market.get("expected_expiration_time")
+                    or ""
+                )
+            )
+        except ValueError:
+            close_at = None
+        return status in {"closed", "settled", "finalized"} or bool(
+            close_at and close_at <= datetime.now(UTC)
+        )
+
+    def _has_matching_fill(self, intent: dict[str, Any]) -> bool:
+        return self.db.fetch_one(
+            """
+            SELECT 1 FROM broker_fills
+            WHERE mode=? AND ticker=? AND side=? AND action=? AND filled_at>=?
+            LIMIT 1
+            """,
+            (
+                self.mode,
+                str(intent.get("ticker") or ""),
+                str(intent.get("side") or ""),
+                str(intent.get("action") or ""),
+                str(intent.get("created_at") or ""),
+            ),
+        ) is not None
 
     def _settled_without_matching_fill(
         self, intent: dict[str, Any], remote_settlements: list[dict[str, Any]]
@@ -1457,21 +1519,7 @@ class KalshiBroker(Broker):
         ) is not None
         if not ticker or not (remotely_settled or previously_settled):
             return False
-        matching_fill = self.db.fetch_one(
-            """
-            SELECT 1 FROM broker_fills
-            WHERE mode=? AND ticker=? AND side=? AND action=? AND filled_at>=?
-            LIMIT 1
-            """,
-            (
-                self.mode,
-                ticker,
-                str(intent.get("side") or ""),
-                str(intent.get("action") or ""),
-                str(intent.get("created_at") or ""),
-            ),
-        )
-        return matching_fill is None
+        return not self._has_matching_fill(intent)
 
     async def kill(self) -> dict[str, Any]:
         self.disarm("Kill switch activated.")

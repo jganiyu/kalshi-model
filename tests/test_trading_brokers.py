@@ -45,6 +45,7 @@ class FakeTradingClient:
         self.remote_fills: list[dict] = []
         self.remote_positions: list[dict] = []
         self.remote_settlements: list[dict] = []
+        self.remote_markets: dict[str, dict] = {}
         self.timeout = False
         self.balance_payload: dict = {
             "balance_dollars": "1000.0000",
@@ -71,6 +72,9 @@ class FakeTradingClient:
 
     async def settlements(self, **_):
         return {"settlements": list(self.remote_settlements)}
+
+    async def market(self, ticker: str):
+        return dict(self.remote_markets.get(ticker) or {"ticker": ticker, "status": "active"})
 
     async def create_order(self, **payload):
         if self.timeout:
@@ -319,6 +323,94 @@ async def test_reconcile_keeps_active_ambiguous_order_blocked(tmp_path: Path) ->
     )
     assert row == {"status": "RECONCILIATION_REQUIRED"}
     assert broker.readiness()["reconciliation_required"] is True
+
+
+@run_async
+async def test_reconcile_clears_unseen_ambiguous_order_when_market_closes(
+    tmp_path: Path,
+) -> None:
+    db, broker, client = await ready_broker(tmp_path)
+    client.timeout = True
+    intent = OrderIntent(
+        "DEMO", "JUST-CLOSED", "YES", "BUY", 1, 0.40, "MANUAL", "manual"
+    )
+    with pytest.raises(AmbiguousSubmissionError):
+        await broker.submit(intent)
+
+    client.remote_markets["JUST-CLOSED"] = {
+        "ticker": "JUST-CLOSED",
+        "status": "closed",
+    }
+    await broker.reconcile()
+
+    row = db.fetch_one(
+        "SELECT status,error FROM broker_order_intents WHERE client_order_id=?",
+        (intent.client_order_id,),
+    )
+    assert row == {
+        "status": "REJECTED",
+        "error": "Kalshi did not report this timed-out order before the market closed.",
+    }
+    assert broker.readiness()["reconciled"] is True
+
+
+@run_async
+async def test_reconcile_does_not_clear_closed_ambiguous_order_with_matching_fill(
+    tmp_path: Path,
+) -> None:
+    db, broker, client = await ready_broker(tmp_path)
+    client.timeout = True
+    intent = OrderIntent(
+        "DEMO", "CLOSED-FILLED", "YES", "BUY", 1, 0.40, "MANUAL", "manual"
+    )
+    with pytest.raises(AmbiguousSubmissionError):
+        await broker.submit(intent)
+    client.remote_fills = [{
+        "fill_id": "ambiguous-fill",
+        "ticker": intent.ticker,
+        "side": "bid",
+        "count_fp": "1.00",
+        "yes_price_dollars": "0.4000",
+        "created_time": iso_now(),
+    }]
+    client.remote_markets[intent.ticker] = {
+        "ticker": intent.ticker,
+        "status": "closed",
+    }
+
+    await broker.reconcile()
+
+    row = db.fetch_one(
+        "SELECT status FROM broker_order_intents WHERE client_order_id=?",
+        (intent.client_order_id,),
+    )
+    assert row == {"status": "RECONCILIATION_REQUIRED"}
+    assert broker.readiness()["reconciled"] is False
+
+
+@run_async
+async def test_user_reconcile_reports_incomplete_instead_of_success(
+    tmp_path: Path,
+) -> None:
+    db = make_db(tmp_path)
+    coordinator = TradingCoordinator(
+        AppConfig(database_path=db.path), db, PaperTradingService(db)
+    )
+    broker = coordinator.broker("DEMO")
+    assert isinstance(broker, KalshiBroker)
+    client = FakeTradingClient()
+    broker.set_client(client)  # type: ignore[arg-type]
+    await broker.reconcile()
+    broker.arm(confirmation="ARM DEMO TRADING", automatic=True)
+    client.timeout = True
+    intent = OrderIntent(
+        "DEMO", "STILL-ACTIVE", "YES", "BUY", 1, 0.40, "MANUAL", "manual"
+    )
+    with pytest.raises(AmbiguousSubmissionError):
+        await broker.submit(intent)
+
+    with pytest.raises(ValueError, match="still requires reconciliation"):
+        await coordinator.reconcile("DEMO")
 
 
 @run_async

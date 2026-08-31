@@ -400,7 +400,17 @@ class TradingCoordinator:
 
     async def reconcile(self, mode: str) -> dict[str, Any]:
         broker = self.broker(mode)
-        return await broker.reconcile()
+        result = await broker.reconcile()
+        readiness = result.get("readiness") or {}
+        if not readiness.get("reconciled"):
+            raise ValueError(
+                str(
+                    readiness.get("last_error")
+                    or readiness.get("blocker")
+                    or "Account reconciliation is still incomplete."
+                )
+            )
+        return result
 
     async def verify_demo(self, current: dict[str, Any], confirmation: str) -> dict[str, Any]:
         if confirmation.strip() != "VERIFY DEMO TRADING":
