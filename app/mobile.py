@@ -70,6 +70,7 @@ def mobile_snapshot(dashboard: dict[str, Any]) -> dict[str, Any]:
         "margin_volatility_index",
         "margin_cushion_ratio",
         "exit_reason",
+        "threshold_breach_exit",
     }
     recent_trades = [
         {

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import math
 import secrets
 import time
@@ -20,6 +21,7 @@ from app.services.broker import (
     KalshiLiveBroker,
     OrderIntent,
     PaperBroker,
+    _exchange_error_detail,
     normalize_mode,
 )
 from app.services.credentials import resolve_trading_credentials
@@ -364,6 +366,14 @@ class TradingCoordinator:
                 blocked_reason=blocked_reason,
             )
             if (
+                str(position.get("threshold_exit_status") or "") == "Blocked"
+                and position.get("threshold_triggered_at")
+            ):
+                state["status"] = "Blocked"
+                state["reason"] = position.get("threshold_exit_block_reason") or (
+                    "A prior exit attempt was rejected."
+                )
+            if (
                 mode != "PAPER"
                 and state["breached"]
                 and state["status"] == "Breached"
@@ -373,6 +383,16 @@ class TradingCoordinator:
                 state["reason"] = readiness.get("blocker") or (
                     f"The {mode.title()} session is not ready for an exit."
                 )
+            state["last_attempt_at"] = position.get("threshold_exit_last_attempt_at")
+            state["last_attempt_bid"] = position.get("threshold_exit_last_attempt_bid")
+            state["error_code"] = position.get("threshold_exit_error_code")
+            try:
+                state["error_details"] = json.loads(
+                    position.get("threshold_exit_error_details_json") or "null"
+                )
+            except (TypeError, json.JSONDecodeError):
+                state["error_details"] = None
+            state["remaining_contracts"] = position.get("contracts")
             position["threshold_breach_exit"] = state
 
     async def reconcile(self, mode: str) -> dict[str, Any]:
@@ -889,13 +909,25 @@ class TradingCoordinator:
         except (KalshiTradingError, ValueError) as exc:
             if intent.action == "SELL":
                 if intent.source == "threshold_breach_exit":
+                    error = _exchange_error_detail(exc)
                     self.db.execute(
                         """
                         UPDATE broker_positions SET threshold_exit_status='Blocked',
-                            threshold_exit_block_reason=?
+                            threshold_exit_block_reason=?,threshold_exit_last_attempt_at=?,
+                            threshold_exit_last_attempt_bid=?,threshold_exit_error_code=?,
+                            threshold_exit_error_details_json=?
                         WHERE mode=? AND ticker=? AND side=? AND status='open'
                         """,
-                        (str(exc), intent.mode, intent.ticker, intent.side),
+                        (
+                            str(exc),
+                            datetime_now(),
+                            intent.decision_snapshot.get("executable_bid"),
+                            error.get("code"),
+                            json.dumps(error, sort_keys=True),
+                            intent.mode,
+                            intent.ticker,
+                            intent.side,
+                        ),
                     )
                 try:
                     await broker.reconcile()
@@ -1024,6 +1056,14 @@ class TradingCoordinator:
                 ),
                 data_reliable=data_reliable,
             )
+            previous_status = str(position.get("threshold_exit_status") or "")
+            previous_reason = position.get("threshold_exit_block_reason")
+            if (
+                previous_status == "Blocked"
+                and position.get("threshold_triggered_at")
+            ):
+                threshold_exit["status"] = "Blocked"
+                threshold_exit["reason"] = previous_reason or "A prior exit attempt was rejected."
             self.db.execute(
                 """
                 UPDATE broker_positions SET threshold_breach_enabled=?,
@@ -1066,9 +1106,15 @@ class TradingCoordinator:
             )
             if reason is None:
                 continue
+            candidate_limit = normalize_order_price(
+                max(0.01, bid - slippage),
+                "SELL",
+                side=side,
+                price_ranges=current.get("price_ranges"),
+            )
             rejected_exits = self.db.fetch_all(
                 """
-                SELECT status,updated_at FROM broker_order_intents
+                SELECT status,updated_at,limit_price FROM broker_order_intents
                 WHERE mode=? AND ticker=? AND side=? AND action='SELL' AND source=?
                 ORDER BY id DESC LIMIT 7
                 """,
@@ -1084,6 +1130,14 @@ class TradingCoordinator:
             if consecutive_rejections and last_rejected_at:
                 retry_delay = min(60.0, float(2 ** min(consecutive_rejections, 6)))
                 if time.time() - last_rejected_at.timestamp() < retry_delay:
+                    continue
+                # Retrying an exchange-rejected order at the identical price
+                # cannot improve execution and only obscures the real failure.
+                if (
+                    reason == "THRESHOLD_BREACH_EXIT"
+                    and abs(float(rejected_exits[0].get("limit_price") or 0) - candidate_limit)
+                    < 1e-9
+                ):
                     continue
             pending_key = (broker.mode, ticker, side)
             if pending_key in self._pending_exit_keys:
@@ -1131,16 +1185,23 @@ class TradingCoordinator:
                 side=side,
                 action="SELL",
                 contracts=contracts,
-                limit_price=max(0.01, bid - slippage),
+                limit_price=candidate_limit,
                 strategy=str(position.get("strategy") or "MANUAL"),
                 source=reason.lower(),
+                time_in_force="immediate_or_cancel",
+                cancel_order_on_pause=False,
                 price_ranges=current.get("price_ranges"),
                 decision_snapshot=decision_snapshot,
                 risk_snapshot={"exchange_index": current.get("exchange_index")},
             )
             if reason == "THRESHOLD_BREACH_EXIT":
                 self._mark_threshold_exit_pending(
-                    broker.mode, ticker, side, threshold_exit, triggered=True
+                    broker.mode,
+                    ticker,
+                    side,
+                    threshold_exit,
+                    triggered=True,
+                    executable_bid=bid,
                 )
             self._pending_exit_keys.add(pending_key)
             task = asyncio.create_task(self._submit_exit(intent, pending_key))
@@ -1162,6 +1223,7 @@ class TradingCoordinator:
         state: dict[str, object],
         *,
         triggered: bool = False,
+        executable_bid: float | None = None,
     ) -> None:
         self.db.execute(
             """
@@ -1173,7 +1235,12 @@ class TradingCoordinator:
                     ELSE threshold_trigger_threshold END,
                 threshold_triggered_at=CASE WHEN ? THEN COALESCE(
                     threshold_triggered_at,?) ELSE threshold_triggered_at END,
-                threshold_exit_status='Exit pending',threshold_exit_block_reason=NULL
+                threshold_exit_status='Exit pending',threshold_exit_block_reason=NULL,
+                threshold_exit_last_attempt_at=CASE WHEN ? THEN ?
+                    ELSE threshold_exit_last_attempt_at END,
+                threshold_exit_last_attempt_bid=CASE WHEN ? THEN ?
+                    ELSE threshold_exit_last_attempt_bid END,
+                threshold_exit_error_code=NULL,threshold_exit_error_details_json=NULL
             WHERE mode=? AND ticker=? AND side=? AND status='open'
             """,
             (
@@ -1186,6 +1253,10 @@ class TradingCoordinator:
                 state["threshold"],
                 int(triggered),
                 datetime_now(),
+                int(triggered),
+                datetime_now(),
+                int(triggered),
+                executable_bid,
                 mode,
                 ticker,
                 side,

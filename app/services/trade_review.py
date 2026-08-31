@@ -660,6 +660,39 @@ class TradeReviewService:
             "SELECT * FROM broker_settlements WHERE mode=? AND ticker=?",
             (link["environment"], link["ticker"]),
         ) or {}
+        protection_row = self.db.fetch_one(
+            """
+            SELECT threshold_breach_enabled,threshold_exit_buffer,threshold_exit_level,
+                   threshold_trigger_btc_proxy,threshold_trigger_threshold,
+                   threshold_triggered_at,threshold_exit_status,
+                   threshold_exit_block_reason,threshold_exit_last_attempt_at,
+                   threshold_exit_last_attempt_bid,threshold_exit_error_code,
+                   threshold_exit_error_details_json,contracts
+            FROM broker_positions WHERE mode=? AND ticker=? AND side=?
+            """,
+            (link["environment"], link["ticker"], link.get("side")),
+        ) or {}
+        try:
+            protection_details = json.loads(
+                protection_row.get("threshold_exit_error_details_json") or "null"
+            )
+        except (TypeError, json.JSONDecodeError):
+            protection_details = None
+        protection = {
+            "enabled": bool(protection_row.get("threshold_breach_enabled")),
+            "buffer_dollars": protection_row.get("threshold_exit_buffer"),
+            "exit_level": protection_row.get("threshold_exit_level"),
+            "trigger_btc_proxy": protection_row.get("threshold_trigger_btc_proxy"),
+            "trigger_threshold": protection_row.get("threshold_trigger_threshold"),
+            "triggered_at": protection_row.get("threshold_triggered_at"),
+            "status": protection_row.get("threshold_exit_status"),
+            "reason": protection_row.get("threshold_exit_block_reason"),
+            "last_attempt_at": protection_row.get("threshold_exit_last_attempt_at"),
+            "last_attempt_bid": protection_row.get("threshold_exit_last_attempt_bid"),
+            "error_code": protection_row.get("threshold_exit_error_code"),
+            "error_details": protection_details,
+            "remaining_contracts": protection_row.get("contracts"),
+        } if protection_row else None
         intent = self.db.fetch_one(
             """
             SELECT decision_snapshot_json FROM broker_order_intents
@@ -699,6 +732,7 @@ class TradeReviewService:
             "edge": buy_assessment.get("net_edge"),
             "available_cash_after": settlement.get("available_cash_after")
             if settlement else latest_activity.get("available_cash_after"),
+            "threshold_breach_exit": protection,
         }
 
     def review(self, environment: str, trade_ref: str) -> dict[str, Any]:

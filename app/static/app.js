@@ -257,11 +257,13 @@ function thresholdBreachExitText(protection = {}) {
   const fields = [
     `Threshold breach exit: ${on ? "On" : "Off"}`,
     `Exit level ${money(protection.exit_level)}`,
-    `Current BTC proxy ${money(protection.btc_proxy)}`,
+    `Current BTC proxy ${money(protection.btc_proxy ?? protection.trigger_btc_proxy)}`,
     `Distance to exit ${signedMoney(protection.distance_to_exit)}`,
     `Status: ${status}`,
   ];
   if (protection.reason) fields.push(`Reason: ${protection.reason}`);
+  if (protection.last_attempt_at) fields.push(`Last attempt ${shortDate(protection.last_attempt_at)}`);
+  if (protection.remaining_contracts != null) fields.push(`Remaining ${compact(protection.remaining_contracts)} contracts`);
   return fields.join(" · ");
 }
 
@@ -1749,6 +1751,9 @@ function historicalReviewSummary(review) {
   const session = review.session || {};
   const coverage = session.coverage == null ? "--" : percent(session.coverage, 0);
   const resultClass = Number(trade.realized_pnl) > 0 ? "positive" : Number(trade.realized_pnl) < 0 ? "negative" : "";
+  const protection = trade.threshold_breach_exit || {};
+  const protectionStatus = protection.status || "Not triggered";
+  const protectionReason = protection.reason || "No failed exit recorded";
   return `
     <div class="trade-review-summary">
       <div><span>Environment / side</span><strong>${escapeHtml(review.environment)} · ${marketSideLabel(trade.side)}</strong><small>${escapeHtml(String(trade.strategy || "--").replaceAll("_", " "))}</small></div>
@@ -1759,6 +1764,7 @@ function historicalReviewSummary(review) {
       <div><span>Settlement margin</span><strong>${session.settlement_margin == null ? "--" : signedMoney(session.settlement_margin)}</strong><small>Price to threshold</small></div>
       <div><span>Available after</span><strong>${trade.available_cash_after == null ? "--" : money(trade.available_cash_after)}</strong><small>Latest transaction</small></div>
       <div><span>Coverage</span><strong>${coverage}</strong><small>${session.gap_count || 0} recorded gap${Number(session.gap_count) === 1 ? "" : "s"}</small></div>
+      <div><span>Threshold breach exit</span><strong>${escapeHtml(protectionStatus)}</strong><small>${escapeHtml(protectionReason)}</small></div>
     </div>`;
 }
 

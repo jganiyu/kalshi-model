@@ -19,10 +19,18 @@ logger = logging.getLogger(__name__)
 
 
 class KalshiTradingError(RuntimeError):
-    def __init__(self, message: str, *, status_code: int | None = None, code: str | None = None):
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        code: str | None = None,
+        details: object | None = None,
+    ):
         super().__init__(message)
         self.status_code = status_code
         self.code = code
+        self.details = details
 
 
 class AmbiguousSubmissionError(KalshiTradingError):
@@ -206,6 +214,7 @@ class KalshiTradingClient:
                 error_payload = payload
             code = str(error_payload.get("code") or "") or None
             remote_message = str(error_payload.get("message") or "")
+            details = error_payload.get("details")
             if submission and response.status_code >= 500:
                 raise AmbiguousSubmissionError(
                     "Kalshi returned an uncertain submission result; reconciliation is required."
@@ -233,7 +242,10 @@ class KalshiTradingClient:
             else:
                 message = remote_message or "Kalshi rejected the request."
             raise KalshiTradingError(
-                message, status_code=response.status_code, code=code
+                message,
+                status_code=response.status_code,
+                code=code,
+                details=details,
             )
         raise KalshiTradingError("Kalshi request failed.")
 
@@ -319,6 +331,8 @@ class KalshiTradingClient:
         live_authorized: bool = False,
         price_ranges: list[dict[str, Any]] | None = None,
         exchange_index: int | None = None,
+        time_in_force: str = "good_till_canceled",
+        cancel_order_on_pause: bool = True,
     ) -> dict[str, Any]:
         if self.environment == "LIVE" and not live_authorized:
             raise KalshiTradingError("Live order submission is not armed.")
@@ -336,15 +350,18 @@ class KalshiTradingClient:
             "side": book_side,
             "count": f"{int(contracts)}.00",
             "price": f"{book_price:.4f}",
-            "time_in_force": "good_till_canceled",
+            "time_in_force": time_in_force,
             "self_trade_prevention_type": "taker_at_cross",
             "post_only": bool(post_only),
-            "cancel_order_on_pause": True,
+            "cancel_order_on_pause": bool(cancel_order_on_pause),
             "reduce_only": bool(reduce_only),
             "subaccount": 0,
         }
-        if exchange_index is not None:
-            payload["exchange_index"] = int(exchange_index)
+        # -1 tells the V2 API to route from the ticker. This is safer than
+        # silently defaulting to shard 0 when an active market lives elsewhere.
+        payload["exchange_index"] = (
+            int(exchange_index) if exchange_index is not None else -1
+        )
         return await self._request(
             "POST",
             "/portfolio/events/orders",

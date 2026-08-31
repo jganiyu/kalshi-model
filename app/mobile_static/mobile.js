@@ -179,11 +179,13 @@ function thresholdBreachExitText(protection = {}) {
   const fields = [
     `Threshold breach exit: ${protection.enabled === false ? "Off" : "On"}`,
     `Exit level ${price(protection.exit_level)}`,
-    `Current BTC proxy ${price(protection.btc_proxy)}`,
+    `Current BTC proxy ${price(protection.btc_proxy ?? protection.trigger_btc_proxy)}`,
     `Distance to exit ${signedMoney(protection.distance_to_exit)}`,
     `Status: ${protection.status || "Blocked"}`,
   ];
   if (protection.reason) fields.push(`Reason: ${protection.reason}`);
+  if (protection.last_attempt_at) fields.push(`Last attempt ${timeLabel(protection.last_attempt_at)}`);
+  if (protection.remaining_contracts != null) fields.push(`Remaining ${compact(protection.remaining_contracts)} contracts`);
   return fields.join(" · ");
 }
 

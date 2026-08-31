@@ -53,6 +53,7 @@ class FakeTradingClient:
         self.cancel_tickers: list[str | None] = []
         self.balance_calls = 0
         self.reject_sells = False
+        self.reject_error: KalshiTradingError | None = None
 
     async def balance(self):
         self.balance_calls += 1
@@ -75,7 +76,7 @@ class FakeTradingClient:
             raise AmbiguousSubmissionError("ambiguous")
         self.created.append(payload)
         if self.reject_sells and payload["action"] == "SELL":
-            raise KalshiTradingError("invalid order", status_code=400)
+            raise self.reject_error or KalshiTradingError("invalid order", status_code=400)
         order = {
             "order_id": f"order-{len(self.created)}",
             "client_order_id": payload["client_order_id"],
@@ -417,7 +418,7 @@ def test_additive_migration_preserves_existing_paper_history(tmp_path: Path) -> 
         )
     db.initialize()
     assert db.fetch_one("SELECT side FROM paper_trades WHERE ticker='OLD'")["side"] == "NO"
-    assert db.fetch_one("SELECT MAX(version) version FROM schema_migrations")["version"] == 16
+    assert db.fetch_one("SELECT MAX(version) version FROM schema_migrations")["version"] == 18
     assert db.fetch_one("SELECT COUNT(*) count FROM broker_order_intents")["count"] == 0
 
 
@@ -497,7 +498,49 @@ async def test_v2_order_payload_is_fixed_point_limit_and_post_only(tmp_path: Pat
     assert captured["time_in_force"] == "good_till_canceled"
     assert captured["post_only"] is True
     assert captured["cancel_order_on_pause"] is True
-    assert "exchange_index" not in captured
+    assert captured["exchange_index"] == -1
+    await http.aclose()
+
+
+@run_async
+async def test_v2_protective_exit_payloads_use_the_yes_book_and_auto_route(
+    tmp_path: Path,
+) -> None:
+    captured: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        captured.append(payload)
+        return httpx.Response(201, json={
+            "order_id": f"exit-{len(captured)}",
+            "client_order_id": payload["client_order_id"],
+            "fill_count": "0.00",
+            "remaining_count": "0.00",
+        })
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client = KalshiTradingClient(
+        http, "https://external-api.demo.kalshi.co/trade-api/v2",
+        "demo-key-id", private_key(tmp_path), environment="DEMO",
+    )
+    for client_order_id, side, price in (
+        ("close-yes", "YES", .46),
+        ("close-no", "NO", .46),
+    ):
+        await client.create_order(
+            ticker="T", client_order_id=client_order_id, side=side,
+            action="SELL", contracts=2, limit_price=price, reduce_only=True,
+            time_in_force="immediate_or_cancel", cancel_order_on_pause=False,
+        )
+    assert captured[0]["side"] == "ask"
+    assert captured[0]["price"] == "0.4600"
+    assert captured[1]["side"] == "bid"
+    assert captured[1]["price"] == "0.5400"
+    for payload in captured:
+        assert payload["reduce_only"] is True
+        assert payload["time_in_force"] == "immediate_or_cancel"
+        assert payload["cancel_order_on_pause"] is False
+        assert payload["exchange_index"] == -1
     await http.aclose()
 
 
@@ -1346,7 +1389,7 @@ def test_broker_cash_migration_preserves_history_and_backfills_nearby_snapshot(
     )
     assert fill and fill["available_cash_after"] == pytest.approx(99.59)
     assert settlement and settlement["available_cash_after"] == pytest.approx(100.59)
-    assert db.fetch_one("SELECT MAX(version) version FROM schema_migrations")["version"] == 16
+    assert db.fetch_one("SELECT MAX(version) version FROM schema_migrations")["version"] == 18
 
 
 @run_async
@@ -1781,6 +1824,12 @@ async def test_rejected_threshold_exit_records_blocked_reason(tmp_path: Path) ->
     await broker.reconcile()
     broker.arm(confirmation="ARM DEMO TRADING")
     client.reject_sells = True
+    client.reject_error = KalshiTradingError(
+        "Kalshi rejected the exit price",
+        status_code=400,
+        code="invalid_order",
+        details={"field": "price", "message": "outside tick schedule", "api_key": "never-store"},
+    )
     db.update_settings({"global_profit_take_enabled": False})
     await coordinator._process_exits(
         broker,
@@ -1793,13 +1842,95 @@ async def test_rejected_threshold_exit_records_blocked_reason(tmp_path: Path) ->
     )
     await asyncio.gather(*list(coordinator._submission_tasks))
     position = db.fetch_one(
-        "SELECT threshold_exit_status,threshold_exit_block_reason "
+        "SELECT threshold_exit_status,threshold_exit_block_reason,threshold_exit_error_code,"
+        "threshold_exit_error_details_json "
         "FROM broker_positions WHERE ticker='BLOCKED-EXIT'"
     )
     assert position == {
         "threshold_exit_status": "Blocked",
-        "threshold_exit_block_reason": "invalid order",
+        "threshold_exit_block_reason": "Kalshi rejected the exit price",
+        "threshold_exit_error_code": "invalid_order",
+        "threshold_exit_error_details_json": json.dumps(
+            {
+                "code": "invalid_order",
+                "details": {"field": "price", "message": "outside tick schedule", "api_key": "[redacted]"},
+                "message": "Kalshi rejected the exit price",
+                "status_code": 400,
+            },
+            sort_keys=True,
+        ),
     }
+    intent = db.fetch_one(
+        "SELECT error,error_code,error_details_json FROM broker_order_intents "
+        "WHERE ticker='BLOCKED-EXIT' AND action='SELL'"
+    )
+    assert intent and intent["error"] == "Kalshi rejected the exit price"
+    assert intent["error_code"] == "invalid_order"
+    assert "never-store" not in str(intent["error_details_json"])
+
+
+@run_async
+async def test_settlement_does_not_relabel_a_failed_threshold_exit_as_exited(
+    tmp_path: Path,
+) -> None:
+    db, broker, client = await ready_broker(tmp_path)
+    db.execute(
+        """
+        INSERT INTO broker_positions(
+            mode,ticker,side,contracts,market_exposure,updated_at,status,
+            threshold_breach_enabled,threshold_exit_status,threshold_exit_block_reason,
+            threshold_triggered_at
+        ) VALUES ('DEMO','FAILED-EXIT','NO',2,1,?,'open',1,'Blocked',
+                  'Kalshi rejected the exit price',?)
+        """,
+        (iso_now(), iso_now()),
+    )
+    client.remote_positions = []
+    client.remote_settlements = [{
+        "ticker": "FAILED-EXIT", "market_result": "YES",
+        "settled_at": iso_now(), "realized_pnl_dollars": "-1.00",
+    }]
+    await broker.reconcile()
+    position = db.fetch_one(
+        "SELECT status,threshold_exit_status,threshold_exit_block_reason "
+        "FROM broker_positions WHERE mode='DEMO' AND ticker='FAILED-EXIT'"
+    )
+    assert position == {
+        "status": "settled",
+        "threshold_exit_status": "Blocked",
+        "threshold_exit_block_reason": "Kalshi rejected the exit price",
+    }
+
+
+@run_async
+async def test_confirmed_threshold_exit_fill_marks_position_exited(tmp_path: Path) -> None:
+    db, broker, client = await ready_broker(tmp_path)
+    now = iso_now()
+    db.execute(
+        """
+        INSERT INTO broker_positions(
+            mode,ticker,side,contracts,market_exposure,updated_at,status,
+            threshold_breach_enabled,threshold_exit_status,threshold_triggered_at
+        ) VALUES ('DEMO','EXITED','YES',2,1,?,'open',1,'Exit pending',?)
+        """,
+        (now, now),
+    )
+    db.execute(
+        """
+        INSERT INTO broker_fills(
+            mode,fill_id,ticker,side,action,contracts,price,fee,source,filled_at,raw_json
+        ) VALUES ('DEMO','confirmed-exit','EXITED','YES','SELL',2,.5,0,
+                  'threshold_breach_exit',?,'{}')
+        """,
+        (now,),
+    )
+    client.remote_positions = []
+    await broker.reconcile()
+    position = db.fetch_one(
+        "SELECT status,threshold_exit_status FROM broker_positions "
+        "WHERE mode='DEMO' AND ticker='EXITED'"
+    )
+    assert position == {"status": "closed", "threshold_exit_status": "Exited"}
 
 
 @run_async

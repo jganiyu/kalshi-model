@@ -57,6 +57,8 @@ class OrderIntent:
     source: str
     client_order_id: str = field(default_factory=lambda: str(uuid.uuid4()))
     post_only: bool = False
+    time_in_force: str = "good_till_canceled"
+    cancel_order_on_pause: bool = True
     price_ranges: list[dict[str, Any]] | None = None
     stop_loss_price: float | None = None
     target_exit_price: float | None = None
@@ -70,12 +72,17 @@ class OrderIntent:
         object.__setattr__(self, "mode", normalize_mode(self.mode))
         object.__setattr__(self, "side", str(self.side).upper())
         object.__setattr__(self, "action", str(self.action).upper())
+        object.__setattr__(self, "time_in_force", str(self.time_in_force).lower())
         if self.mode == "PAPER":
             return
         if self.side not in {"YES", "NO"}:
             raise ValueError("Choose Up or Down.")
         if self.action not in {"BUY", "SELL"}:
             raise ValueError("Choose Buy or Sell.")
+        if self.time_in_force not in {
+            "good_till_canceled", "immediate_or_cancel", "fill_or_kill"
+        }:
+            raise ValueError("Choose a supported order time in force.")
         if isinstance(self.contracts, bool) or int(self.contracts) < 1:
             raise ValueError("Contracts must be a positive whole number.")
         object.__setattr__(
@@ -154,6 +161,42 @@ def _safe_json(payload: dict[str, Any]) -> str:
         return value
 
     return json.dumps(scrub(payload), sort_keys=True, default=str)
+
+
+def _exchange_error_detail(exc: Exception) -> dict[str, Any]:
+    """Persist useful exchange diagnostics without retaining secrets."""
+    detail: dict[str, Any] = {"message": str(exc)}
+    if isinstance(exc, KalshiTradingError):
+        if exc.status_code is not None:
+            detail["status_code"] = exc.status_code
+        if exc.code:
+            detail["code"] = exc.code
+        if exc.details not in (None, ""):
+            detail["details"] = exc.details
+    return json.loads(_safe_json(detail))
+
+
+def _threshold_exit_record(position: dict[str, Any]) -> dict[str, Any]:
+    """Return safe threshold-exit evidence for the ledger and review APIs."""
+    try:
+        details = json.loads(position.get("threshold_exit_error_details_json") or "null")
+    except (TypeError, json.JSONDecodeError):
+        details = None
+    return {
+        "enabled": bool(position.get("threshold_breach_enabled")),
+        "buffer_dollars": position.get("threshold_exit_buffer"),
+        "exit_level": position.get("threshold_exit_level"),
+        "trigger_btc_proxy": position.get("threshold_trigger_btc_proxy"),
+        "trigger_threshold": position.get("threshold_trigger_threshold"),
+        "triggered_at": position.get("threshold_triggered_at"),
+        "status": position.get("threshold_exit_status"),
+        "reason": position.get("threshold_exit_block_reason"),
+        "last_attempt_at": position.get("threshold_exit_last_attempt_at"),
+        "last_attempt_bid": position.get("threshold_exit_last_attempt_bid"),
+        "error_code": position.get("threshold_exit_error_code"),
+        "error_details": details,
+        "remaining_contracts": position.get("contracts"),
+    }
 
 
 def fill_aggregate(
@@ -518,6 +561,17 @@ class KalshiBroker(Broker):
             for row in settlement_margin_rows
             if row.get("settlement_price") is not None and row.get("strike") is not None
         }
+        protection_rows = self.db.fetch_all(
+            """
+            SELECT * FROM broker_positions
+            WHERE mode=? AND threshold_breach_enabled IS NOT NULL
+            """,
+            (self.mode,),
+        )
+        protections = {
+            (str(row.get("ticker")), str(row.get("side"))): _threshold_exit_record(row)
+            for row in protection_rows
+        }
         grouped: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
         for fill in fills:
             grouped[(str(fill.get("ticker")), str(fill.get("side")))].append(fill)
@@ -643,6 +697,7 @@ class KalshiBroker(Broker):
                     "margin_cushion_ratio": (
                         entry_evidence.get(key) or {}
                     ).get("margin_cushion_ratio"),
+                    "threshold_breach_exit": protections.get(key),
                     **review_metadata(self.db, self.mode, trade_ref, status),
                 }
             )
@@ -1084,6 +1139,8 @@ class KalshiBroker(Broker):
                 live_authorized=self.session_armed,
                 price_ranges=intent.price_ranges,
                 exchange_index=intent.risk_snapshot.get("exchange_index"),
+                time_in_force=intent.time_in_force,
+                cancel_order_on_pause=intent.cancel_order_on_pause,
             )
         except AmbiguousSubmissionError as exc:
             self._set_intent(
@@ -1098,13 +1155,31 @@ class KalshiBroker(Broker):
             self._audit("SUBMISSION_AMBIGUOUS", {"error": str(exc)}, intent=intent)
             raise
         except (KalshiTradingError, ValueError) as exc:
-            self._set_intent(intent.client_order_id, "REJECTED", error=str(exc))
-            self._audit("SUBMISSION_REJECTED", {"error": str(exc)}, intent=intent)
+            exchange_error = _exchange_error_detail(exc)
+            self._set_intent(
+                intent.client_order_id,
+                "REJECTED",
+                error=str(exc),
+                error_code=exchange_error.get("code"),
+                error_details=exchange_error,
+            )
+            self._audit(
+                "SUBMISSION_REJECTED",
+                {"error": str(exc), "exchange_error": exchange_error},
+                intent=intent,
+            )
             raise
         exchange_order_id = str(response.get("order_id") or "")
         fill_count = _number(response.get("fill_count") or response.get("fill_count_fp"))
         remaining = _number(response.get("remaining_count") or response.get("remaining_count_fp"), intent.contracts)
-        status = "FILLED" if remaining <= 0 else "PARTIALLY_FILLED" if fill_count > 0 else "ACKNOWLEDGED"
+        # IOC responses report zero remaining contracts even when nothing
+        # matched. A zero-fill IOC is not a completed fill.
+        status = (
+            "FILLED" if fill_count >= intent.contracts and fill_count > 0
+            else "PARTIALLY_FILLED" if fill_count > 0
+            else "CANCELED" if intent.time_in_force == "immediate_or_cancel"
+            else "ACKNOWLEDGED"
+        )
         self._set_intent(
             intent.client_order_id,
             status,
@@ -1818,7 +1893,14 @@ class KalshiBroker(Broker):
                         UPDATE broker_positions SET contracts=0,market_exposure=0,
                             realized_pnl=?,fees=?,updated_at=?,status='closed'
                             ,threshold_exit_status=CASE
-                                WHEN threshold_triggered_at IS NOT NULL THEN 'Exited'
+                                WHEN EXISTS (
+                                    SELECT 1 FROM broker_fills f
+                                    WHERE f.mode=broker_positions.mode
+                                      AND f.ticker=broker_positions.ticker
+                                      AND f.side=broker_positions.side
+                                      AND f.action='SELL'
+                                      AND f.source='threshold_breach_exit'
+                                ) THEN 'Exited'
                                 ELSE threshold_exit_status END
                         WHERE mode=? AND ticker=? AND status='open'
                         """,
@@ -1878,8 +1960,14 @@ class KalshiBroker(Broker):
             if key not in active:
                 self.db.execute(
                     """UPDATE broker_positions SET status='closed',contracts=0,updated_at=?,
-                        threshold_exit_status=CASE WHEN threshold_triggered_at IS NOT NULL
-                            THEN 'Exited' ELSE threshold_exit_status END
+                        threshold_exit_status=CASE WHEN EXISTS (
+                            SELECT 1 FROM broker_fills f
+                            WHERE f.mode=broker_positions.mode
+                              AND f.ticker=broker_positions.ticker
+                              AND f.side=broker_positions.side
+                              AND f.action='SELL'
+                              AND f.source='threshold_breach_exit'
+                        ) THEN 'Exited' ELSE threshold_exit_status END
                         WHERE mode=? AND ticker=? AND side=?""",
                     (iso_now(), self.mode, *key),
                 )
@@ -2005,6 +2093,8 @@ class KalshiBroker(Broker):
         *,
         exchange_order_id: str | None = None,
         error: str | None = None,
+        error_code: str | None = None,
+        error_details: dict[str, Any] | None = None,
     ) -> None:
         previous = self.db.fetch_one(
             "SELECT status,ticker,exchange_order_id FROM broker_order_intents WHERE mode=? AND client_order_id=?",
@@ -2013,9 +2103,19 @@ class KalshiBroker(Broker):
         self.db.execute(
             """
             UPDATE broker_order_intents SET status=?,exchange_order_id=COALESCE(?,exchange_order_id),
-                error=?,updated_at=? WHERE mode=? AND client_order_id=?
+                error=?,error_code=?,error_details_json=?,updated_at=?
+            WHERE mode=? AND client_order_id=?
             """,
-            (status, exchange_order_id, error, iso_now(), self.mode, client_order_id),
+            (
+                status,
+                exchange_order_id,
+                error,
+                error_code,
+                _safe_json(error_details) if error_details is not None else None,
+                iso_now(),
+                self.mode,
+                client_order_id,
+            ),
         )
         if previous and previous.get("status") != status:
             self._audit(
@@ -2024,6 +2124,8 @@ class KalshiBroker(Broker):
                     "from": previous.get("status"),
                     "to": status,
                     "error": error,
+                    "error_code": error_code,
+                    "error_details": error_details,
                 },
                 client_order_id=client_order_id,
                 exchange_order_id=(

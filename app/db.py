@@ -831,6 +831,86 @@ MIGRATIONS: list[tuple[int, str]] = [
         ALTER TABLE broker_positions ADD COLUMN threshold_exit_block_reason TEXT;
         """,
     ),
+    (
+        17,
+        """
+        ALTER TABLE broker_order_intents ADD COLUMN error_code TEXT;
+        ALTER TABLE broker_order_intents ADD COLUMN error_details_json TEXT;
+
+        ALTER TABLE broker_positions ADD COLUMN threshold_exit_last_attempt_at TEXT;
+        ALTER TABLE broker_positions ADD COLUMN threshold_exit_last_attempt_bid REAL;
+        ALTER TABLE broker_positions ADD COLUMN threshold_exit_error_code TEXT;
+        ALTER TABLE broker_positions ADD COLUMN threshold_exit_error_details_json TEXT;
+
+        -- Settlement is not evidence that a protective exit filled. Repair
+        -- earlier history that was incorrectly labeled Exited on settlement.
+        UPDATE broker_positions
+        SET threshold_exit_status='Blocked',
+            threshold_exit_block_reason=COALESCE(
+                threshold_exit_block_reason,
+                (
+                    SELECT i.error FROM broker_order_intents i
+                    WHERE i.mode=broker_positions.mode
+                      AND i.ticker=broker_positions.ticker
+                      AND i.side=broker_positions.side
+                      AND i.action='SELL'
+                      AND i.source='threshold_breach_exit'
+                      AND i.status='REJECTED'
+                    ORDER BY i.id DESC LIMIT 1
+                ),
+                'Threshold exit was not confirmed before settlement.'
+            )
+        WHERE threshold_exit_status='Exited'
+          AND threshold_triggered_at IS NOT NULL
+          AND NOT EXISTS (
+              SELECT 1 FROM broker_fills f
+              WHERE f.mode=broker_positions.mode
+                AND f.ticker=broker_positions.ticker
+                AND f.side=broker_positions.side
+                AND f.action='SELL'
+                AND f.source='threshold_breach_exit'
+          );
+        """,
+    ),
+    (
+        18,
+        """
+        -- Prefer the actual rejected protective-order reason over a later
+        -- data-quality message that could overwrite it on older rows.
+        UPDATE broker_positions
+        SET threshold_exit_status='Blocked',
+            threshold_exit_block_reason=(
+                SELECT i.error FROM broker_order_intents i
+                WHERE i.mode=broker_positions.mode
+                  AND i.ticker=broker_positions.ticker
+                  AND i.side=broker_positions.side
+                  AND i.action='SELL'
+                  AND i.source='threshold_breach_exit'
+                  AND i.status='REJECTED'
+                  AND i.error IS NOT NULL
+                ORDER BY i.id DESC LIMIT 1
+            )
+        WHERE threshold_exit_status='Blocked'
+          AND EXISTS (
+              SELECT 1 FROM broker_order_intents i
+              WHERE i.mode=broker_positions.mode
+                AND i.ticker=broker_positions.ticker
+                  AND i.side=broker_positions.side
+                  AND i.action='SELL'
+                  AND i.source='threshold_breach_exit'
+                  AND i.status='REJECTED'
+                  AND i.error IS NOT NULL
+          )
+          AND NOT EXISTS (
+              SELECT 1 FROM broker_fills f
+              WHERE f.mode=broker_positions.mode
+                AND f.ticker=broker_positions.ticker
+                AND f.side=broker_positions.side
+                AND f.action='SELL'
+                AND f.source='threshold_breach_exit'
+          );
+        """,
+    ),
 ]
 
 
