@@ -382,7 +382,7 @@ def test_legacy_history_survives_additive_migration_without_fake_review(
         ).lastrowid
     db.initialize()
     assert db.fetch_one("SELECT id FROM paper_trades WHERE id=?", (trade_id,))
-    assert db.fetch_one("SELECT MAX(version) version FROM schema_migrations")["version"] == 18
+    assert db.fetch_one("SELECT MAX(version) version FROM schema_migrations")["version"] == 19
     metadata = review_metadata(db, "PAPER", paper_trade_ref(trade_id), "settled")
     assert metadata["review_available"] is False
     assert metadata["review_status"] == "UNAVAILABLE"

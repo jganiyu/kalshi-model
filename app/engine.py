@@ -1138,7 +1138,9 @@ class AnalysisEngine:
                     observed_at, market["ticker"], yes_bid, yes_ask, no_bid, no_ask, spread,
                     state["liquidity"], state["open_interest"], state["volume"],
                     state["yes_bid_size"], state["yes_ask_size"], state["imbalance"],
-                    rapid, json.dumps(metrics),
+                    # Normalized columns contain every value consumed by the
+                    # model and historical review; avoid a redundant full book.
+                    rapid, "{}",
                 ),
             )
         return state
@@ -1765,19 +1767,27 @@ class AnalysisEngine:
     ) -> dict[str, Any]:
         async with self._update_lock:
             current_settings = self.db.settings()
-            live_limit_changed = any(
-                key.startswith("live_")
+            changed_live_limits = [
+                key
+                for key, value in updates.items()
+                if key.startswith("live_")
                 and key not in {"live_automatic_trading_enabled"}
                 and current_settings.get(key) != value
-                for key, value in updates.items()
-            )
+            ]
             settings = self.db.update_settings(
                 updates, restored_from_id=restored_from_id
             )
-            if live_limit_changed:
+            if changed_live_limits:
                 live_broker = self.trading.broker("LIVE")
                 if isinstance(live_broker, KalshiBroker):
-                    live_broker.disarm("Live limits changed; rearm to continue.")
+                    live_broker._audit(
+                        "LIVE_LIMITS_CHANGED",
+                        {
+                            "settings": sorted(changed_live_limits),
+                            "session_remains_armed": live_broker.session_armed,
+                            "automatic_remains_armed": live_broker.automatic_armed,
+                        },
+                    )
             self._refresh_cached_dashboard(iso_now())
             return settings
 

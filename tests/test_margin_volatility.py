@@ -170,7 +170,7 @@ def test_additive_migration_preserves_history_and_settings(tmp_path: Path) -> No
     legacy.initialize()
     assert legacy.settings()["starting_bankroll"] == pytest.approx(4321.0)
     assert legacy.settings()["maximum_margin_volatility"] == pytest.approx(0.0)
-    assert legacy.fetch_one("SELECT MAX(version) version FROM schema_migrations")["version"] == 18
+    assert legacy.fetch_one("SELECT MAX(version) version FROM schema_migrations")["version"] == 19
     assert legacy.fetch_one("SELECT COUNT(*) count FROM margin_volatility_observations")["count"] == 0
     assert "margin_volatility_index" in {
         row["name"] for row in legacy.fetch_all("PRAGMA table_info(signal_snapshots)")

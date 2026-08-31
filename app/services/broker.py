@@ -237,6 +237,9 @@ class KalshiBroker(Broker):
         self.session_armed = False
         self.automatic_armed = False
         self._last_connection_at: float | None = None
+        self._reconcile_lock = asyncio.Lock()
+        self._reconcile_generation = 0
+        self._reconciliation_paused = False
 
     def set_client(self, client: KalshiTradingClient | None) -> None:
         self.client = client
@@ -1118,9 +1121,8 @@ class KalshiBroker(Broker):
         if not risk["passed"]:
             self._set_intent(intent.client_order_id, "REJECTED", error=risk["primary_blocker"])
             if self.mode == "LIVE" and intent.action == "BUY":
-                self.automatic_armed = False
                 self._audit(
-                    "AUTOMATIC_DISARMED_BY_RISK",
+                    "AUTOMATIC_ENTRY_BLOCKED_BY_RISK",
                     {"reason": risk["primary_blocker"]},
                     intent=intent,
                 )
@@ -1151,7 +1153,6 @@ class KalshiBroker(Broker):
                 reconciliation_required=True,
                 last_error=str(exc),
             )
-            self.disarm(str(exc))
             self._audit("SUBMISSION_AMBIGUOUS", {"error": str(exc)}, intent=intent)
             raise
         except (KalshiTradingError, ValueError) as exc:
@@ -1239,6 +1240,16 @@ class KalshiBroker(Broker):
         return response
 
     async def reconcile(self) -> dict[str, Any]:
+        """Coalesce overlapping account refreshes into one authoritative result."""
+        requested_generation = self._reconcile_generation
+        async with self._reconcile_lock:
+            if requested_generation != self._reconcile_generation:
+                return self.portfolio()
+            result = await self._reconcile_once()
+            self._reconcile_generation += 1
+            return result
+
+    async def _reconcile_once(self) -> dict[str, Any]:
         if self.client is None:
             self._update_mode_state(
                 connected=False, authenticated=False, reconciled=False,
@@ -1252,6 +1263,7 @@ class KalshiBroker(Broker):
                 self.client.positions(), self.client.settlements(),
             )
         except (KalshiTradingError, ValueError) as exc:
+            exchange_error = _exchange_error_detail(exc)
             failed_state: dict[str, Any] = dict(
                 connected=False,
                 reconciled=False,
@@ -1261,7 +1273,17 @@ class KalshiBroker(Broker):
             if getattr(exc, "status_code", None) in {401, 403}:
                 failed_state["authenticated"] = False
             self._update_mode_state(**failed_state)
-            self.disarm("Reconciliation failed.")
+            if not self._reconciliation_paused:
+                self._audit(
+                    "RECONCILIATION_PAUSED",
+                    {
+                        "reason": str(exc),
+                        "exchange_error": exchange_error,
+                        "session_will_resume": self.session_armed,
+                        "automatic_will_resume": self.automatic_armed,
+                    },
+                )
+            self._reconciliation_paused = True
             raise
         observed_at = iso_now()
         available = _dollars(balance, "balance_dollars", "balance")
@@ -1390,6 +1412,8 @@ class KalshiBroker(Broker):
             ),
         )
         self._last_connection_at = time.monotonic()
+        was_paused = self._reconciliation_paused
+        self._reconciliation_paused = False
         self._audit(
             "RECONCILED",
             {
@@ -1400,6 +1424,14 @@ class KalshiBroker(Broker):
                 "unresolved_submissions": int(unresolved.get("count") or 0),
             },
         )
+        if was_paused:
+            self._audit(
+                "RECONCILIATION_RESUMED",
+                {
+                    "session_resumed": self.session_armed,
+                    "automatic_resumed": self.automatic_armed,
+                },
+            )
         return self.portfolio()
 
     def _settled_without_matching_fill(
@@ -1675,13 +1707,13 @@ class KalshiBroker(Broker):
         if not exchange_id:
             return
         previous = self.db.fetch_one(
-            "SELECT status FROM broker_orders WHERE mode=? AND exchange_order_id=?",
+            "SELECT * FROM broker_orders WHERE mode=? AND exchange_order_id=?",
             (self.mode, exchange_id),
         )
         side, action, limit_price = self._semantic_order(order)
         client_id = str(order.get("client_order_id") or "") or None
         intent = self.db.fetch_one(
-            "SELECT strategy,source FROM broker_order_intents WHERE mode=? AND client_order_id=?",
+            "SELECT strategy,source,status FROM broker_order_intents WHERE mode=? AND client_order_id=?",
             (self.mode, client_id),
         ) if client_id else None
         requested = _number(
@@ -1698,6 +1730,19 @@ class KalshiBroker(Broker):
             max(0.0, requested - filled),
         )
         status = self._order_status(order) if str(order.get("status") or "").upper() not in OPEN_ORDER_STATES | FINAL_ORDER_STATES else str(order["status"]).upper()
+        # Kalshi continues returning settled BUY orders as `executed`. Settlement
+        # is a stronger local terminal state, so never regress it to FILLED.
+        if status == "FILLED" and action == "BUY":
+            settlement_exists = self.db.fetch_one(
+                "SELECT 1 AS found FROM broker_settlements WHERE mode=? AND ticker=?",
+                (self.mode, str(order.get("ticker") or "")),
+            )
+            if (
+                (previous or {}).get("status") == "SETTLED"
+                or (intent or {}).get("status") == "SETTLED"
+                or settlement_exists
+            ):
+                status = "SETTLED"
         updated_at = str(order.get("last_update_time") or order.get("updated_at") or iso_now())
         self.db.execute(
             """
@@ -2097,9 +2142,24 @@ class KalshiBroker(Broker):
         error_details: dict[str, Any] | None = None,
     ) -> None:
         previous = self.db.fetch_one(
-            "SELECT status,ticker,exchange_order_id FROM broker_order_intents WHERE mode=? AND client_order_id=?",
+            "SELECT status,ticker,exchange_order_id,error,error_code,error_details_json "
+            "FROM broker_order_intents WHERE mode=? AND client_order_id=?",
             (self.mode, client_order_id),
         )
+        serialized_details = (
+            _safe_json(error_details) if error_details is not None else None
+        )
+        if previous and all(
+            (
+                previous.get("status") == status,
+                previous.get("exchange_order_id")
+                == (exchange_order_id or previous.get("exchange_order_id")),
+                previous.get("error") == error,
+                previous.get("error_code") == error_code,
+                previous.get("error_details_json") == serialized_details,
+            )
+        ):
+            return
         self.db.execute(
             """
             UPDATE broker_order_intents SET status=?,exchange_order_id=COALESCE(?,exchange_order_id),
@@ -2111,7 +2171,7 @@ class KalshiBroker(Broker):
                 exchange_order_id,
                 error,
                 error_code,
-                _safe_json(error_details) if error_details is not None else None,
+                serialized_details,
                 iso_now(),
                 self.mode,
                 client_order_id,

@@ -771,13 +771,19 @@ def test_live_limit_review_persists_across_calibration_saves_and_restart(
 
     asyncio.run(engine.apply_settings({"live_max_amount_per_order": 25.0}))
 
-    assert broker.session_armed is False
-    assert broker.automatic_armed is False
+    assert broker.session_armed is True
+    assert broker.automatic_armed is True
     assert broker.mode_state()["limits_reviewed_at"] == reviewed_at
+    assert any(
+        event["event_type"] == "LIVE_LIMITS_CHANGED"
+        for event in broker.audit_history(10)
+    )
 
     restarted = AnalysisEngine(AppConfig(database_path=db.path), db)
     restarted_broker = restarted.trading.broker("LIVE")
     assert isinstance(restarted_broker, KalshiBroker)
+    assert restarted_broker.session_armed is False
+    assert restarted_broker.automatic_armed is False
     restarted_broker.arm(confirmation="ARM LIVE TRADING")
     assert restarted_broker.readiness()["limits_reviewed"] is True
     assert restarted_broker.session_armed is True

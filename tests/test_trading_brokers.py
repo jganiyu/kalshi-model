@@ -423,8 +423,66 @@ def test_additive_migration_preserves_existing_paper_history(tmp_path: Path) -> 
         )
     db.initialize()
     assert db.fetch_one("SELECT side FROM paper_trades WHERE ticker='OLD'")["side"] == "NO"
-    assert db.fetch_one("SELECT MAX(version) version FROM schema_migrations")["version"] == 18
+    assert db.fetch_one("SELECT MAX(version) version FROM schema_migrations")["version"] == 19
     assert db.fetch_one("SELECT COUNT(*) count FROM broker_order_intents")["count"] == 0
+
+
+def test_storage_cleanup_removes_only_redundant_reconciliation_data(
+    tmp_path: Path,
+) -> None:
+    db = Database(tmp_path / "cleanup.db")
+    with db.transaction() as connection:
+        for version, sql in MIGRATIONS[:18]:
+            connection.executescript(sql)
+            connection.execute(
+                "INSERT INTO schema_migrations(version,applied_at) VALUES (?,?)",
+                (version, iso_now()),
+            )
+        now = iso_now()
+        connection.execute(
+            "INSERT INTO markets(ticker,status,raw_json,first_seen_at,updated_at) "
+            "VALUES ('CLEAN','settled','{}',?,?)",
+            (now, now),
+        )
+        connection.execute(
+            "INSERT INTO kalshi_snapshots(observed_at,ticker,orderbook_json) "
+            "VALUES (?, 'CLEAN', '{\"yes\":[[40,2]]}')",
+            (now,),
+        )
+        connection.execute(
+            "INSERT INTO kalshi_trade_ticks("
+            "observed_at,ticker,trade_id,contracts,is_block_trade,raw_json"
+            ") VALUES (?, 'CLEAN', 'trade-1', 2, 0, '{\"trade_id\":\"trade-1\"}')",
+            (now,),
+        )
+        connection.executemany(
+            "INSERT INTO broker_audit_events("
+            "mode,created_at,event_type,detail_json"
+            ") VALUES ('LIVE',?,?,?)",
+            [
+                (
+                    now,
+                    "ORDER_STATE_CHANGED",
+                    '{"from":"SETTLED","to":"FILLED"}',
+                ),
+                (now, "ARMED", '{"automatic":true}'),
+            ],
+        )
+
+    db.initialize()
+
+    assert db.fetch_one(
+        "SELECT COUNT(*) count FROM broker_audit_events"
+    )["count"] == 1
+    assert db.fetch_one(
+        "SELECT event_type FROM broker_audit_events"
+    )["event_type"] == "ARMED"
+    assert db.fetch_one(
+        "SELECT orderbook_json FROM kalshi_snapshots"
+    )["orderbook_json"] == "{}"
+    assert db.fetch_one(
+        "SELECT raw_json FROM kalshi_trade_ticks"
+    )["raw_json"] == "{}"
 
 
 @run_async
@@ -1052,7 +1110,9 @@ async def test_live_automation_resumes_after_private_stream_reconnect(
 
 
 @run_async
-async def test_live_reconnect_failure_disarms_trading(tmp_path: Path) -> None:
+async def test_live_reconciliation_failure_pauses_then_resumes_trading(
+    tmp_path: Path,
+) -> None:
     db = make_db(tmp_path)
     coordinator = TradingCoordinator(
         AppConfig(database_path=db.path), db, PaperTradingService(db)
@@ -1072,13 +1132,96 @@ async def test_live_reconnect_failure_disarms_trading(tmp_path: Path) -> None:
         "LIVE", False, "temporary disconnect"
     )
 
+    healthy_balance = client.balance
+
     async def failed_balance():
         raise KalshiTradingError("reconciliation unavailable")
 
     client.balance = failed_balance  # type: ignore[method-assign]
     await coordinator._handle_private_stream_status("LIVE", True, None)
-    assert broker.session_armed is False
-    assert broker.automatic_armed is False
+    assert broker.session_armed is True
+    assert broker.automatic_armed is True
+    assert broker.readiness()["ready_for_automatic"] is False
+    assert broker.mode_state()["last_error"] == "reconciliation unavailable"
+
+    client.balance = healthy_balance  # type: ignore[method-assign]
+    await coordinator._handle_private_stream_status("LIVE", True, None)
+    assert broker.session_armed is True
+    assert broker.automatic_armed is True
+    assert broker.readiness()["ready_for_automatic"] is True
+    events = broker.audit_history(20)
+    assert any(event["event_type"] == "RECONCILIATION_PAUSED" for event in events)
+    assert any(
+        event["event_type"] == "RECONCILIATION_RESUMED"
+        and event["detail"]["automatic_resumed"] is True
+        for event in events
+    )
+
+
+@run_async
+async def test_overlapping_reconciliations_are_coalesced(tmp_path: Path) -> None:
+    db = make_db(tmp_path)
+    client = FakeTradingClient()
+    broker = KalshiBroker("DEMO", db, client)  # type: ignore[arg-type]
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def slow_balance():
+        client.balance_calls += 1
+        started.set()
+        await release.wait()
+        return dict(client.balance_payload)
+
+    client.balance = slow_balance  # type: ignore[method-assign]
+    tasks = [asyncio.create_task(broker.reconcile()) for _ in range(6)]
+    await started.wait()
+    release.set()
+    await asyncio.gather(*tasks)
+
+    assert client.balance_calls == 1
+    assert db.fetch_one(
+        "SELECT COUNT(*) count FROM broker_audit_events "
+        "WHERE mode='DEMO' AND event_type='RECONCILED'"
+    )["count"] == 1
+
+
+@run_async
+async def test_settled_order_does_not_regress_or_generate_reconcile_churn(
+    tmp_path: Path,
+) -> None:
+    db, broker, client = await ready_broker(tmp_path)
+    intent = OrderIntent(
+        "DEMO", "SETTLED-STABLE", "YES", "BUY", 1, .40,
+        "STANDARD_EDGE", "automatic",
+    )
+    await broker.submit(intent)
+    client.remote_orders[0].update(
+        {"status": "executed", "fill_count": "1.00", "remaining_count": "0.00"}
+    )
+    client.remote_settlements = [{
+        "ticker": "SETTLED-STABLE",
+        "market_result": "YES",
+        "settled_time": "2026-08-30T12:15:00+00:00",
+        "revenue_dollars": "1.00",
+    }]
+
+    await broker.reconcile()
+    assert db.fetch_one(
+        "SELECT status FROM broker_orders WHERE mode='DEMO' AND ticker='SETTLED-STABLE'"
+    )["status"] == "SETTLED"
+    assert db.fetch_one(
+        "SELECT status FROM broker_order_intents "
+        "WHERE mode='DEMO' AND ticker='SETTLED-STABLE'"
+    )["status"] == "SETTLED"
+
+    await broker.reconcile()
+    assert db.fetch_one(
+        "SELECT COUNT(*) count FROM broker_audit_events "
+        "WHERE mode='DEMO' AND event_type IN "
+        "('ORDER_STATE_CHANGED','INTENT_STATE_CHANGED') "
+        "AND json_extract(detail_json,'$.from')='SETTLED' "
+        "AND json_extract(detail_json,'$.to')='FILLED'"
+    )["count"] == 0
 
 
 @run_async
@@ -1394,7 +1537,7 @@ def test_broker_cash_migration_preserves_history_and_backfills_nearby_snapshot(
     )
     assert fill and fill["available_cash_after"] == pytest.approx(99.59)
     assert settlement and settlement["available_cash_after"] == pytest.approx(100.59)
-    assert db.fetch_one("SELECT MAX(version) version FROM schema_migrations")["version"] == 18
+    assert db.fetch_one("SELECT MAX(version) version FROM schema_migrations")["version"] == 19
 
 
 @run_async
@@ -1799,11 +1942,12 @@ async def test_breached_exchange_position_uses_reduce_only_exit_once_after_armin
         "SELECT * FROM broker_positions WHERE mode=? AND ticker='BREACHED'",
         (mode,),
     )
-    assert position and position["threshold_exit_status"] == "Exit pending"
+    assert position and position["threshold_exit_status"] == "Blocked"
+    assert "did not fill" in position["threshold_exit_block_reason"]
     displayed = coordinator.summary(current)["modes"][mode]["positions"][0][
         "threshold_breach_exit"
     ]
-    assert displayed["status"] == "Exit pending"
+    assert displayed["status"] == "Blocked"
     assert displayed["exit_level"] == 100.0
     assert displayed["btc_proxy"] == btc_proxy
 
@@ -2021,7 +2165,7 @@ async def test_sell_respects_contracts_reserved_by_another_exit(tmp_path: Path) 
 
 
 @run_async
-async def test_live_risk_failure_disarms_automatic_only(tmp_path: Path) -> None:
+async def test_live_risk_failure_blocks_entry_without_disarming(tmp_path: Path) -> None:
     db, broker, client = await ready_broker(tmp_path, "LIVE")
     db.update_settings({"live_max_amount_per_order": .01})
     with pytest.raises(ValueError, match="maximum amount"):
@@ -2029,8 +2173,12 @@ async def test_live_risk_failure_disarms_automatic_only(tmp_path: Path) -> None:
             OrderIntent("LIVE", "RISK", "YES", "BUY", 1, .4, "STANDARD_EDGE", "automatic")
         )
     assert broker.session_armed is True
-    assert broker.automatic_armed is False
+    assert broker.automatic_armed is True
     assert client.created == []
+    assert any(
+        event["event_type"] == "AUTOMATIC_ENTRY_BLOCKED_BY_RISK"
+        for event in broker.audit_history(10)
+    )
 
 
 @run_async

@@ -190,7 +190,8 @@ class VolumeSignalService:
                 (
                     str(observed_at), ticker, trade_id, price, contracts, side,
                     int(bool(trade.get("is_block_trade"))),
-                    json.dumps(trade, sort_keys=True),
+                    # Every volume calculation uses the normalized columns.
+                    "{}",
                 )
             )
         self.db.executemany(

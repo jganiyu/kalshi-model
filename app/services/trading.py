@@ -219,7 +219,9 @@ class TradingCoordinator:
             try:
                 await broker.reconcile()
             except (KalshiTradingError, ValueError):
-                broker.disarm("Private stream reconciliation failed.")
+                # Reconciliation itself blocks trading. Keep the user's in-memory
+                # arm state so a later successful refresh can resume it.
+                pass
 
         async def on_status(_: str, connected: bool, error: str | None) -> None:
             await self._handle_private_stream_status(mode, connected, error)
@@ -262,7 +264,6 @@ class TradingCoordinator:
         try:
             await broker.reconcile()
         except (KalshiTradingError, ValueError):
-            broker.disarm("Private stream reconciliation failed.")
             return
         if broker.session_armed:
             broker._audit(
@@ -284,7 +285,9 @@ class TradingCoordinator:
                 try:
                     await broker.reconcile()
                 except (KalshiTradingError, ValueError):
-                    broker.disarm("Periodic account reconciliation failed.")
+                    # A later successful reconciliation restores readiness while
+                    # retaining the user's arm and automatic-trading choices.
+                    pass
 
         self._reconciliation_tasks[mode] = asyncio.create_task(run())
 
@@ -1152,8 +1155,7 @@ class TradingCoordinator:
                 # Repeating an unfilled protective order at an unchanged price
                 # cannot improve execution and can churn a thin market.
                 if (
-                    reason == "THRESHOLD_BREACH_EXIT"
-                    and abs(float(rejected_exits[0].get("limit_price") or 0) - candidate_limit)
+                    abs(float(rejected_exits[0].get("limit_price") or 0) - candidate_limit)
                     < 1e-9
                 ):
                     continue
