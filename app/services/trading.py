@@ -891,8 +891,31 @@ class TradingCoordinator:
         broker = self.broker(intent.mode)
         assert isinstance(broker, KalshiBroker)
         try:
-            await broker.submit(intent)
+            result = await broker.submit(intent)
             await broker.reconcile()
+            if (
+                intent.action == "SELL"
+                and intent.source == "threshold_breach_exit"
+                and str(result.get("status") or "").upper()
+                in {"CANCELED", "EXPIRED"}
+            ):
+                self.db.execute(
+                    """
+                    UPDATE broker_positions SET threshold_exit_status='Blocked',
+                        threshold_exit_block_reason=?,threshold_exit_last_attempt_at=?,
+                        threshold_exit_last_attempt_bid=?
+                    WHERE mode=? AND ticker=? AND side=? AND status='open'
+                    """,
+                    (
+                        "Kalshi accepted the protective exit but it did not fill; "
+                        "waiting for a new executable quote.",
+                        datetime_now(),
+                        intent.decision_snapshot.get("executable_bid"),
+                        intent.mode,
+                        intent.ticker,
+                        intent.side,
+                    ),
+                )
             if intent.action == "BUY":
                 self.db.execute(
                     """
@@ -1120,19 +1143,14 @@ class TradingCoordinator:
                 """,
                 (broker.mode, ticker, side, reason.lower()),
             )
-            consecutive_rejections = 0
-            last_rejected_at = None
+            consecutive_unfilled = 0
             for row in rejected_exits:
-                if row.get("status") != "REJECTED":
+                if row.get("status") not in {"REJECTED", "CANCELED", "EXPIRED"}:
                     break
-                consecutive_rejections += 1
-                last_rejected_at = last_rejected_at or parse_time(row.get("updated_at"))
-            if consecutive_rejections and last_rejected_at:
-                retry_delay = min(60.0, float(2 ** min(consecutive_rejections, 6)))
-                if time.time() - last_rejected_at.timestamp() < retry_delay:
-                    continue
-                # Retrying an exchange-rejected order at the identical price
-                # cannot improve execution and only obscures the real failure.
+                consecutive_unfilled += 1
+            if consecutive_unfilled:
+                # Repeating an unfilled protective order at an unchanged price
+                # cannot improve execution and can churn a thin market.
                 if (
                     reason == "THRESHOLD_BREACH_EXIT"
                     and abs(float(rejected_exits[0].get("limit_price") or 0) - candidate_limit)

@@ -54,6 +54,7 @@ class FakeTradingClient:
         self.balance_calls = 0
         self.reject_sells = False
         self.reject_error: KalshiTradingError | None = None
+        self.cancel_ioc = False
 
     async def balance(self):
         self.balance_calls += 1
@@ -77,12 +78,16 @@ class FakeTradingClient:
         self.created.append(payload)
         if self.reject_sells and payload["action"] == "SELL":
             raise self.reject_error or KalshiTradingError("invalid order", status_code=400)
+        unfilled_ioc = bool(
+            self.cancel_ioc
+            and payload.get("time_in_force") == "immediate_or_cancel"
+        )
         order = {
             "order_id": f"order-{len(self.created)}",
             "client_order_id": payload["client_order_id"],
             "ticker": payload["ticker"],
             "fill_count": "0.00",
-            "remaining_count": f'{payload["contracts"]}.00',
+            "remaining_count": "0.00" if unfilled_ioc else f'{payload["contracts"]}.00',
         }
         book_side, book_price = outcome_to_book(
             payload["side"], payload["action"], payload["limit_price"]
@@ -92,7 +97,7 @@ class FakeTradingClient:
             "side": book_side,
             "price": str(book_price),
             "count": str(payload["contracts"]),
-            "status": "resting",
+            "status": "canceled" if unfilled_ioc else "resting",
             "reduce_only": payload["reduce_only"],
         })
         return order
@@ -1805,6 +1810,61 @@ async def test_breached_exchange_position_uses_reduce_only_exit_once_after_armin
     await coordinator._process_exits(broker, current)
     await asyncio.gather(*list(coordinator._submission_tasks))
     assert len(client.created) == 1
+
+
+@run_async
+async def test_unfilled_ioc_threshold_exit_is_blocked_and_retries_only_on_new_quote(
+    tmp_path: Path,
+) -> None:
+    db = make_db(tmp_path)
+    coordinator = TradingCoordinator(
+        AppConfig(database_path=db.path), db, PaperTradingService(db)
+    )
+    broker = coordinator.broker("DEMO")
+    assert isinstance(broker, KalshiBroker)
+    client = FakeTradingClient()
+    client.cancel_ioc = True
+    client.remote_positions = [{
+        "ticker": "UNFILLED-EXIT", "position_fp": "1.00",
+        "market_exposure_dollars": "0.45", "last_updated_ts": iso_now(),
+    }]
+    broker.set_client(client)  # type: ignore[arg-type]
+    await broker.reconcile()
+    broker.arm(confirmation="ARM DEMO TRADING")
+    db.update_settings({"global_profit_take_enabled": False})
+    current = {
+        "ticker": "UNFILLED-EXIT", "status": "active",
+        "observed_at": iso_now(), "time_remaining_seconds": 300,
+        "yes_bid": .45, "no_bid": .55, "btc_proxy": 99.0,
+        "strike": 100.0, "data_quality": {"reliable": True},
+    }
+
+    await coordinator._process_exits(broker, current)
+    await asyncio.gather(*list(coordinator._submission_tasks))
+    position = db.fetch_one(
+        "SELECT threshold_exit_status,threshold_exit_block_reason "
+        "FROM broker_positions WHERE mode='DEMO' AND ticker='UNFILLED-EXIT'"
+    )
+    assert position == {
+        "threshold_exit_status": "Blocked",
+        "threshold_exit_block_reason": (
+            "Kalshi accepted the protective exit but it did not fill; "
+            "waiting for a new executable quote."
+        ),
+    }
+    intent = db.fetch_one(
+        "SELECT status FROM broker_order_intents "
+        "WHERE mode='DEMO' AND ticker='UNFILLED-EXIT' AND action='SELL'"
+    )
+    assert intent == {"status": "CANCELED"}
+
+    await coordinator._process_exits(broker, current)
+    await asyncio.gather(*list(coordinator._submission_tasks))
+    assert len(client.created) == 1
+
+    await coordinator._process_exits(broker, {**current, "yes_bid": .46})
+    await asyncio.gather(*list(coordinator._submission_tasks))
+    assert len(client.created) == 2
 
 
 @run_async
