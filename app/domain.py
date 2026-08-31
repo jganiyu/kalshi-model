@@ -28,6 +28,18 @@ def parse_time(value: str | None) -> datetime | None:
     return datetime.fromisoformat(value.replace("Z", "+00:00"))
 
 
+def settlement_margin(settlement_price: object, strike: object) -> float | None:
+    """Return settlement price minus strike without trusting external numerics."""
+    try:
+        price = float(settlement_price)  # type: ignore[arg-type]
+        threshold = float(strike)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(price) or not math.isfinite(threshold):
+        return None
+    return price - threshold
+
+
 def clamp(value: float, low: float, high: float) -> float:
     return min(high, max(low, value))
 

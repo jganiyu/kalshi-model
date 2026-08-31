@@ -12,7 +12,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from app.db import Database
-from app.domain import iso_now, kalshi_fee, parse_time
+from app.domain import iso_now, kalshi_fee, parse_time, settlement_margin
 from app.services.kalshi_trading import (
     AmbiguousSubmissionError,
     KalshiTradingClient,
@@ -559,11 +559,13 @@ class KalshiBroker(Broker):
             FROM settlements s LEFT JOIN markets m ON m.ticker=s.ticker
             """
         )
-        settlement_margins = {
-            str(row["ticker"]): float(row["settlement_price"]) - float(row["strike"])
-            for row in settlement_margin_rows
-            if row.get("settlement_price") is not None and row.get("strike") is not None
-        }
+        settlement_margins: dict[str, float] = {}
+        for row in settlement_margin_rows:
+            margin = settlement_margin(
+                row.get("settlement_price"), row.get("strike")
+            )
+            if margin is not None:
+                settlement_margins[str(row["ticker"])] = margin
         protection_rows = self.db.fetch_all(
             """
             SELECT * FROM broker_positions

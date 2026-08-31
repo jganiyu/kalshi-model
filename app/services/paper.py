@@ -8,7 +8,13 @@ from datetime import date
 from typing import Any, Callable
 
 from app.db import Database
-from app.domain import iso_now, kalshi_fee, parse_time, threshold_breach_exit_state
+from app.domain import (
+    iso_now,
+    kalshi_fee,
+    parse_time,
+    settlement_margin,
+    threshold_breach_exit_state,
+)
 from app.services.decision import Decision
 from app.services.margin_volatility import MarginVolatilityService
 from app.services.trade_review import paper_trade_ref, review_metadata
@@ -59,11 +65,13 @@ class PaperTradingService:
             FROM settlements s LEFT JOIN markets m ON m.ticker=s.ticker
             """
         )
-        settlement_margins = {
-            str(row["ticker"]): float(row["settlement_price"]) - float(row["strike"])
-            for row in settlement_rows
-            if row.get("settlement_price") is not None and row.get("strike") is not None
-        }
+        settlement_margins: dict[str, float] = {}
+        for row in settlement_rows:
+            margin = settlement_margin(
+                row.get("settlement_price"), row.get("strike")
+            )
+            if margin is not None:
+                settlement_margins[str(row["ticker"])] = margin
         for trade in trades:
             trade["settlement_margin"] = settlement_margins.get(str(trade["ticker"]))
         orders = self.db.fetch_all("SELECT * FROM paper_orders ORDER BY created_at ASC")

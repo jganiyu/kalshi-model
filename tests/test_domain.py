@@ -12,6 +12,7 @@ from app.domain import (
     kalshi_fee,
     position_size,
     robust_composite,
+    settlement_margin,
     settlement_probability,
 )
 
@@ -20,6 +21,13 @@ def test_kalshi_fee_uses_current_quadratic_formula_and_centicent_rounding() -> N
     assert kalshi_fee(0.50, 100) == pytest.approx(1.75)
     assert kalshi_fee(0.055, 1) == pytest.approx(0.0037)
     assert kalshi_fee(0.01, 1) == pytest.approx(0.0007)
+
+
+def test_settlement_margin_ignores_malformed_exchange_values() -> None:
+    assert settlement_margin("79123.45", 79000) == pytest.approx(123.45)
+    assert settlement_margin("", 79000) is None
+    assert settlement_margin(None, 79000) is None
+    assert settlement_margin("NaN", 79000) is None
 
 
 def test_expected_value_includes_entry_price_and_fee() -> None:
