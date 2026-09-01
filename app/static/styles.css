@@ -306,7 +306,18 @@ nav { display: grid; gap: 2px; }
 .standard-edge-hud-track i { display: block; width: var(--progress); height: 100%; background: var(--hud-warning); transition: width 180ms ease, background-color 180ms ease; }
 .standard-edge-hud-track.passed i { background: var(--green); }
 .standard-edge-hud-track.locked i { width: 0; background: var(--faint); }
-.standard-edge-hud-gates { display: grid; grid-template-columns: 1fr 1fr; gap: 9px 12px; margin-top: 18px; }
+.standard-edge-gates-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 18px; }
+.standard-edge-gates-heading > span { color: var(--muted); font-size: 8px; font-weight: 760; letter-spacing: .1em; text-transform: uppercase; }
+.standard-edge-gate-release { display: inline-flex; cursor: pointer; align-items: center; gap: 7px; color: var(--muted); font-size: 8px; font-weight: 680; }
+.standard-edge-gate-release input { position: absolute; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
+.standard-edge-gate-release i { position: relative; width: 25px; height: 14px; border: 1px solid var(--line-strong); border-radius: 10px; background: var(--surface-hover); transition: border-color 160ms ease, background-color 160ms ease; }
+.standard-edge-gate-release i::after { position: absolute; top: 2px; left: 2px; width: 8px; height: 8px; border-radius: 50%; background: var(--muted); content: ""; transition: left 160ms ease, background-color 160ms ease; }
+.standard-edge-gate-release input:checked + i { border-color: color-mix(in srgb, var(--amber) 70%, var(--line-strong)); background: var(--amber-soft); }
+.standard-edge-gate-release input:checked + i::after { left: 13px; background: var(--amber); }
+.standard-edge-gate-release input:focus-visible + i { outline: 2px solid var(--green); outline-offset: 2px; }
+.standard-edge-hud-gates { display: grid; grid-template-columns: 1fr 1fr; gap: 9px 12px; margin-top: 10px; }
+.standard-edge-hud.gates-released .standard-edge-hud-gates > span:not(#standard-edge-data-gate):not(#standard-edge-risk-gate) { opacity: .42; }
+.standard-edge-hud.gates-released .standard-edge-hud-gates > span:not(#standard-edge-data-gate):not(#standard-edge-risk-gate) i { background: var(--faint); box-shadow: none; }
 .standard-edge-hud-gates > span { display: grid; min-width: 0; grid-template-columns: 6px minmax(0, 1fr); align-items: center; column-gap: 6px; }
 .standard-edge-hud-gates i { width: 6px; height: 6px; grid-row: 1 / 3; border-radius: 50%; background: var(--red); box-shadow: 0 0 0 3px color-mix(in srgb, var(--red) 10%, transparent); }
 .standard-edge-hud-gates span.pass i { background: var(--green); box-shadow: 0 0 0 3px color-mix(in srgb, var(--green) 10%, transparent); }

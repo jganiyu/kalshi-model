@@ -1281,6 +1281,9 @@ class AnalysisEngine:
                 settings.get("directional_momentum_lookback_seconds", 15)
             ),
         )
+        gates_released = bool(
+            self.paper.gate_release_state(str(market["ticker"]))["released"]
+        )
         execution_quality_by_side: dict[str, dict[str, Any]] = {}
         for side in ("YES", "NO"):
             execution_quality = dict(quality)
@@ -1314,6 +1317,7 @@ class AnalysisEngine:
                 model_variant_spread=variant_spread,
                 selected_side=side,
                 held_contracts=held_by_side[side],
+                entry_gates_released=gates_released,
             )
             for side in ("YES", "NO")
         }

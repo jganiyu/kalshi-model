@@ -216,6 +216,14 @@
                 <div class="standard-edge-hud-track locked" id="standard-edge-confirmation-track" role="progressbar" aria-label="Standard Edge confirmation" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><i id="standard-edge-confirmation-bar"></i></div>
               </div>
 
+              <div class="standard-edge-gates-heading">
+                <span>Entry gates</span>
+                <label class="standard-edge-gate-release" title="Temporarily bypass releasable Standard Edge gates for this market. Win chance, Net EV, confirmation, reliable data, and broker safety remain required.">
+                  <span id="standard-edge-gate-release-label">Gates active</span>
+                  <input id="standard-edge-gate-release" type="checkbox" aria-label="Release Standard Edge gates for this market">
+                  <i></i>
+                </label>
+              </div>
               <div class="standard-edge-hud-gates" aria-label="Standard Edge entry gates">
                 <span id="standard-edge-spread-gate"><i></i><b>Spread <button class="hud-help" type="button" aria-label="About spread" data-tooltip="Current bid-ask spread versus the maximum allowed for the required entry quality.">i</button></b><small>--</small></span>
                 <span id="standard-edge-liquidity-gate"><i></i><b>Liquidity <button class="hud-help" type="button" aria-label="About liquidity" data-tooltip="Contracts available at the executable ask versus the configured minimum.">i</button></b><small>--</small></span>
@@ -345,17 +353,17 @@
           </div>
         </section>
         <div class="paper-stats" id="paper-stats"></div>
+        <section class="table-section">
+          <div class="section-heading"><div><h3>Trade ledger</h3><p>Executable asks, fees, and settlement results</p></div><button class="secondary-button" id="run-backtest">Run backtest</button></div>
+          <div id="backtest-result" class="inline-result" hidden></div>
+          <div class="table-wrap"><table><thead><tr><th>Opened</th><th>Contract</th><th>Side</th><th>Price</th><th>Contracts</th><th>Source</th><th>Edge</th><th>Status</th><th>P&amp;L</th><th>Available after</th></tr></thead><tbody id="trade-table"><tr><td colspan="10" class="empty-state">No paper trades yet.</td></tr></tbody></table></div>
+        </section>
         <section class="table-section" id="position-section" hidden>
           <div class="section-heading"><div><h3>Positions and orders</h3><p>Kalshi is the source of truth</p></div></div>
           <p class="protection-warning">Filled positions remain unsettled until Kalshi publishes settlement; they are not resting orders.</p>
           <p class="protection-warning" id="protection-warning">Protective exits require the app to remain running and connected.</p>
           <div class="table-wrap"><table><caption>Unsettled positions</caption><thead><tr><th>Market</th><th>Side</th><th>Contracts</th><th>Exposure</th><th>Stop</th><th>Profit take</th><th>Threshold breach exit</th><th>Status</th></tr></thead><tbody id="position-table"></tbody></table></div>
           <div class="table-wrap"><table><caption>Order history</caption><thead><tr><th>Updated</th><th>Market</th><th>Side</th><th>Action</th><th>Filled</th><th>Remaining</th><th>Price</th><th>Status</th><th></th></tr></thead><tbody id="exchange-order-table"></tbody></table></div>
-        </section>
-        <section class="table-section">
-          <div class="section-heading"><div><h3>Trade ledger</h3><p>Executable asks, fees, and settlement results</p></div><button class="secondary-button" id="run-backtest">Run backtest</button></div>
-          <div id="backtest-result" class="inline-result" hidden></div>
-          <div class="table-wrap"><table><thead><tr><th>Opened</th><th>Contract</th><th>Side</th><th>Price</th><th>Contracts</th><th>Source</th><th>Edge</th><th>Status</th><th>P&amp;L</th><th>Available after</th></tr></thead><tbody id="trade-table"><tr><td colspan="10" class="empty-state">No paper trades yet.</td></tr></tbody></table></div>
         </section>
       </section>
 

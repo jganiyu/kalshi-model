@@ -93,6 +93,35 @@ async def dashboard() -> dict[str, Any]:
     return engine.dashboard
 
 
+@app.put("/api/standard-edge/gate-release")
+async def set_standard_edge_gate_release(
+    payload: dict[str, Any] = Body(...),
+) -> dict[str, Any]:
+    current = engine.dashboard.get("current") or {}
+    ticker = str(current.get("ticker") or "")
+    requested_ticker = str(payload.get("ticker") or ticker)
+    if not ticker:
+        raise HTTPException(status_code=409, detail="There is no active market to release.")
+    if requested_ticker != ticker:
+        raise HTTPException(
+            status_code=409,
+            detail="The active market changed. Review the new market before releasing gates.",
+        )
+    released = payload.get("released")
+    if not isinstance(released, bool):
+        raise HTTPException(status_code=422, detail="released must be true or false")
+    try:
+        state = engine.paper.set_gate_release(ticker, released)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    readiness = current.get("standard_edge_readiness") or (
+        current.get("automatic_entry") or {}
+    ).get("standard_edge_readiness")
+    if isinstance(readiness, dict):
+        readiness["gate_release"] = state
+    return state
+
+
 @app.websocket("/ws/live")
 async def live(websocket: WebSocket) -> None:
     await websocket.accept()

@@ -201,3 +201,74 @@ def test_direction_defaults_and_settings_validation() -> None:
         "directional_momentum_lookback_seconds": 20.0,
         "directional_momentum_minimum_movement_dollars": 2.5,
     }
+
+
+def test_market_gate_release_keeps_confirmation_and_hard_safety_active(
+    tmp_path: Path,
+) -> None:
+    db, service = make_service(tmp_path)
+    db.update_settings(
+        {
+            "automatic_min_confidence": "High",
+            "threshold_margin_gate_dollars": 50,
+        }
+    )
+    assessments, decisions = assessment_and_decisions()
+    service.set_gate_release("DIRECTION", True)
+
+    def run(now: float, *, risk_allowed: bool = True) -> dict:
+        return service.consider_strategies(
+            ticker="DIRECTION",
+            assessments=assessments,
+            standard_decisions=decisions,
+            seconds_remaining=300,
+            market_status="active",
+            market_open_time="2026-08-31T12:00:00+00:00",
+            market_observed_at="2026-08-31T12:10:00+00:00",
+            threshold_state=None,
+            settlement_window={"coverage": 1.0},
+            z_distance=3.0,
+            threshold_margin_dollars=0,
+            directional_momentum={
+                "reliable": True,
+                "regression_movement_dollars": -2,
+                "slope_dollars_per_second": -2 / 15,
+                "direction": "DOWN",
+                "sample_count": 16,
+                "coverage_seconds": 15,
+            },
+            model_version="test",
+            now=now,
+            automatic_enabled=True,
+            portfolio={
+                "automatic_trade_allowed": risk_allowed,
+                "automatic_trade_block_reason": (
+                    None if risk_allowed else "The daily loss limit is active."
+                ),
+                "available_cash": 1_000,
+            },
+        )
+
+    first = run(0)["standard_edge_readiness"]
+    progressing = run(3)["standard_edge_readiness"]
+    assert first["gate_release"]["released"] is True
+    assert first["metrics"]["confirmation"]["passed"] is False
+    assert progressing["metrics"]["confirmation"]["progress"] > 0
+    assert progressing["gates"]["quality"]["passed"] is False
+    assert progressing["gates"]["threshold_margin"]["passed"] is False
+    assert progressing["gates"]["directional_momentum"]["passed"] is False
+
+    blocked = run(4, risk_allowed=False)["standard_edge_readiness"]
+    assert blocked["gates"]["risk"]["passed"] is False
+    assert blocked["metrics"]["confirmation"]["locked"] is True
+    assert blocked["blocker"] == "The daily loss limit is active."
+
+
+def test_gate_release_is_scoped_to_one_market_and_defaults_back_to_active(
+    tmp_path: Path,
+) -> None:
+    _db, service = make_service(tmp_path)
+    assert service.gate_release_state("DIRECTION")["released"] is False
+    assert service.set_gate_release("DIRECTION", True)["released"] is True
+    assert service.gate_release_state("NEXT-MARKET")["released"] is False
+    assert service.set_gate_release("DIRECTION", False)["released"] is False

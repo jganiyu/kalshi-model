@@ -370,8 +370,17 @@ function renderStandardEdgeHud(readiness) {
   const confirmation = metrics.confirmation || {};
   const gates = readiness?.gates || {};
   const status = String(readiness?.status || "WATCHING").toLowerCase();
+  const gateRelease = readiness?.gate_release || {};
+  const gatesReleased = Boolean(gateRelease.released);
 
   hud.dataset.status = status;
+  hud.classList.toggle("gates-released", gatesReleased);
+  const releaseInput = $("#standard-edge-gate-release");
+  releaseInput.checked = gatesReleased;
+  releaseInput.disabled = !gateRelease.ticker;
+  $("#standard-edge-gate-release-label").textContent = gatesReleased
+    ? "Gates released"
+    : "Gates active";
   $("#standard-edge-hud-side").textContent = readiness?.side
     ? marketSideLabel(readiness.side)
     : "--";
@@ -438,6 +447,30 @@ function renderStandardEdgeHud(readiness) {
   renderReadinessGate("#standard-edge-risk-gate", gates.risk, gates.risk?.passed ? "Clear" : "Blocked");
   $("#standard-edge-hud-blocker").textContent = readiness?.blocker
     || "Waiting for live trade data.";
+}
+
+async function toggleStandardEdgeGateRelease(event) {
+  const input = event.currentTarget;
+  const ticker = state.dashboard?.current?.ticker;
+  input.disabled = true;
+  try {
+    await api("/api/standard-edge/gate-release", {
+      method: "PUT",
+      body: JSON.stringify({ ticker, released: input.checked }),
+    });
+    await refreshDashboard();
+    showToast(
+      input.checked ? "Entry gates released" : "Entry gates active",
+      input.checked
+        ? "Win chance, Net EV, confirmation, reliable data, and broker safety still apply."
+        : "Standard Edge gates are enforcing this market again.",
+    );
+  } catch (error) {
+    input.checked = !input.checked;
+    showToast("Gate release not changed", error.message);
+  } finally {
+    input.disabled = false;
+  }
 }
 
 function renderDashboard(data) {
@@ -1168,6 +1201,20 @@ function drawChart(frameTime = performance.now()) {
   const plotRight = width - right;
   const x = (timestamp) => left + ((timestamp - viewStart) / windowMs) * chartWidth;
   const y = (value) => top + (1 - (value - low) / (high - low)) * chartHeight;
+  const marketOpenTime = new Date(current?.open_time || "").getTime();
+  const distinguishActiveMarket = state.chartWindow >= 15
+    && Number.isFinite(marketOpenTime)
+    && marketOpenTime > viewStart
+    && marketOpenTime < viewEnd;
+  const activeMarketX = distinguishActiveMarket ? x(marketOpenTime) : left;
+
+  if (distinguishActiveMarket) {
+    context.save();
+    context.globalAlpha = 0.34;
+    context.fillStyle = color("--surface-hover");
+    context.fillRect(left, top, Math.max(0, activeMarketX - left), chartHeight);
+    context.restore();
+  }
 
   context.strokeStyle = color("--chart-grid");
   context.fillStyle = color("--chart-label");
@@ -1225,12 +1272,13 @@ function drawChart(frameTime = performance.now()) {
     context.strokeStyle = thresholdColor;
     context.lineWidth = 1.25;
     context.setLineDash([]);
-    context.beginPath(); context.moveTo(left, levelY); context.lineTo(plotRight, levelY); context.stroke();
+    const thresholdStart = distinguishActiveMarket ? activeMarketX : left;
+    context.beginPath(); context.moveTo(thresholdStart, levelY); context.lineTo(plotRight, levelY); context.stroke();
     context.font = `500 11px ${numberFont}`;
     const labelWidth = context.measureText(label).width;
     const arrowWidth = direction ? 17 : 0;
     const groupWidth = labelWidth + arrowWidth;
-    const groupLeft = left + (chartWidth - groupWidth) / 2;
+    const groupLeft = thresholdStart + (plotRight - thresholdStart - groupWidth) / 2;
     context.fillStyle = color("--surface");
     context.fillRect(groupLeft - 8, levelY - 11, groupWidth + 16, 22);
     context.fillStyle = thresholdColor;
@@ -1271,10 +1319,38 @@ function drawChart(frameTime = performance.now()) {
 
   const lastPoint = points.at(-1);
 
-  if (points.length > 1) {
+  const drawPriceSegment = (series, alpha = 1) => {
+    if (series.length < 2) return;
+    context.save();
+    context.globalAlpha = alpha;
     context.beginPath();
-    points.forEach((point, index) => index === 0 ? context.moveTo(x(point.time), y(point.price)) : context.lineTo(x(point.time), y(point.price)));
-    context.strokeStyle = color("--chart-line"); context.lineWidth = 2.25; context.lineJoin = "round"; context.stroke();
+    series.forEach((point, index) => index === 0
+      ? context.moveTo(x(point.time), y(point.price))
+      : context.lineTo(x(point.time), y(point.price)));
+    context.strokeStyle = color("--chart-line");
+    context.lineWidth = 2.25;
+    context.lineJoin = "round";
+    context.stroke();
+    context.restore();
+  };
+  if (distinguishActiveMarket) {
+    const older = points.filter((point) => point.time <= marketOpenTime);
+    const active = points.filter((point) => point.time >= marketOpenTime);
+    const bridge = older.at(-1);
+    if (bridge && active[0] !== bridge) active.unshift(bridge);
+    drawPriceSegment(older, 0.34);
+    drawPriceSegment(active);
+    context.save();
+    context.strokeStyle = color("--line-strong");
+    context.lineWidth = 1;
+    context.setLineDash([3, 4]);
+    context.beginPath();
+    context.moveTo(activeMarketX, top);
+    context.lineTo(activeMarketX, top + chartHeight);
+    context.stroke();
+    context.restore();
+  } else {
+    drawPriceSegment(points);
   }
   const movement = activePriceMovement(frameTime);
   if (movement) {
@@ -1959,10 +2035,35 @@ function drawHistoricalTradeReview() {
       || (event.event_type === "SETTLEMENT" && !event.trade_ref))).forEach((event) => {
     const eventX = x(new Date(event.observed_at).getTime());
     if (eventX < left || eventX > width - right) return;
+    const entryEvent = ["ENTRY", "PARTIAL_FILL"].includes(event.event_type);
+    const exitEvent = ["EXIT", "PARTIAL_EXIT"].includes(event.event_type);
+    const tag = entryEvent ? "Entry" : exitEvent ? "Exit" : null;
     context.save(); context.strokeStyle = eventColors[event.event_type]; context.lineWidth = 1.25;
-    context.setLineDash([3, 3]); context.beginPath(); context.moveTo(eventX, top); context.lineTo(eventX, top + chartHeight); context.stroke();
-    context.fillStyle = eventColors[event.event_type]; context.beginPath();
-    context.moveTo(eventX, top); context.lineTo(eventX - 4, top + 7); context.lineTo(eventX + 4, top + 7); context.closePath(); context.fill(); context.restore();
+    context.setLineDash([3, 3]);
+    context.beginPath();
+    context.moveTo(eventX, tag ? top + 16 : top);
+    context.lineTo(eventX, top + chartHeight);
+    context.stroke();
+    context.setLineDash([]);
+    context.fillStyle = eventColors[event.event_type];
+    if (tag) {
+      context.font = `700 8px ${color("--number-font")}`;
+      const tagWidth = Math.ceil(context.measureText(tag).width) + 10;
+      const tagLeft = Math.max(left, Math.min(width - right - tagWidth, eventX - tagWidth / 2));
+      context.fillRect(tagLeft, top, tagWidth, 14);
+      context.fillStyle = "#fff";
+      context.textAlign = "center";
+      context.textBaseline = "middle";
+      context.fillText(tag, tagLeft + tagWidth / 2, top + 7);
+    } else {
+      context.beginPath();
+      context.moveTo(eventX, top);
+      context.lineTo(eventX - 4, top + 7);
+      context.lineTo(eventX + 4, top + 7);
+      context.closePath();
+      context.fill();
+    }
+    context.restore();
   });
   const selectedIndex = state.tradeReview.selectedIndex;
   if (selectedIndex != null && selectablePoints[selectedIndex]) {
@@ -2564,6 +2665,7 @@ function bindEvents() {
       : "Choose the file downloaded when the key was created.";
   });
   $("#run-backtest").addEventListener("click", runBacktest);
+  $("#standard-edge-gate-release").addEventListener("change", toggleStandardEdgeGateRelease);
   $("#reset-paper-round").addEventListener("click", resetPaperRound);
   $("#run-bootstrap").addEventListener("click", runBootstrap);
   $("#backup-database").addEventListener("click", backupDatabase);

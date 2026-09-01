@@ -968,6 +968,11 @@ def test_dashboard_markup_has_two_fixed_books_and_paper_trade_history() -> None:
     assert 'id="standard-edge-direction-gate"' in markup
     assert 'id="standard-edge-volatility-gate"' in markup
     assert 'id="standard-edge-cushion"' in markup
+    assert 'id="standard-edge-gate-release"' in markup
+    assert 'id="standard-edge-gate-release-label"' in markup
+    assert '"/api/standard-edge/gate-release"' in script
+    assert 'state.chartWindow >= 15' in script
+    assert 'const tag = entryEvent ? "Entry" : exitEvent ? "Exit" : null;' in script
     assert 'data-chart-mode="volatility"' in markup
     assert 'id: "maximum_margin_volatility"' in script
     assert 'id: "directional_momentum_gate_enabled"' in script
@@ -979,6 +984,9 @@ def test_dashboard_markup_has_two_fixed_books_and_paper_trade_history() -> None:
     assert "standard_edge_readiness" in script
     assert 'current?.execution_market_mode || "LIVE"' in script
     assert 'api("/api/model-side"' not in script
+
+    trading_page = markup[markup.index('id="page-paper"'):markup.index('id="page-settings"')]
+    assert trading_page.index("Trade ledger") < trading_page.index("Positions and orders")
 
 
 def test_dashboard_open_trades_and_collapsible_manual_ticket_markup() -> None:

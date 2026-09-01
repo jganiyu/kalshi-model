@@ -146,6 +146,7 @@ def make_decision(
     model_variant_spread: float,
     selected_side: str | None = None,
     held_contracts: int = 0,
+    entry_gates_released: bool = False,
 ) -> Decision:
     side = str(selected_side or settings.get("selected_side", "YES")).upper()
     if side not in {"YES", "NO"}:
@@ -270,7 +271,11 @@ def make_decision(
         )
 
     available = market.get(f"{side.lower()}_ask_size")
-    minimum_liquidity = int(settings.get("minimum_liquidity_contracts", 1))
+    minimum_liquidity = (
+        1
+        if entry_gates_released
+        else int(settings.get("minimum_liquidity_contracts", 1))
+    )
     if available is not None and float(available) < minimum_liquidity:
         return Decision(
             "HOLD", "LIQUIDITY", "Low",
