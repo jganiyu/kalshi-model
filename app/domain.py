@@ -416,20 +416,17 @@ def texas_holdem_exit_reason(
     """Evaluate the phase target and River stop for a Texas position."""
     phase = texas_holdem_phase(seconds_remaining)
     key = str(phase["key"])
-    target_key = {
-        "FLOP": "texas_holdem_flop_target",
-        "TURN": "texas_holdem_turn_target",
-        "RIVER": "texas_holdem_river_target",
-    }[key]
+    target_key = f"texas_holdem_{key.lower()}_target"
+    stop_key = f"texas_holdem_{key.lower()}_stop"
     default_target = {"FLOP": 0.60, "TURN": 0.50, "RIVER": 0.95}[key]
     target = float(settings.get(target_key, default_target))
-    river_stop = float(settings.get("texas_holdem_river_stop", 0.60))
-    state = {**phase, "target": target, "river_stop": river_stop, "bid": bid}
+    stop = float(settings.get(stop_key, 0.60))
+    state = {**phase, "target": target, "stop": stop, "bid": bid}
     if bid is None:
         return None, state
     price = float(bid)
     if price + 1e-12 >= target:
         return f"TEXAS_{key}_TARGET", state
-    if key == "RIVER" and price <= river_stop + 1e-12:
-        return "TEXAS_RIVER_STOP", state
+    if price <= stop + 1e-12:
+        return f"TEXAS_{key}_STOP", state
     return None, state

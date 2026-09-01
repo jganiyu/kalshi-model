@@ -142,10 +142,13 @@ class PaperTradingService:
         phase = texas_holdem_phase(seconds_remaining)
         maximum_price = float(settings.get("texas_holdem_max_entry_price", 0.50))
         entry_window = int(settings.get("texas_holdem_entry_window_seconds", 20))
-        max_attempts = 1 + int(settings.get("texas_holdem_additional_retries", 2))
+        # The initial IOC plus the user-configured number of fresh-quote retries.
+        max_attempts = 1 + max(0, int(settings.get("texas_holdem_additional_retries", 2)))
         targets = {
             "flop": float(settings.get("texas_holdem_flop_target", 0.60)),
+            "flop_stop": float(settings.get("texas_holdem_flop_stop", 0.60)),
             "turn": float(settings.get("texas_holdem_turn_target", 0.50)),
+            "turn_stop": float(settings.get("texas_holdem_turn_stop", 0.60)),
             "river": float(settings.get("texas_holdem_river_target", 0.95)),
             "river_stop": float(settings.get("texas_holdem_river_stop", 0.60)),
         }
@@ -207,7 +210,7 @@ class PaperTradingService:
                 blocker = "Waiting for the official market opening."
             elif opening_elapsed > entry_window:
                 status = "FOLDED" if filled <= 0 else "PARTIALLY_FILLED"
-                blocker = "The 20-second opening play expired."
+                blocker = f"The {entry_window}-second opening play expired."
             elif proposed_side is None:
                 blocker = "BTC proxy is exactly at To Beat."
             elif stored_side and proposed_side != stored_side:
@@ -249,15 +252,24 @@ class PaperTradingService:
                     remaining = max(0, math.ceil(target_contracts - filled)) if target_contracts > 0 else None
                     metadata = {
                         "market_open_time": market_open_time,
+                        "trigger_timestamp": market_observed_at or iso_now(),
+                        "configured_window_seconds": entry_window,
                         "opening_btc_proxy_margin": margin,
                         "entry_price_cap": maximum_price,
                         "flop_target": targets["flop"],
+                        "flop_stop": targets["flop_stop"],
                         "turn_target": targets["turn"],
+                        "turn_stop": targets["turn_stop"],
                         "river_target": targets["river"],
                         "river_stop": targets["river_stop"],
                         "threshold_breach_exempt": True,
                         "attempt_number": attempt_number,
                         "quote_marker": quote_marker,
+                        "quote_timestamp": market_observed_at,
+                        "quote_age_seconds": 0.0,
+                        "requested_contracts": remaining,
+                        "time_in_force": "immediate_or_cancel",
+                        "exchange_index": assessment.get("exchange_index"),
                     }
                     opener = fixed_entry_handler or self.open_fixed_strategy
                     entered, effective = opener(
@@ -1337,7 +1349,11 @@ class PaperTradingService:
         liquidity: dict[str, int | None] = {}
         for entry in entries:
             side = str(entry["side"])
-            entry_enabled = enabled and entry.get("strategy") != "TEXAS_HOLDEM"
+            legacy_texas = self.db.fetch_one(
+                "SELECT 1 FROM texas_holdem_rounds WHERE environment='PAPER' AND ticker=?",
+                (ticker,),
+            ) is not None
+            entry_enabled = enabled and entry.get("strategy") != "TEXAS_HOLDEM" and not legacy_texas
             state = threshold_breach_exit_state(
                 side,
                 float(btc_proxy) if btc_proxy is not None else None,

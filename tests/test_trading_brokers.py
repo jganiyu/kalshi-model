@@ -2361,3 +2361,37 @@ async def test_swing_metadata_is_preserved_in_exchange_intent(tmp_path: Path) ->
     assert json.loads(row["decision_snapshot_json"])["strategy_metadata"] == {
         "maximum_entry_ask": .05
     }
+
+
+@run_async
+async def test_texas_entry_is_marketable_ioc_but_never_exceeds_cap(tmp_path: Path) -> None:
+    db = make_db(tmp_path)
+    coordinator = TradingCoordinator(
+        AppConfig(database_path=db.path), db, PaperTradingService(db)
+    )
+    broker = coordinator.broker("DEMO")
+    assert isinstance(broker, KalshiBroker)
+    client = FakeTradingClient()
+    broker.set_client(client)  # type: ignore[arg-type]
+    await broker.reconcile()
+    broker.arm(confirmation="ARM DEMO TRADING", automatic=True)
+    db.update_settings({
+        "trading_mode": "DEMO", "demo_automatic_trading_enabled": True,
+        "demo_min_data_quality": "Low", "texas_holdem_max_entry_price": .50,
+    })
+    entered, _ = coordinator.submit_automatic(
+        strategy="TEXAS_HOLDEM", ticker="TEXAS-CAP",
+        assessment={
+            "side": "NO", "buy": {"executable_price": .48},
+            "spread": .01, "ask_size": 100, "data_reliable": True,
+            "trade_allowed": True, "decision_confidence": "High",
+            "exchange_index": 7,
+        },
+        bankroll_fraction=.01, model_version="test", reason="fixture",
+        time_in_force="immediate_or_cancel", maximum_entry_price=.50,
+    )
+    assert entered is True
+    await asyncio.gather(*list(coordinator._submission_tasks))
+    assert client.created[0]["limit_price"] == pytest.approx(.50)
+    assert client.created[0]["time_in_force"] == "immediate_or_cancel"
+    assert client.created[0]["exchange_index"] == 7

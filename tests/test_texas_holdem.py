@@ -106,12 +106,18 @@ def test_phase_boundaries_and_exit_targets() -> None:
     assert texas_holdem_phase(300)["key"] == "RIVER"
     settings = {
         "texas_holdem_flop_target": 0.60,
+        "texas_holdem_flop_stop": 0.60,
         "texas_holdem_turn_target": 0.50,
+        "texas_holdem_turn_stop": 0.60,
         "texas_holdem_river_target": 0.95,
         "texas_holdem_river_stop": 0.60,
     }
     assert texas_holdem_exit_reason(0.60, 800, settings)[0] == "TEXAS_FLOP_TARGET"
+    assert texas_holdem_exit_reason(0.59, 800, settings)[0] == "TEXAS_FLOP_STOP"
     assert texas_holdem_exit_reason(0.50, 500, settings)[0] == "TEXAS_TURN_TARGET"
+    assert texas_holdem_exit_reason(
+        0.59, 500, {**settings, "texas_holdem_turn_target": .95}
+    )[0] == "TEXAS_TURN_STOP"
     assert texas_holdem_exit_reason(0.95, 200, settings)[0] == "TEXAS_RIVER_TARGET"
     assert texas_holdem_exit_reason(0.60, 200, settings)[0] == "TEXAS_RIVER_STOP"
     assert texas_holdem_exit_reason(0.75, 200, settings)[0] is None
@@ -151,6 +157,18 @@ def test_price_cap_blocks_opening_attempt_without_consuming_retry(tmp_path: Path
     assert result["attempt_count"] == 0
     assert "50¢" in result["blocker"]
     assert db.fetch_one("SELECT id FROM paper_entries WHERE ticker='TEXAS'") is None
+
+
+def test_opening_expiry_uses_the_saved_window_in_status_text(tmp_path: Path) -> None:
+    db = make_db(tmp_path)
+    db.update_settings({"texas_holdem_entry_window_seconds": 7})
+    service = PaperTradingService(db)
+    result = run_strategy(
+        service, assessments(yes_bid=0.52, yes_ask=0.54), margin=25.0,
+        observed_at="2026-09-01T12:00:08+00:00", seconds_remaining=892,
+    )["texas_holdem"]
+    assert result["status"] == "FOLDED"
+    assert result["blocker"] == "The 7-second opening play expired."
 
 
 def test_retries_require_new_market_state_and_fold_after_three_attempts(
@@ -258,7 +276,7 @@ def test_texas_position_uses_phase_exit_instead_of_generic_protection() -> None:
     assert protective_exit_reason(
         position, 0.55, 800, settings,
         btc_proxy=90, threshold=100, data_reliable=True,
-    )[0] is None
+    )[0] == "TEXAS_FLOP_STOP"
     assert protective_exit_reason(
         position, 0.60, 800, settings,
         btc_proxy=90, threshold=100, data_reliable=True,
@@ -267,6 +285,20 @@ def test_texas_position_uses_phase_exit_instead_of_generic_protection() -> None:
         position, 0.60, 200, settings,
         btc_proxy=110, threshold=100, data_reliable=True,
     )[0] == "TEXAS_RIVER_STOP"
+
+
+def test_texas_metadata_never_enters_threshold_breach_path() -> None:
+    settings = {
+        "global_profit_take_enabled": False,
+        "threshold_breach_exit_enabled": True,
+        "threshold_breach_exit_buffer_dollars": 0,
+        "texas_holdem_flop_target": .95, "texas_holdem_flop_stop": .01,
+    }
+    reason, _ = protective_exit_reason(
+        {"side": "YES", "strategy_metadata_json": '{"strategy":"TEXAS_HOLDEM"}'},
+        .50, 800, settings, btc_proxy=90, threshold=100, data_reliable=True,
+    )
+    assert reason is None
 
 
 def test_texas_retry_guard_ignores_prior_texas_ioc_but_not_other_strategy(

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import math
+import random
 import secrets
 import time
 from dataclasses import replace
@@ -47,6 +48,14 @@ def _json_object(value: Any) -> dict[str, Any]:
     return parsed if isinstance(parsed, dict) else {}
 
 
+def _is_texas_position(position: dict[str, Any]) -> bool:
+    """Use persisted strategy evidence; never rely on a UI-only marker."""
+    if str(position.get("strategy") or "").upper() == "TEXAS_HOLDEM":
+        return True
+    metadata = _json_object(position.get("strategy_metadata_json"))
+    return str(metadata.get("strategy") or metadata.get("strategy_name") or "").upper() == "TEXAS_HOLDEM"
+
+
 def manual_market_quality(
     current: dict[str, Any], assessment: dict[str, Any]
 ) -> tuple[bool, str]:
@@ -69,17 +78,17 @@ def protective_exit_reason(
     threshold: float | None = None,
     data_reliable: bool = True,
 ) -> tuple[str | None, int | None]:
-    if position.get("strategy") == "TEXAS_HOLDEM":
+    if settings.get("global_profit_take_enabled", True) and bid + 1e-12 >= float(
+        settings.get("global_profit_take_price", 0.99)
+    ):
+        return "GLOBAL_PROFIT_TAKE", 0
+    if _is_texas_position(position):
         texas_reason, _ = texas_holdem_exit_reason(bid, seconds_remaining, settings)
         if texas_reason:
             return texas_reason, 0
         # Texas positions intentionally begin on the opposite side of To Beat;
         # their dedicated River stop replaces generic stops and breach exits.
         return None, None
-    if settings.get("global_profit_take_enabled", True) and bid + 1e-12 >= float(
-        settings.get("global_profit_take_price", 0.99)
-    ):
-        return "GLOBAL_PROFIT_TAKE", 0
     threshold_exit = threshold_breach_exit_state(
         str(position.get("side") or ""),
         btc_proxy,
@@ -235,13 +244,20 @@ class TradingCoordinator:
         async def on_message(_: dict[str, Any]) -> None:
             try:
                 await broker.reconcile()
-            except (KalshiTradingError, ValueError):
+            except asyncio.CancelledError:
+                raise
+            except Exception:
                 # Reconciliation itself blocks trading. Keep the user's in-memory
                 # arm state so a later successful refresh can resume it.
                 pass
 
         async def on_status(_: str, connected: bool, error: str | None) -> None:
-            await self._handle_private_stream_status(mode, connected, error)
+            try:
+                await self._handle_private_stream_status(mode, connected, error)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                broker._audit("PRIVATE_STREAM_STATUS_ERROR", {"error": str(exc)})
 
         feed = KalshiPrivateWebSocketFeed(
             ws_url,
@@ -280,7 +296,10 @@ class TradingCoordinator:
         # submissions blocked until the exchange account is authoritative again.
         try:
             await broker.reconcile()
-        except (KalshiTradingError, ValueError):
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            broker._audit("RECONCILIATION_AFTER_RECONNECT_ERROR", {"error": str(exc)})
             return
         if broker.session_armed:
             broker._audit(
@@ -293,18 +312,27 @@ class TradingCoordinator:
             return
 
         async def run() -> None:
+            delay = 1.0
             while True:
-                await asyncio.sleep(30)
+                await asyncio.sleep(delay)
                 broker = self.brokers[mode]
                 assert isinstance(broker, KalshiBroker)
                 if not broker.client:
+                    delay = 30.0
                     continue
                 try:
                     await broker.reconcile()
-                except (KalshiTradingError, ValueError):
-                    # A later successful reconciliation restores readiness while
-                    # retaining the user's arm and automatic-trading choices.
-                    pass
+                    delay = 30.0
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    # This is deliberately broad: a transient parser, database,
+                    # or transport failure must not kill the sole recovery task.
+                    broker._audit("RECONCILIATION_LOOP_ERROR", {
+                        "error": str(exc), "retry_in_seconds": delay,
+                    })
+                    delay = min(30.0, delay * 2.0)
+                    delay = max(0.25, delay + random.uniform(-0.2 * delay, 0.2 * delay))
 
         self._reconciliation_tasks[mode] = asyncio.create_task(run())
 
@@ -363,6 +391,13 @@ class TradingCoordinator:
         }
         readiness = portfolio.get("readiness") or {}
         for position in portfolio.get("positions") or []:
+            if self._is_persisted_texas_position(mode, position):
+                position["threshold_breach_exit"] = {
+                    "enabled": False, "breached": False, "status": "Inactive",
+                    "reason": "Texas Hold'em uses phase exits instead.",
+                    "remaining_contracts": position.get("contracts"),
+                }
+                continue
             entry = (position.get("entries") or [{}])[0]
             ticker = str(position.get("ticker") or "")
             side = str(position.get("side") or "")
@@ -414,6 +449,20 @@ class TradingCoordinator:
                 state["error_details"] = None
             state["remaining_contracts"] = position.get("contracts")
             position["threshold_breach_exit"] = state
+
+    def _is_persisted_texas_position(self, mode: str, position: dict[str, Any]) -> bool:
+        if _is_texas_position(position):
+            return True
+        ticker = str(position.get("ticker") or "")
+        if not ticker:
+            return False
+        return self.db.fetch_one(
+            """SELECT 1 FROM texas_holdem_rounds WHERE environment=? AND ticker=?
+               UNION ALL
+               SELECT 1 FROM broker_order_intents
+               WHERE mode=? AND ticker=? AND strategy='TEXAS_HOLDEM' LIMIT 1""",
+            (mode, ticker, mode, ticker),
+        ) is not None
 
     async def reconcile(self, mode: str) -> dict[str, Any]:
         broker = self.broker(mode)
@@ -727,7 +776,8 @@ class TradingCoordinator:
         assert isinstance(broker, KalshiBroker)
         side = str(assessment.get("side") or "")
         buy = assessment.get("buy") or {}
-        price = buy.get("executable_price")
+        executable_price = buy.get("executable_price")
+        price = executable_price
         key = (mode, ticker)
         if side not in {"YES", "NO"} or price is None:
             return broker, None, 0.0, "An executable automatic candidate is unavailable."
@@ -775,13 +825,21 @@ class TradingCoordinator:
             remaining_allocation,
         )
         price = normalize_order_price(
-            float(price),
-            "BUY",
-            side=side,
+            float(price), "BUY", side=side,
             price_ranges=assessment.get("price_ranges"),
         )
         if maximum_entry_price is not None and price > float(maximum_entry_price) + 1e-12:
             return broker, None, effective, "The executable entry exceeds the Texas Hold'em price cap."
+        if strategy == "TEXAS_HOLDEM" and maximum_entry_price is not None:
+            # Threshold exits use a market-style IOC floor.  The symmetric safe
+            # entry is a marketable IOC *ceiling*: sweep available offers, but
+            # never let tick normalization move the all-in limit above the cap.
+            price = normalize_order_price(
+                float(maximum_entry_price), "SELL", side=side,
+                price_ranges=assessment.get("price_ranges"),
+            )
+            if price > float(maximum_entry_price) + 1e-12:
+                return broker, None, effective, "The Texas Hold'em price cap is not a valid exchange tick."
         unit = float(price) + kalshi_fee(float(price))
         if (
             exchange_index is not None
@@ -834,6 +892,13 @@ class TradingCoordinator:
                 "reason": reason,
                 "assessment": assessment,
                 "strategy_metadata": strategy_metadata or {},
+                "executable_price": executable_price,
+                "submitted_limit_price": price,
+                "entry_price_cap": maximum_entry_price,
+                "market_style_ioc": bool(
+                    strategy == "TEXAS_HOLDEM"
+                    and time_in_force == "immediate_or_cancel"
+                ),
                 "margin_volatility_index": (strategy_metadata or {}).get(
                     "margin_volatility_index"
                 ),
@@ -956,6 +1021,7 @@ class TradingCoordinator:
     async def _submit_and_attach_position(self, intent: OrderIntent) -> None:
         broker = self.broker(intent.mode)
         assert isinstance(broker, KalshiBroker)
+        submit_started_at = time.time()
         try:
             result = await broker.submit(intent)
             await broker.reconcile()
@@ -974,10 +1040,42 @@ class TradingCoordinator:
                     (intent.mode, intent.client_order_id),
                 ) or {}
                 if attempt_number:
+                    attempt = self.db.fetch_one(
+                        """
+                        SELECT evidence_json FROM texas_holdem_attempts
+                        WHERE round_id=(SELECT id FROM texas_holdem_rounds
+                                        WHERE environment=? AND ticker=?)
+                          AND attempt_number=?
+                        """,
+                        (intent.mode, intent.ticker, attempt_number),
+                    ) or {}
+                    evidence = _json_object(attempt.get("evidence_json"))
+                    try:
+                        trigger = parse_time(
+                            str(evidence.get("trigger_timestamp") or "")
+                        )
+                    except (TypeError, ValueError):
+                        trigger = None
+                    evidence.update({
+                        "detection_to_submit_ms": max(
+                            0.0,
+                            (submit_started_at - trigger.timestamp()) * 1000
+                            if trigger else 0.0,
+                        ),
+                        "submitted_limit_price": intent.limit_price,
+                        "entry_price_cap": intent.decision_snapshot.get("entry_price_cap"),
+                        "time_in_force": intent.time_in_force,
+                        "exchange_index": intent.risk_snapshot.get("exchange_index"),
+                        "client_order_id": intent.client_order_id,
+                        "exchange_order_id": result.get("exchange_order_id"),
+                        "filled_contracts": float(fill.get("amount") or 0.0),
+                        "final_state": str(result.get("status") or "ACKNOWLEDGED"),
+                    })
                     self.db.execute(
                         """
                         UPDATE texas_holdem_attempts SET broker_client_order_id=?,
-                            requested_contracts=?,filled_contracts=?,status=?,blocker=NULL
+                            requested_contracts=?,filled_contracts=?,status=?,blocker=NULL,
+                            evidence_json=?
                         WHERE round_id=(
                             SELECT id FROM texas_holdem_rounds
                             WHERE environment=? AND ticker=?
@@ -988,6 +1086,7 @@ class TradingCoordinator:
                             intent.contracts,
                             float(fill.get("amount") or 0.0),
                             str(result.get("status") or "ACKNOWLEDGED"),
+                            json.dumps(evidence, sort_keys=True),
                             intent.mode,
                             intent.ticker,
                             attempt_number,
@@ -1288,7 +1387,7 @@ class TradingCoordinator:
             if position.get("ticker") != ticker:
                 continue
             side = str(position.get("side"))
-            texas_position = position.get("strategy") == "TEXAS_HOLDEM"
+            texas_position = self._is_persisted_texas_position(broker.mode, position)
             threshold_exit = threshold_breach_exit_state(
                 side,
                 btc_proxy,

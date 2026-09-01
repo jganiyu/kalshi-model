@@ -44,9 +44,9 @@
   --green-soft: #e5f5ef;
   --red: #e1334b;
   --red-soft: #ffe8eb;
-  --amber: #9b671d;
+  --amber: #efa900;
   --amber-soft: #fcf1dc;
-  --hud-warning: #e39a00;
+  --hud-warning: var(--amber);
   --blue: #3476c5;
   --sidebar: #efefec;
   --sidebar-ink: #242421;

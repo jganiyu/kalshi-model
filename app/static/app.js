@@ -531,7 +531,9 @@ function renderTexasHoldemHud(texas = {}) {
     || (texas.status === "ENTERED" ? "Position entered. Watching the active street exit." : "Opening play is active.");
   const values = {
     "#texas-flop-target": texas.targets?.flop,
+    "#texas-flop-stop": texas.targets?.flop_stop,
     "#texas-turn-target": texas.targets?.turn,
+    "#texas-turn-stop": texas.targets?.turn_stop,
     "#texas-river-target": texas.targets?.river,
     "#texas-river-stop": texas.targets?.river_stop,
   };
@@ -548,7 +550,9 @@ async function updateTexasQuickSetting(event) {
   const input = event.currentTarget;
   const mapping = {
     "texas-flop-target": "texas_holdem_flop_target",
+    "texas-flop-stop": "texas_holdem_flop_stop",
     "texas-turn-target": "texas_holdem_turn_target",
+    "texas-turn-stop": "texas_holdem_turn_stop",
     "texas-river-target": "texas_holdem_river_target",
     "texas-river-stop": "texas_holdem_river_stop",
   };
@@ -1330,8 +1334,7 @@ function drawChart(frameTime = performance.now()) {
   const x = (timestamp) => left + ((timestamp - viewStart) / windowMs) * chartWidth;
   const y = (value) => top + (1 - (value - low) / (high - low)) * chartHeight;
   const marketOpenTime = new Date(current?.open_time || "").getTime();
-  const distinguishActiveMarket = state.chartWindow >= 15
-    && Number.isFinite(marketOpenTime)
+  const distinguishActiveMarket = Number.isFinite(marketOpenTime)
     && marketOpenTime > viewStart
     && marketOpenTime < viewEnd;
   const activeMarketX = distinguishActiveMarket ? x(marketOpenTime) : left;
@@ -1367,7 +1370,7 @@ function drawChart(frameTime = performance.now()) {
   }
 
   const drawMarketPhases = () => {
-    if (state.chartWindow < 15 || !Number.isFinite(marketOpenTime)) return;
+    if (!Number.isFinite(marketOpenTime)) return;
     const phaseDurationMs = 5 * 60 * 1000;
     const phases = ["FLOP", "TURN", "RIVER"].map((label, index) => ({
       label,
@@ -1670,10 +1673,12 @@ const calibrationGroups = [
     { id: "texas_holdem_enabled", label: "Enable Texas Hold’em Strategy", type: "toggle", tip: "Runs one contrarian opening play per market and replaces Standard Edge automatic entries while enabled. Default: off." },
     { id: "texas_holdem_max_entry_price", label: "Maximum entry price", unit: "cents", min: 1, max: 99, step: 1, scale: 100, tip: "Highest all-in executable contract price allowed for the opening IOC buy. Default: 50 cents." },
     { id: "texas_holdem_flop_target", label: "Flop target", unit: "cents", min: 1, max: 99, step: 1, scale: 100, tip: "Executable bid that closes the position during minutes 0–5. Default: 60 cents." },
+    { id: "texas_holdem_flop_stop", label: "Flop stop", unit: "cents", min: 1, max: 99, step: 1, scale: 100, tip: "Executable bid that folds during minutes 0–5. Default: 60 cents." },
     { id: "texas_holdem_turn_target", label: "Turn target", unit: "cents", min: 1, max: 99, step: 1, scale: 100, tip: "Executable bid that closes the position during minutes 5–10. Default: 50 cents." },
+    { id: "texas_holdem_turn_stop", label: "Turn stop", unit: "cents", min: 1, max: 99, step: 1, scale: 100, tip: "Executable bid that folds during minutes 5–10. Default: 60 cents." },
     { id: "texas_holdem_river_target", label: "River target", unit: "cents", min: 1, max: 99, step: 1, scale: 100, tip: "Executable bid that takes profit during minutes 10–15. Default: 95 cents." },
     { id: "texas_holdem_river_stop", label: "River stop", unit: "cents", min: 1, max: 99, step: 1, scale: 100, tip: "Executable bid at or below which the position folds during the River. It is inactive during the Flop and Turn. Default: 60 cents." },
-    { id: "texas_holdem_entry_window_seconds", label: "Opening-play window", unit: "seconds", min: 1, max: 120, step: 1, integer: true, tip: "Time after official market open in which the initial attempt and fresh-quote retries may occur. Default: 20 seconds." },
+    { id: "texas_holdem_entry_window_seconds", label: "Opening-play window", unit: "seconds", min: 1, max: 120, step: 1, integer: true, tip: "Time after official market open in which the initial attempt and fresh-quote retries may occur." },
     { id: "texas_holdem_additional_retries", label: "Additional retries", unit: "retries", min: 0, max: 10, step: 1, integer: true, tip: "Fresh-quote IOC retries after the initial attempt. Default: 2." },
   ]],
   ["Stops & Exits", [
@@ -2798,7 +2803,7 @@ function bindEvents() {
   });
   $("#run-backtest").addEventListener("click", runBacktest);
   $("#standard-edge-gate-release").addEventListener("change", toggleStandardEdgeGateRelease);
-  ["#texas-flop-target", "#texas-turn-target", "#texas-river-target", "#texas-river-stop"].forEach((selector) => {
+  ["#texas-flop-target", "#texas-flop-stop", "#texas-turn-target", "#texas-turn-stop", "#texas-river-target", "#texas-river-stop"].forEach((selector) => {
     $(selector).addEventListener("change", updateTexasQuickSetting);
   });
   $("#reset-paper-round").addEventListener("click", resetPaperRound);
