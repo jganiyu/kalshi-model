@@ -210,11 +210,11 @@ def test_market_gate_release_keeps_confirmation_and_hard_safety_active(
     db.update_settings(
         {
             "automatic_min_confidence": "High",
+            "automatic_entry_window_minutes": 1,
             "threshold_margin_gate_dollars": 50,
         }
     )
     assessments, decisions = assessment_and_decisions()
-    service.set_gate_release("DIRECTION", True)
 
     def run(now: float, *, risk_allowed: bool = True) -> dict:
         return service.consider_strategies(
@@ -249,9 +249,15 @@ def test_market_gate_release_keeps_confirmation_and_hard_safety_active(
             },
         )
 
+    outside_window = run(-1)["standard_edge_readiness"]
+    assert outside_window["metrics"]["confirmation"]["locked"] is True
+    assert outside_window["blocker"] == "Outside the Standard Edge entry window."
+
+    service.set_gate_release("DIRECTION", True)
     first = run(0)["standard_edge_readiness"]
     progressing = run(3)["standard_edge_readiness"]
     assert first["gate_release"]["released"] is True
+    assert "entry_window" in first["gate_release"]["released_gates"]
     assert first["metrics"]["confirmation"]["passed"] is False
     assert progressing["metrics"]["confirmation"]["progress"] > 0
     assert progressing["gates"]["quality"]["passed"] is False

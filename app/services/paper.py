@@ -64,7 +64,7 @@ class PaperTradingService:
             ],
             "released_gates": [
                 "spread", "liquidity", "quality", "threshold_margin",
-                "directional_momentum", "volatility",
+                "directional_momentum", "volatility", "entry_window",
             ] if released else [],
         }
 
@@ -1458,6 +1458,7 @@ class PaperTradingService:
         model_version: str,
         now: float | None = None,
         automatic_enabled: bool | None = None,
+        gates_released: bool = False,
         open_handler: Callable[[str, Decision, str], bool] | None = None,
     ) -> dict[str, Any]:
         settings = self.db.settings()
@@ -1469,7 +1470,10 @@ class PaperTradingService:
             bool(settings.get("paper_trading_enabled", False))
             if automatic_enabled is None else bool(automatic_enabled)
         )
-        inside_window = 0 < seconds_remaining <= entry_window
+        inside_window = bool(
+            0 < seconds_remaining
+            and (gates_released or seconds_remaining <= entry_window)
+        )
         if not enabled or not inside_window or not decision.side:
             self.reset_automatic_confirmation()
             return {
@@ -1787,7 +1791,10 @@ class PaperTradingService:
                     execution_risk.get("primary_blocker")
                     or "The selected account cannot accept this entry."
                 )
-        inside_window = 0 < seconds_remaining <= entry_window
+        inside_window = bool(
+            0 < seconds_remaining
+            and (gates_released or seconds_remaining <= entry_window)
+        )
         priority_blocked = bool(
             priority_strategy and priority_strategy != "STANDARD_EDGE"
         )
@@ -2641,7 +2648,8 @@ class PaperTradingService:
             standard_result = self.consider_automatic_entry(
                 ticker=ticker, decision=standard, seconds_remaining=seconds_remaining,
                 model_version=model_version, now=current_time,
-                automatic_enabled=enabled, open_handler=standard_entry_handler,
+                automatic_enabled=enabled, gates_released=gates_released,
+                open_handler=standard_entry_handler,
             )
             result["active_strategy"] = "STANDARD_EDGE"
             result["standard_edge"] = standard_result

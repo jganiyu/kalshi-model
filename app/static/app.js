@@ -462,7 +462,7 @@ async function toggleStandardEdgeGateRelease(event) {
     showToast(
       input.checked ? "Entry gates released" : "Entry gates active",
       input.checked
-        ? "Win chance, Net EV, confirmation, reliable data, and broker safety still apply."
+        ? "The entry window and soft gates are bypassed. Win chance, Net EV, confirmation, reliable data, and broker safety still apply."
         : "Standard Edge gates are enforcing this market again.",
     );
   } catch (error) {
