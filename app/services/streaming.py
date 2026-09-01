@@ -4,6 +4,7 @@ import asyncio
 import base64
 import json
 import logging
+import random
 import ssl
 import time
 from collections.abc import Awaitable, Callable
@@ -152,7 +153,7 @@ class BitcoinWebSocketFeeds:
             except Exception as exc:
                 logger.warning("%s stream disconnected: %s", source, exc)
                 await self.on_status(source, False, str(exc))
-                await asyncio.sleep(delay)
+                await asyncio.sleep(delay + random.uniform(0, delay * 0.2))
                 delay = min(30.0, delay * 2)
 
     async def _coinbase_connection(self) -> None:
@@ -312,7 +313,7 @@ class KalshiWebSocketFeed:
             except Exception as exc:
                 logger.warning("Kalshi stream disconnected: %s", exc)
                 await self.on_status("Kalshi", False, str(exc))
-                await asyncio.sleep(delay)
+                await asyncio.sleep(delay + random.uniform(0, delay * 0.2))
                 delay = min(30.0, delay * 2)
 
     async def _connection(self, ticker: str) -> None:
@@ -412,7 +413,7 @@ class KalshiPrivateWebSocketFeed:
             except Exception as exc:
                 logger.warning("%s stream disconnected: %s", self.source, exc)
                 await self.on_status(self.source, False, str(exc))
-                await asyncio.sleep(delay)
+                await asyncio.sleep(delay + random.uniform(0, delay * 0.2))
                 delay = min(30.0, delay * 2)
 
     async def _connection(self) -> None:

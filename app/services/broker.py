@@ -364,10 +364,12 @@ class KalshiBroker(Broker):
         reasons: list[str] = []
         if not credentials:
             reasons.append(f"{self.mode.title()} trading credentials are not configured.")
+        elif not state.get("connected"):
+            reasons.append("Reconnecting to Kalshi.")
         if not state.get("authenticated"):
             reasons.append("Account authentication is not verified.")
         if not state.get("reconciled") or state.get("reconciliation_required"):
-            reasons.append("Account reconciliation is required.")
+            reasons.append("Reconciling Kalshi account activity.")
         if state.get("kill_switch"):
             reasons.append("The kill switch is active.")
         if not self.session_armed:
@@ -1165,7 +1167,9 @@ class KalshiBroker(Broker):
             )
             self._audit("SUBMISSION_AMBIGUOUS", {"error": str(exc)}, intent=intent)
             raise
-        except (KalshiTradingError, ValueError) as exc:
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
             exchange_error = _exchange_error_detail(exc)
             self._set_intent(
                 intent.client_order_id,
@@ -1272,7 +1276,9 @@ class KalshiBroker(Broker):
                 self.client.balance(), self.client.orders(), self.client.fills(),
                 self.client.positions(), self.client.settlements(),
             )
-        except (KalshiTradingError, ValueError) as exc:
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
             exchange_error = _exchange_error_detail(exc)
             failed_state: dict[str, Any] = dict(
                 connected=False,
