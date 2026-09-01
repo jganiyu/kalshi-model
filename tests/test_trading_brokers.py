@@ -148,6 +148,8 @@ def test_v2_single_book_mapping() -> None:
     assert outcome_to_book("YES", "SELL", 0.42) == ("ask", 0.42)
     assert outcome_to_book("NO", "BUY", 0.42) == ("ask", 0.58)
     assert outcome_to_book("NO", "SELL", 0.42) == ("bid", 0.58)
+    assert outcome_to_book("YES", "SELL", 0.01) == ("ask", 0.01)
+    assert outcome_to_book("NO", "SELL", 0.01) == ("bid", 0.99)
 
 
 def test_exchange_order_prices_use_directional_whole_cent_rounding() -> None:
@@ -171,6 +173,12 @@ def test_exchange_order_prices_follow_tapered_market_ticks() -> None:
     assert normalize_order_price(
         0.815, "BUY", side="NO", price_ranges=ranges
     ) == 0.82
+    assert normalize_order_price(
+        0.0001, "SELL", side="YES", price_ranges=ranges
+    ) == 0.001
+    assert normalize_order_price(
+        0.0001, "SELL", side="NO", price_ranges=ranges
+    ) == 0.001
 
 
 def test_signed_headers_sign_method_and_path(tmp_path: Path) -> None:
@@ -2020,7 +2028,9 @@ async def test_breached_exchange_position_uses_reduce_only_exit_once_after_armin
     assert client.created[0]["action"] == "SELL"
     assert client.created[0]["side"] == side
     assert client.created[0]["contracts"] == 4
+    assert client.created[0]["limit_price"] == pytest.approx(0.01)
     assert client.created[0]["reduce_only"] is True
+    assert client.created[0]["time_in_force"] == "immediate_or_cancel"
     intent = db.fetch_one(
         "SELECT * FROM broker_order_intents WHERE mode=? AND ticker='BREACHED'",
         (mode,),
@@ -2028,6 +2038,8 @@ async def test_breached_exchange_position_uses_reduce_only_exit_once_after_armin
     assert intent and intent["source"] == "threshold_breach_exit"
     evidence = json.loads(intent["decision_snapshot_json"])
     assert evidence["trigger"] == "THRESHOLD_BREACH_EXIT"
+    assert evidence["market_style_ioc"] is True
+    assert evidence["submitted_limit_floor"] == pytest.approx(0.01)
     assert evidence["threshold_trigger_btc_proxy"] == btc_proxy
     assert evidence["threshold_trigger_threshold"] == 100.0
     position = db.fetch_one(

@@ -35,6 +35,15 @@ from app.services.streaming import KalshiPrivateWebSocketFeed
 
 
 _USE_DEFAULT_STOP = object()
+_MARKET_STYLE_EXIT_FLOOR = 0.0001
+
+
+def _json_object(value: Any) -> dict[str, Any]:
+    try:
+        parsed = json.loads(str(value or "{}"))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
 
 
 def manual_market_quality(
@@ -1142,15 +1151,21 @@ class TradingCoordinator:
             )
             if reason is None:
                 continue
+            # Kalshi has no unpriced market order. A threshold-breach exit uses
+            # the lowest valid outcome price as a reduce-only IOC limit, which
+            # sweeps every executable bid without leaving a resting order.
+            market_style_exit = reason == "THRESHOLD_BREACH_EXIT"
             candidate_limit = normalize_order_price(
-                max(0.01, bid - slippage),
+                _MARKET_STYLE_EXIT_FLOOR
+                if market_style_exit else max(0.01, bid - slippage),
                 "SELL",
                 side=side,
                 price_ranges=current.get("price_ranges"),
             )
             rejected_exits = self.db.fetch_all(
                 """
-                SELECT status,updated_at,limit_price FROM broker_order_intents
+                SELECT status,updated_at,limit_price,decision_snapshot_json
+                FROM broker_order_intents
                 WHERE mode=? AND ticker=? AND side=? AND action='SELL' AND source=?
                 ORDER BY id DESC LIMIT 7
                 """,
@@ -1164,10 +1179,24 @@ class TradingCoordinator:
             if consecutive_unfilled:
                 # Repeating an unfilled protective order at an unchanged price
                 # cannot improve execution and can churn a thin market.
-                if (
-                    abs(float(rejected_exits[0].get("limit_price") or 0) - candidate_limit)
-                    < 1e-9
-                ):
+                latest_rejected = rejected_exits[0]
+                latest_snapshot = _json_object(
+                    latest_rejected.get("decision_snapshot_json")
+                )
+                latest_bid = latest_snapshot.get("executable_bid")
+                unchanged_market = bool(
+                    market_style_exit
+                    and latest_bid is not None
+                    and abs(float(latest_bid) - bid) < 1e-9
+                )
+                unchanged_limit = bool(
+                    not market_style_exit
+                    and abs(
+                        float(latest_rejected.get("limit_price") or 0)
+                        - candidate_limit
+                    ) < 1e-9
+                )
+                if unchanged_market or unchanged_limit:
                     continue
             pending_key = (broker.mode, ticker, side)
             if pending_key in self._pending_exit_keys:
@@ -1197,6 +1226,9 @@ class TradingCoordinator:
                 "trigger": reason,
                 "executable_bid": bid,
                 "priority": priority,
+                "market_style_ioc": market_style_exit,
+                "submitted_limit_floor": candidate_limit
+                if market_style_exit else None,
             }
             if reason == "THRESHOLD_BREACH_EXIT":
                 decision_snapshot.update(
