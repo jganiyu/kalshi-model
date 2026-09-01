@@ -386,3 +386,50 @@ def threshold_breach_exit_state(
         "status": status,
         "reason": reason,
     }
+
+
+def texas_holdem_phase(seconds_remaining: float | None) -> dict[str, object]:
+    """Return the authoritative five-minute Texas Hold'em market phase."""
+    remaining = max(0.0, min(900.0, float(seconds_remaining or 0.0)))
+    elapsed = 900.0 - remaining
+    if elapsed < 300.0:
+        key, label, start = "FLOP", "The Flop", 0.0
+    elif elapsed < 600.0:
+        key, label, start = "TURN", "The Turn", 300.0
+    else:
+        key, label, start = "RIVER", "The River", 600.0
+    return {
+        "key": key,
+        "label": label,
+        "elapsed_seconds": elapsed,
+        "phase_elapsed_seconds": max(0.0, min(300.0, elapsed - start)),
+        "progress": max(0.0, min(1.0, (elapsed - start) / 300.0)),
+        "market_progress": max(0.0, min(1.0, elapsed / 900.0)),
+    }
+
+
+def texas_holdem_exit_reason(
+    bid: float | None,
+    seconds_remaining: float | None,
+    settings: dict[str, object],
+) -> tuple[str | None, dict[str, object]]:
+    """Evaluate the phase target and River stop for a Texas position."""
+    phase = texas_holdem_phase(seconds_remaining)
+    key = str(phase["key"])
+    target_key = {
+        "FLOP": "texas_holdem_flop_target",
+        "TURN": "texas_holdem_turn_target",
+        "RIVER": "texas_holdem_river_target",
+    }[key]
+    default_target = {"FLOP": 0.60, "TURN": 0.50, "RIVER": 0.95}[key]
+    target = float(settings.get(target_key, default_target))
+    river_stop = float(settings.get("texas_holdem_river_stop", 0.60))
+    state = {**phase, "target": target, "river_stop": river_stop, "bid": bid}
+    if bid is None:
+        return None, state
+    price = float(bid)
+    if price + 1e-12 >= target:
+        return f"TEXAS_{key}_TARGET", state
+    if key == "RIVER" and price <= river_stop + 1e-12:
+        return "TEXAS_RIVER_STOP", state
+    return None, state

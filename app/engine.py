@@ -312,6 +312,7 @@ class AnalysisEngine:
             )
             current_payload["btc_proxy"] = btc_state.get("price")
             current_payload["btc_state"] = btc_state
+            self.paper.process_texas_holdem_exits(ticker, current_payload)
             self.paper.process_threshold_breach_exits(ticker, current_payload)
             self._schedule_trade_review(current_payload, observed_at)
             if self._previous_ticker and self._previous_ticker != ticker:
@@ -742,6 +743,9 @@ class AnalysisEngine:
         )
         current["btc_proxy"] = self._latest_btc.get("price")
         current["btc_state"] = self._latest_btc
+        self.paper.process_texas_holdem_exits(
+            str(self._current_market["ticker"]), current
+        )
         self.paper.process_threshold_breach_exits(
             str(self._current_market["ticker"]), current
         )
@@ -1386,15 +1390,29 @@ class AnalysisEngine:
             automatic_enabled = bool(
                 settings.get(f"{trading_mode.lower()}_automatic_trading_enabled", False)
             ) and bool(readiness.get("automatic_armed"))
+            texas_enabled = bool(settings.get("texas_holdem_enabled", False))
             execution_risk_by_side = {
                 side: self.trading.preview_automatic_risk(
-                    strategy="STANDARD_EDGE",
+                    strategy="TEXAS_HOLDEM" if texas_enabled else "STANDARD_EDGE",
                     ticker=str(market["ticker"]),
                     assessment=assessments[side],
-                    bankroll_fraction=float(decisions[side].suggested_fraction or 0.0),
+                    bankroll_fraction=(
+                        float(settings.get("max_risk_per_trade_pct", 0.05))
+                        if texas_enabled else float(decisions[side].suggested_fraction or 0.0)
+                    ),
                     model_version=model_version,
-                    reason=decisions[side].explanation,
-                    stop_loss_cents=settings.get("default_stop_loss_cents"),
+                    reason=(
+                        "Texas Hold'em opening-play risk preview."
+                        if texas_enabled else decisions[side].explanation
+                    ),
+                    stop_loss_cents=(
+                        None if texas_enabled else settings.get("default_stop_loss_cents")
+                    ),
+                    time_in_force=("immediate_or_cancel" if texas_enabled else None),
+                    maximum_entry_price=(
+                        settings.get("texas_holdem_max_entry_price")
+                        if texas_enabled else None
+                    ),
                 )
                 for side in ("YES", "NO")
             }
@@ -1433,7 +1451,13 @@ class AnalysisEngine:
                 ),
                 "execution_risk_by_side": execution_risk_by_side,
                 "entry_exists_override": self.trading.has_automatic_entry(
-                    trading_mode, str(market["ticker"])
+                    trading_mode,
+                    str(market["ticker"]),
+                    strategy=(
+                        "TEXAS_HOLDEM"
+                        if settings.get("texas_holdem_enabled", False)
+                        else None
+                    ),
                 ),
                 "standard_entry_handler": standard_entry_handler,
                 "fixed_entry_handler": self.trading.submit_automatic,
@@ -1495,6 +1519,7 @@ class AnalysisEngine:
                 "standard_edge_readiness": automatic_entry.get(
                     "standard_edge_readiness"
                 ),
+                "texas_holdem": automatic_entry.get("texas_holdem"),
                 "swing_readiness": automatic_entry.get("swing_readiness"),
             }
         )

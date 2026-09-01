@@ -131,7 +131,7 @@ def consider(
 def test_threshold_margin_gate_applies_to_swing_entries(tmp_path: Path) -> None:
     db = make_db(tmp_path, threshold_margin_gate_dollars=50.0)
     add_market(db, "SWING-MARGIN")
-    service = PaperTradingService(db)
+    service = PaperTradingService(db, enable_retired_strategy_entries=True)
 
     blocked = consider(
         service, "SWING-MARGIN", assessment(), threshold_margin_dollars=49.0
@@ -158,7 +158,7 @@ def test_swing_defaults_are_conservative() -> None:
 def test_exact_entry_price_qualifies_and_manual_side_is_independent(tmp_path: Path) -> None:
     db = make_db(tmp_path, selected_side="NO")
     add_market(db, "SWING-ENTRY")
-    service = PaperTradingService(db)
+    service = PaperTradingService(db, enable_retired_strategy_entries=True)
 
     result = consider(service, "SWING-ENTRY", assessment())
     entry = db.fetch_one("SELECT * FROM paper_entries WHERE ticker='SWING-ENTRY'")
@@ -199,7 +199,7 @@ def test_swing_rejects_price_probability_and_window_failures(
 ) -> None:
     db = make_db(tmp_path)
     add_market(db, "SWING-BLOCK")
-    service = PaperTradingService(db)
+    service = PaperTradingService(db, enable_retired_strategy_entries=True)
 
     result = consider(
         service, "SWING-BLOCK",
@@ -215,7 +215,7 @@ def test_swing_rejects_price_probability_and_window_failures(
 def test_swing_advantage_includes_fees_and_slippage(tmp_path: Path) -> None:
     db = make_db(tmp_path, swing_min_model_advantage=0.03)
     add_market(db, "SWING-COSTS")
-    service = PaperTradingService(db)
+    service = PaperTradingService(db, enable_retired_strategy_entries=True)
     values = assessment(0.08, ask=0.05, bid=0.04)
     buy = values["YES"]["buy"]
 
@@ -247,7 +247,7 @@ def test_swing_existing_gates_block_entry(
 ) -> None:
     db = make_db(tmp_path)
     add_market(db, f"SWING-{gate}")
-    service = PaperTradingService(db)
+    service = PaperTradingService(db, enable_retired_strategy_entries=True)
     result = consider(service, f"SWING-{gate}", values, portfolio=portfolio)
     assert result["entered"] is False
     assert result["swing_readiness"]["gates"][gate]["passed"] is False
@@ -256,7 +256,7 @@ def test_swing_existing_gates_block_entry(
 def test_swing_confirmation_resets_when_a_requirement_fails(tmp_path: Path) -> None:
     db = make_db(tmp_path, swing_confirmation_seconds=2)
     add_market(db, "SWING-CONFIRM")
-    service = PaperTradingService(db)
+    service = PaperTradingService(db, enable_retired_strategy_entries=True)
     valid = assessment(0.12)
 
     first = consider(service, "SWING-CONFIRM", valid, now=0)
@@ -274,7 +274,7 @@ def test_swing_confirmation_resets_when_a_requirement_fails(tmp_path: Path) -> N
 
 def test_swing_uses_stronger_side_and_existing_strategy_keeps_priority(tmp_path: Path) -> None:
     db = make_db(tmp_path)
-    service = PaperTradingService(db)
+    service = PaperTradingService(db, enable_retired_strategy_entries=True)
     low = assessment(0.10)["YES"]
     stronger = {
         **low,
@@ -305,7 +305,7 @@ def test_swing_uses_stronger_side_and_existing_strategy_keeps_priority(tmp_path:
 def open_swing(tmp_path: Path, ticker: str, **settings: object) -> tuple[Database, PaperTradingService]:
     db = make_db(tmp_path, **settings)
     add_market(db, ticker)
-    service = PaperTradingService(db)
+    service = PaperTradingService(db, enable_retired_strategy_entries=True)
     assert consider(service, ticker, assessment())["entered"] is True
     return db, service
 
@@ -426,13 +426,26 @@ def test_swing_results_and_additive_migration(tmp_path: Path) -> None:
     assert "exit_reason" in columns
     assert legacy.fetch_one(
         "SELECT MAX(version) version FROM schema_migrations"
-            )["version"] == 19
+            )["version"] == 20
 
 
-def test_swing_controls_and_results_are_rendered() -> None:
+def test_retired_strategy_controls_are_hidden_and_entries_are_disabled(
+    tmp_path: Path,
+) -> None:
     root = Path(__file__).resolve().parents[1]
     script = (root / "app/static/app.js").read_text()
-    assert '["Swing Trade", [' in script
-    assert 'id: "swing_max_entry_price"' in script
-    assert 'id: "swing_target_exit_price"' in script
-    assert 'SWING: "Swing trade"' in script
+    assert '["Early Threshold", [' not in script
+    assert '["Late Conviction", [' not in script
+    assert '["Swing Trade", [' not in script
+    assert 'id: "swing_max_entry_price"' not in script
+    assert 'SWING: "Swing trade"' not in script
+    assert DEFAULT_SETTINGS["early_threshold_enabled"] is False
+    assert DEFAULT_SETTINGS["late_conviction_enabled"] is False
+
+    db = make_db(tmp_path)
+    add_market(db, "RETIRED-SWING")
+    service = PaperTradingService(db)
+    result = consider(service, "RETIRED-SWING", assessment())
+    assert result["active_strategy"] is None
+    assert result["entered"] is False
+    assert db.fetch_one("SELECT COUNT(*) count FROM paper_entries")["count"] == 0

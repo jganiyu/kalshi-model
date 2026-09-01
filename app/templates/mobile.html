@@ -42,6 +42,7 @@
     </section>
 
     <section class="hud" aria-labelledby="hud-title">
+      <div id="standard-hud-content">
       <div class="hud-heading">
         <div><p class="eyebrow" id="hud-title">STANDARD EDGE</p><h2 id="hud-side">--</h2></div>
         <strong class="hud-status" id="hud-status">Watching</strong>
@@ -72,6 +73,35 @@
       </div>
       <p class="cushion" id="hud-cushion">Cushion --</p>
       <p class="blocker" id="hud-blocker">Waiting for live trade data.</p>
+      </div>
+
+      <div class="texas-mobile-hud" id="texas-mobile-hud" hidden>
+        <div class="hud-heading">
+          <div><p class="eyebrow" id="texas-mobile-title">TEXAS HOLD’EM STRATEGY</p><h2 id="texas-mobile-phase">THE FLOP</h2></div>
+          <strong class="hud-status" id="texas-mobile-status">Waiting</strong>
+        </div>
+        <div class="texas-mobile-phase" data-mobile-phase="FLOP">
+          <div><span>Flop</span><strong id="texas-mobile-flop-target">60¢ target</strong></div>
+          <div class="track"><i></i></div>
+        </div>
+        <div class="texas-mobile-phase" data-mobile-phase="TURN">
+          <div><span>Turn</span><strong id="texas-mobile-turn-target">50¢ target</strong></div>
+          <div class="track"><i></i></div>
+        </div>
+        <div class="texas-mobile-phase" data-mobile-phase="RIVER">
+          <div><span>River</span><strong id="texas-mobile-river-target">95¢ target · 60¢ stop</strong></div>
+          <div class="track"><i></i></div>
+        </div>
+        <div class="texas-mobile-details">
+          <span><small>Side</small><strong id="texas-mobile-side">--</strong></span>
+          <span><small>Entry cap</small><strong id="texas-mobile-cap">--</strong></span>
+          <span><small>Attempts</small><strong id="texas-mobile-attempts">--</strong></span>
+          <span><small>Filled</small><strong id="texas-mobile-filled">--</strong></span>
+          <span><small>Current bid</small><strong id="texas-mobile-bid">--</strong></span>
+          <span><small>Active target</small><strong id="texas-mobile-active-target">--</strong></span>
+        </div>
+        <p class="blocker" id="texas-mobile-blocker">Waiting for the opening play.</p>
+      </div>
     </section>
 
     <section class="open-trades" aria-labelledby="open-trades-title">

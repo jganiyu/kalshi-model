@@ -190,7 +190,7 @@
             <button class="manual-order-toggle" id="manual-order-toggle" type="button" aria-expanded="false" aria-controls="manual-order-ticket">Manual order</button>
           </section>
           <section class="standard-edge-hud" id="standard-edge-hud" aria-label="Standard Edge entry readiness">
-            <div class="standard-edge-hud-inner">
+            <div class="standard-edge-hud-inner" id="standard-edge-hud-content">
               <div class="standard-edge-hud-kicker">
                 <span>Standard Edge</span>
                 <button class="hud-help" type="button" aria-label="About Standard Edge" data-tooltip="Tracks the automatic Standard Edge strategy. Its side is selected independently from Manual Order.">i</button>
@@ -237,6 +237,26 @@
               <p class="standard-edge-hud-cushion" id="standard-edge-cushion">Cushion --</p>
               <p class="standard-edge-hud-blocker"><button class="hud-help" type="button" aria-label="About the primary blocker" data-tooltip="The first requirement currently preventing Standard Edge confirmation or entry.">i</button><span id="standard-edge-hud-blocker">Waiting for live trade data.</span></p>
               <button class="standard-edge-hud-arm" id="hud-arm-trading" data-arm-session type="button" hidden>Arm session</button>
+            </div>
+            <div class="standard-edge-hud-inner texas-holdem-hud" id="texas-holdem-hud" hidden>
+              <div class="standard-edge-hud-kicker"><span>Texas Hold’em Strategy</span><button class="hud-help" type="button" aria-label="About Texas Hold’em" data-tooltip="A three-street contrarian opening play. It buys the contract opposite BTC's opening position versus To Beat, then manages phase targets and a River stop.">i</button></div>
+              <div class="standard-edge-hud-heading">
+                <strong id="texas-holdem-phase">THE FLOP</strong>
+                <div class="standard-edge-hud-status-wrap"><span class="standard-edge-hud-state" id="texas-holdem-status">Waiting</span></div>
+              </div>
+              <div class="texas-phase-row" data-phase="FLOP"><div><span>Flop</span><strong><input id="texas-flop-target" type="number" min="1" max="99" step="1" aria-label="Flop target">¢ target</strong></div><div class="texas-phase-track" role="progressbar" aria-label="Flop progress"><i></i></div></div>
+              <div class="texas-phase-row" data-phase="TURN"><div><span>Turn</span><strong><input id="texas-turn-target" type="number" min="1" max="99" step="1" aria-label="Turn target">¢ target</strong></div><div class="texas-phase-track" role="progressbar" aria-label="Turn progress"><i></i></div></div>
+              <div class="texas-phase-row" data-phase="RIVER"><div><span>River</span><strong><input id="texas-river-target" type="number" min="1" max="99" step="1" aria-label="River target">¢ target · <input id="texas-river-stop" type="number" min="1" max="99" step="1" aria-label="River stop">¢ stop</strong></div><div class="texas-phase-track" role="progressbar" aria-label="River progress"><i></i></div></div>
+              <div class="texas-holdem-details" aria-label="Texas Hold’em status">
+                <span><small>Side</small><strong id="texas-side">--</strong></span>
+                <span><small>Entry cap</small><strong id="texas-entry-cap">--</strong></span>
+                <span><small>Attempts</small><strong id="texas-attempts">--</strong></span>
+                <span><small>Filled</small><strong id="texas-filled">--</strong></span>
+                <span><small>Current bid</small><strong id="texas-current-bid">--</strong></span>
+                <span><small>Active target</small><strong id="texas-active-target">--</strong></span>
+              </div>
+              <p class="standard-edge-hud-blocker"><button class="hud-help" type="button" aria-label="About the opening play status" data-tooltip="Shows the opening IOC state, phase exit state, or the first blocker preventing the play.">i</button><span id="texas-holdem-blocker">Waiting for the opening play.</span></p>
+              <button class="standard-edge-hud-arm" id="texas-hud-arm-trading" data-arm-session type="button" hidden>Arm session</button>
             </div>
           </section>
           </div>

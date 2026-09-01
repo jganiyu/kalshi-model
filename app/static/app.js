@@ -34,6 +34,7 @@ const state = {
     saved: null, defaults: null, dirty: false, controlsRendered: false,
     summary: null, evidence: null, evidenceUpdatedAt: 0, evidenceRequest: null,
   },
+  texasPhaseAnimation: null,
 };
 
 const $ = (selector) => document.querySelector(selector);
@@ -268,9 +269,33 @@ function thresholdBreachExitText(protection = {}) {
 }
 
 function thresholdExitResultLabel(trade = {}) {
-  return String(trade.exit_reason || "").toUpperCase() === "THRESHOLD_BREACH_EXIT"
-    ? " · Threshold breach exit"
-    : "";
+  const reason = String(trade.exit_reason || "").toUpperCase();
+  const labels = {
+    THRESHOLD_BREACH_EXIT: "Threshold breach exit",
+    TEXAS_FLOP_TARGET: "Texas Hold’em · Flop target",
+    TEXAS_TURN_TARGET: "Texas Hold’em · Turn target",
+    TEXAS_RIVER_TARGET: "Texas Hold’em · River target",
+    TEXAS_RIVER_STOP: "Texas Hold’em · River stop",
+  };
+  return labels[reason] ? ` · ${labels[reason]}` : "";
+}
+
+function texasExitText(position = {}) {
+  const current = state.dashboard?.current?.texas_holdem || {};
+  const status = position.texas_exit_status || current.status || "Watching";
+  const phase = current.phase?.label || "Opening play";
+  const target = current.active_target;
+  const bid = current.executable_bid;
+  const fields = [
+    `Texas Hold’em exit: ${status}`,
+    `Phase ${phase}`,
+    `Active target ${cents(target, 0)}`,
+    `Current bid ${cents(bid, 1)}`,
+  ];
+  if (position.texas_exit_reason || current.blocker) {
+    fields.push(`Reason: ${position.texas_exit_reason || current.blocker}`);
+  }
+  return fields.join(" · ");
 }
 
 function renderDashboardOpenTrades(mode, portfolio = {}) {
@@ -300,7 +325,7 @@ function renderDashboardOpenTrades(mode, portfolio = {}) {
       <strong class="${side === "YES" ? "yes" : "no"}" title="${escapeHtml(position.ticker || "Current market")}">${escapeHtml(marketSideLabel(side))} · ${escapeHtml(String(strategy).replaceAll("_", " "))}</strong>
       <small>${escapeHtml(status)}</small>
       <p>${escapeHtml(compact(position.contracts))} contracts · ${escapeHtml(cents(entryPrice))} entry · ${escapeHtml(money(exposure))} exposure</p>
-      <p class="threshold-breach-state">${escapeHtml(thresholdBreachExitText(protection))}</p>
+      <p class="threshold-breach-state">${escapeHtml(String(strategy).toUpperCase() === "TEXAS_HOLDEM" ? texasExitText(position) : thresholdBreachExitText(protection))}</p>
     </article>`;
   });
   const orderRows = restingOrders.map((order) => {
@@ -449,6 +474,103 @@ function renderStandardEdgeHud(readiness) {
     || "Waiting for live trade data.";
 }
 
+function texasPhaseProgress(openTime) {
+  const opened = new Date(openTime || "").getTime();
+  const elapsed = Number.isFinite(opened)
+    ? Math.max(0, Math.min(900, (Date.now() - opened) / 1000))
+    : 0;
+  return { elapsed, phase: elapsed < 300 ? "FLOP" : elapsed < 600 ? "TURN" : "RIVER" };
+}
+
+function animateTexasPhases() {
+  const hud = $("#texas-holdem-hud");
+  if (!hud || hud.hidden) {
+    state.texasPhaseAnimation = null;
+    return;
+  }
+  const texas = state.dashboard?.current?.texas_holdem
+    || state.dashboard?.current?.automatic_entry?.texas_holdem || {};
+  const timing = texasPhaseProgress(texas.market_open_time);
+  const starts = { FLOP: 0, TURN: 300, RIVER: 600 };
+  $$('[data-phase]').forEach((row) => {
+    const key = row.dataset.phase;
+    const progress = Math.max(0, Math.min(1, (timing.elapsed - starts[key]) / 300));
+    const track = row.querySelector(".texas-phase-track");
+    track.style.setProperty("--progress", `${(progress * 100).toFixed(3)}%`);
+    track.setAttribute("aria-valuenow", String(Math.round(progress * 100)));
+    row.classList.toggle("complete", progress >= 1);
+    row.classList.toggle("active", key === timing.phase);
+  });
+  state.texasPhaseAnimation = window.requestAnimationFrame(animateTexasPhases);
+}
+
+function renderTexasHoldemHud(texas = {}) {
+  const enabled = Boolean(texas?.enabled);
+  const standard = $("#standard-edge-hud-content");
+  const hud = $("#texas-holdem-hud");
+  standard.hidden = enabled;
+  hud.hidden = !enabled;
+  if (!enabled) {
+    if (state.texasPhaseAnimation) window.cancelAnimationFrame(state.texasPhaseAnimation);
+    state.texasPhaseAnimation = null;
+    return;
+  }
+  $("#standard-edge-hud").dataset.status = String(texas.status || "WATCHING").toLowerCase();
+  const phaseKey = String(texas.phase?.key || texasPhaseProgress(texas.market_open_time).phase);
+  $("#texas-holdem-phase").textContent = `THE ${phaseKey}`;
+  $("#texas-holdem-status").textContent = String(texas.status || "WAITING").replaceAll("_", " ");
+  $("#texas-side").textContent = marketSideLabel(texas.side);
+  $("#texas-entry-cap").textContent = cents(texas.entry_price_cap, 0);
+  $("#texas-attempts").textContent = `${Number(texas.attempt_count || 0)} / ${Number(texas.maximum_attempts || 3)}`;
+  $("#texas-filled").textContent = texas.target_contracts == null
+    ? compact(texas.filled_contracts || 0)
+    : `${compact(texas.filled_contracts || 0)} / ${compact(texas.target_contracts)}`;
+  $("#texas-current-bid").textContent = cents(texas.executable_bid, 1);
+  $("#texas-active-target").textContent = cents(texas.active_target, 0);
+  $("#texas-holdem-blocker").textContent = texas.blocker
+    || (texas.status === "ENTERED" ? "Position entered. Watching the active street exit." : "Opening play is active.");
+  const values = {
+    "#texas-flop-target": texas.targets?.flop,
+    "#texas-turn-target": texas.targets?.turn,
+    "#texas-river-target": texas.targets?.river,
+    "#texas-river-stop": texas.targets?.river_stop,
+  };
+  Object.entries(values).forEach(([selector, value]) => {
+    const input = $(selector);
+    if (document.activeElement !== input && value != null) input.value = String(Math.round(Number(value) * 100));
+  });
+  if (!state.texasPhaseAnimation) {
+    state.texasPhaseAnimation = window.requestAnimationFrame(animateTexasPhases);
+  }
+}
+
+async function updateTexasQuickSetting(event) {
+  const input = event.currentTarget;
+  const mapping = {
+    "texas-flop-target": "texas_holdem_flop_target",
+    "texas-turn-target": "texas_holdem_turn_target",
+    "texas-river-target": "texas_holdem_river_target",
+    "texas-river-stop": "texas_holdem_river_stop",
+  };
+  const centsValue = Number(input.value);
+  if (!Number.isFinite(centsValue) || centsValue < 1 || centsValue > 99) {
+    showToast("Texas Hold’em setting not changed", "Enter a value from 1¢ through 99¢.");
+    await refreshDashboard();
+    return;
+  }
+  try {
+    await api("/api/settings", {
+      method: "PUT",
+      body: JSON.stringify({ [mapping[input.id]]: centsValue / 100 }),
+    });
+    await refreshDashboard();
+    showToast("Texas Hold’em updated", "The active position is using the new phase value.");
+  } catch (error) {
+    showToast("Texas Hold’em setting not changed", error.message);
+    await refreshDashboard();
+  }
+}
+
 async function toggleStandardEdgeGateRelease(event) {
   const input = event.currentTarget;
   const ticker = state.dashboard?.current?.ticker;
@@ -557,6 +679,11 @@ function renderDashboard(data) {
   renderStandardEdgeHud(
     current?.standard_edge_readiness
       || current?.automatic_entry?.standard_edge_readiness,
+  );
+  renderTexasHoldemHud(
+    current?.texas_holdem
+      || current?.automatic_entry?.texas_holdem
+      || {},
   );
   syncArmButton(readiness, trading.mode);
   renderTradeAssessment();
@@ -915,7 +1042,7 @@ function syncArmButton(readiness = selectedTrading().selected?.readiness || {}, 
   const confirmation = state.trading.armConfirmation;
   const pending = confirmation.confirming && confirmation.mode === mode && !readiness.session_armed;
   $$('[data-arm-session]').forEach((button) => {
-    button.hidden = button.id === "hud-arm-trading" && mode === "PAPER";
+    button.hidden = mode === "PAPER";
     button.classList.toggle("confirming", pending);
     button.classList.toggle("armed", Boolean(readiness.session_armed));
     button.disabled = confirmation.submitting;
@@ -1100,6 +1227,7 @@ function drawVolatilityChart(context, width, height, color, numberFont) {
       context.fillText(chartTimeLabel(timestamp, state.chartWindow <= 5), columnX, height - 8);
     }
   }
+
   if (state.maximumMvi > 0) {
     const maximumY = y(Math.max(0, Math.min(10, state.maximumMvi)));
     context.save();
@@ -1238,6 +1366,53 @@ function drawChart(frameTime = performance.now()) {
     }
   }
 
+  const drawMarketPhases = () => {
+    if (state.chartWindow < 15 || !Number.isFinite(marketOpenTime)) return;
+    const phaseDurationMs = 5 * 60 * 1000;
+    const phases = ["FLOP", "TURN", "RIVER"].map((label, index) => ({
+      label,
+      start: marketOpenTime + index * phaseDurationMs,
+      end: marketOpenTime + (index + 1) * phaseDurationMs,
+    }));
+    context.save();
+    phases.forEach((phase, index) => {
+      const visibleStart = Math.max(viewStart, phase.start);
+      const visibleEnd = Math.min(viewEnd, phase.end);
+      if (visibleEnd <= visibleStart) return;
+      const startX = x(visibleStart);
+      const endX = x(visibleEnd);
+      context.globalAlpha = 0.24;
+      context.fillStyle = color("--surface-hover");
+      context.fillRect(startX, top, endX - startX, 18);
+      if (phase.start >= viewStart && phase.start <= viewEnd) {
+        context.strokeStyle = color("--line-strong");
+        context.globalAlpha = index === 0 ? 0.72 : 0.48;
+        context.lineWidth = 1;
+        context.setLineDash(index === 0 ? [3, 4] : [2, 5]);
+        context.beginPath();
+        context.moveTo(x(phase.start), top);
+        context.lineTo(x(phase.start), top + chartHeight);
+        context.stroke();
+      }
+      if (endX - startX >= 14) {
+        context.setLineDash([]);
+        context.globalAlpha = 0.78;
+        context.fillStyle = color("--chart-label");
+        context.font = `650 9px ${numberFont}`;
+        context.textAlign = "center";
+        context.textBaseline = "top";
+        const labelX = Math.min(
+          plotRight - 18,
+          Math.max(left + 18, startX + (endX - startX) / 2),
+        );
+        context.fillText(phase.label, labelX, top + 4);
+      }
+    });
+    context.restore();
+  };
+
+  drawMarketPhases();
+
   const drawDoubleChevron = (centerX, centerY, direction, arrowColor, scale = 1) => {
     context.save();
     context.strokeStyle = arrowColor;
@@ -1272,13 +1447,12 @@ function drawChart(frameTime = performance.now()) {
     context.strokeStyle = thresholdColor;
     context.lineWidth = 1.25;
     context.setLineDash([]);
-    const thresholdStart = distinguishActiveMarket ? activeMarketX : left;
-    context.beginPath(); context.moveTo(thresholdStart, levelY); context.lineTo(plotRight, levelY); context.stroke();
+    context.beginPath(); context.moveTo(left, levelY); context.lineTo(plotRight, levelY); context.stroke();
     context.font = `500 11px ${numberFont}`;
     const labelWidth = context.measureText(label).width;
     const arrowWidth = direction ? 17 : 0;
     const groupWidth = labelWidth + arrowWidth;
-    const groupLeft = thresholdStart + (plotRight - thresholdStart - groupWidth) / 2;
+    const groupLeft = left + (plotRight - left - groupWidth) / 2;
     context.fillStyle = color("--surface");
     context.fillRect(groupLeft - 8, levelY - 11, groupWidth + 16, 22);
     context.fillStyle = thresholdColor;
@@ -1340,15 +1514,6 @@ function drawChart(frameTime = performance.now()) {
     if (bridge && active[0] !== bridge) active.unshift(bridge);
     drawPriceSegment(older, 0.34);
     drawPriceSegment(active);
-    context.save();
-    context.strokeStyle = color("--line-strong");
-    context.lineWidth = 1;
-    context.setLineDash([3, 4]);
-    context.beginPath();
-    context.moveTo(activeMarketX, top);
-    context.lineTo(activeMarketX, top + chartHeight);
-    context.stroke();
-    context.restore();
   } else {
     drawPriceSegment(points);
   }
@@ -1501,49 +1666,22 @@ const calibrationGroups = [
   ["Margin Volatility", [
     { id: "maximum_margin_volatility", label: "Maximum Margin Volatility", unit: "MVI", min: 0, max: 10, step: .1, tip: "Maximum 30-minute Margin Volatility Index allowed for automatic confirmation in Paper, Demo, and Live. Low MVI is allowed; values above this maximum block. Use 0 to turn it off. Default: off." },
   ]],
-  ["Early Threshold", [
-    { id: "early_threshold_enabled", label: "Early threshold strategy", type: "toggle", tip: "Allows a small automatic entry when a pre-open threshold remains favorable after activation. Default: on." },
-    { id: "early_bankroll_pct", label: "Bankroll allocation", unit: "% bankroll", min: 0, max: 100, step: 1, scale: 100, tip: "Target allocation before the global trade and position caps are applied. Default: 3%." },
-    { id: "early_min_probability", label: "Minimum win chance", unit: "%", min: 50, max: 99, step: 1, scale: 100, tip: "Minimum estimated chance for the side being bought. Default: 65%." },
-    { id: "early_min_net_ev", label: "Minimum Buy EV", unit: "cents", min: 0, max: 25, step: .1, scale: 100, tip: "Minimum value per contract after the executable ask, fee, and slippage. Default: 0.5 cents." },
-    { id: "early_entry_window_seconds", label: "Opening window", unit: "seconds", min: 1, max: 300, step: 1, tip: "Time after activation in which the early strategy may enter. Default: 60 seconds." },
-    { id: "early_threshold_stability_seconds", label: "Threshold stability", unit: "seconds", min: 0, max: 120, step: .5, tip: "How long the pre-open threshold must remain unchanged. Default: 1 second." },
-    { id: "early_confirmation_seconds", label: "Quote confirmation", unit: "seconds", min: 0, max: 120, step: .5, tip: "Minimum time and one fresh quote required before entry. Default: 2 seconds." },
-    { id: "early_max_spread", label: "Maximum spread", unit: "%", min: 0, max: 50, step: .5, scale: 100, tip: "Widest accepted spread for an early entry. Default: 20%." },
-    { id: "early_min_liquidity_contracts", label: "Minimum liquidity", unit: "contracts", min: 1, max: 1000000, step: 1, integer: true, tip: "Minimum contracts available at the selected ask. Default: 1 contract." },
-  ]],
-  ["Late Conviction", [
-    { id: "late_conviction_enabled", label: "Late conviction strategy", type: "toggle", tip: "Allows a small automatic entry near expiration when one outcome is highly likely and Buy EV remains positive. Default: on." },
-    { id: "late_bankroll_pct", label: "Bankroll allocation", unit: "% bankroll", min: 0, max: 100, step: 1, scale: 100, tip: "Target allocation before the global trade and position caps are applied. Default: 3%." },
-    { id: "late_max_seconds_remaining", label: "Maximum time remaining", unit: "seconds", min: 1, max: 900, step: 1, tip: "Latest phase in which the strategy may begin evaluating an entry. Default: 120 seconds." },
-    { id: "late_min_probability", label: "Minimum win chance", unit: "%", min: 50, max: 99, step: 1, scale: 100, tip: "Minimum estimated chance for the side being bought. Default: 79%." },
-    { id: "late_min_net_ev", label: "Minimum Buy EV", unit: "cents", min: 0, max: 25, step: .1, scale: 100, tip: "Minimum value per contract after the executable ask, fee, and slippage. Default: 0.5 cents." },
-    { id: "late_confirmation_seconds", label: "Confirmation period", unit: "seconds", min: 0, max: 120, step: .5, tip: "How long the late conditions must remain valid. Default: 3 seconds." },
-    { id: "late_min_settlement_coverage", label: "Settlement coverage", unit: "%", min: 0, max: 100, step: 5, scale: 100, tip: "Minimum share of the final settlement window already observed. Default: 80%." },
-    { id: "late_min_z_distance", label: "Minimum threshold distance", unit: "z-score", min: 0, max: 20, step: .25, tip: "Minimum absolute volatility-adjusted distance from the threshold. Default: 2.0." },
-    { id: "late_max_spread", label: "Maximum spread", unit: "%", min: 0, max: 50, step: .5, scale: 100, tip: "Widest accepted spread for a late entry. Default: 3%." },
-    { id: "late_min_liquidity_contracts", label: "Minimum liquidity", unit: "contracts", min: 1, max: 1000000, step: 1, integer: true, tip: "Minimum contracts available at the selected ask. Default: 1 contract." },
-  ]],
-  ["Swing Trade", [
-    { id: "swing_enabled", label: "Swing strategy", type: "toggle", tip: "Buys a deeply discounted side early when the model supports it, then sells into a configured price move. Default: off." },
-    { id: "swing_entry_window_seconds", label: "Opening window", unit: "seconds", min: 1, max: 600, step: 1, tip: "Time after the official market open during which Swing may enter. Default: 300 seconds." },
-    { id: "swing_max_entry_price", label: "Maximum entry ask", unit: "cents", min: 1, max: 99, step: 1, scale: 100, tip: "Highest displayed ask that may qualify for Swing. Fees and slippage are added separately. Default: 5 cents." },
-    { id: "swing_target_exit_price", label: "Target exit bid", unit: "cents", min: 1, max: 99, step: 1, scale: 100, tip: "Displayed executable bid that triggers a Swing exit. Default: 10 cents." },
-    { id: "swing_bankroll_pct", label: "Bankroll allocation", unit: "% bankroll", min: 0, max: 100, step: 1, scale: 100, tip: "Target allocation before global trade and position caps. Default: 1%." },
-    { id: "swing_min_model_advantage", label: "Minimum model advantage", unit: "%", min: 0, max: 50, step: .5, scale: 100, tip: "Required model probability above the all-in break-even probability after fees and slippage. Default: 3%." },
-    { id: "swing_fallback_mode", label: "Fallback behavior", type: "select", options: ["Exit", "Hold to settlement"], tip: "Exit near expiration if the target is missed, or keep the position through settlement. Default: Exit." },
-    { id: "swing_fallback_seconds_remaining", label: "Fallback exit", unit: "seconds remaining", min: 1, max: 900, step: 1, tip: "When the fallback exit begins if Exit is selected. Default: 120 seconds remaining." },
-    { id: "swing_stop_loss_cents", label: "Swing stop-loss", unit: "cents", min: 0, max: 99, step: 1, nullable: true, tip: "Optional absolute bid trigger for Swing entries. Use 0 or leave blank to turn it off. Default: off." },
-    { id: "swing_max_spread", label: "Maximum spread", unit: "cents", min: 0, max: 50, step: .5, scale: 100, tip: "Widest contract spread allowed at entry. Default: 3 cents." },
-    { id: "swing_min_liquidity_contracts", label: "Minimum liquidity", unit: "contracts", min: 1, max: 1000000, step: 1, integer: true, tip: "Minimum contracts available at the qualifying ask. Default: 1 contract." },
-    { id: "swing_confirmation_seconds", label: "Confirmation period", unit: "seconds", min: 0, max: 120, step: .5, tip: "How long every Swing entry requirement must remain valid. Default: immediate." },
+  ["Texas Hold’em Strategy", [
+    { id: "texas_holdem_enabled", label: "Enable Texas Hold’em Strategy", type: "toggle", tip: "Runs one contrarian opening play per market and replaces Standard Edge automatic entries while enabled. Default: off." },
+    { id: "texas_holdem_max_entry_price", label: "Maximum entry price", unit: "cents", min: 1, max: 99, step: 1, scale: 100, tip: "Highest all-in executable contract price allowed for the opening IOC buy. Default: 50 cents." },
+    { id: "texas_holdem_flop_target", label: "Flop target", unit: "cents", min: 1, max: 99, step: 1, scale: 100, tip: "Executable bid that closes the position during minutes 0–5. Default: 60 cents." },
+    { id: "texas_holdem_turn_target", label: "Turn target", unit: "cents", min: 1, max: 99, step: 1, scale: 100, tip: "Executable bid that closes the position during minutes 5–10. Default: 50 cents." },
+    { id: "texas_holdem_river_target", label: "River target", unit: "cents", min: 1, max: 99, step: 1, scale: 100, tip: "Executable bid that takes profit during minutes 10–15. Default: 95 cents." },
+    { id: "texas_holdem_river_stop", label: "River stop", unit: "cents", min: 1, max: 99, step: 1, scale: 100, tip: "Executable bid at or below which the position folds during the River. It is inactive during the Flop and Turn. Default: 60 cents." },
+    { id: "texas_holdem_entry_window_seconds", label: "Opening-play window", unit: "seconds", min: 1, max: 120, step: 1, integer: true, tip: "Time after official market open in which the initial attempt and fresh-quote retries may occur. Default: 20 seconds." },
+    { id: "texas_holdem_additional_retries", label: "Additional retries", unit: "retries", min: 0, max: 10, step: 1, integer: true, tip: "Fresh-quote IOC retries after the initial attempt. Default: 2." },
   ]],
   ["Stops & Exits", [
     { id: "default_stop_loss_cents", label: "Default stop-loss", unit: "cents", min: 0, max: 99, step: 1, nullable: true, tip: "Optional absolute bid trigger prefilled on new Buy drafts. Use 0 or leave blank to turn it off; existing stops never change." },
     { id: "global_profit_take_enabled", label: "Global profit take", type: "toggle", tip: "Closes open positions in Paper, Demo, or Live when the executable bid reaches the configured level. Default: on." },
     { id: "global_profit_take_price", label: "Profit-take bid", unit: "cents", min: 1, max: 99, step: 1, scale: 100, tip: "Executable bid that triggers an exit for every strategy and manual trade. Demo and Live require the app to stay connected. Default: 99 cents." },
     { type: "subsection", label: "Threshold Breach Exit", description: "This is a side-aware exit based on the BTC proxy versus To Beat. It does not use contract price as the trigger." },
-    { id: "threshold_breach_exit_enabled", label: "Enable Threshold Breach Exit", type: "toggle", tip: "Side-aware exit based on the BTC proxy versus To Beat. It does not use contract price as the trigger. Default: on." },
+    { id: "threshold_breach_exit_enabled", label: "Enable Threshold Breach Exit", type: "toggle", tip: "Side-aware BTC-proxy exit for Standard Edge and manual positions. Texas Hold’em positions are intentionally exempt because they begin contrarian. Default: on." },
     { id: "threshold_breach_exit_buffer_dollars", label: "Threshold exit buffer", unit: "dollars", min: -100000, max: 100000, step: .25, tip: "Signed side-aware offset from To Beat. A negative value tolerates an adverse move beyond the threshold; -$2 exits an Up at $2 below To Beat or a Down at $2 above it. Positive values exit before the threshold. Default: $0." },
   ]],
   ["Position Sizing and Risk", [
@@ -1686,24 +1824,18 @@ function renderCalibrationResults(data) {
   const exchangeResults = data.mode && data.mode !== "PAPER";
   $("#strategy-results-subtitle").textContent = `${modeLabel(data.mode || "PAPER")} performance`;
   const strategyLabels = {
-    EARLY_THRESHOLD: "Early threshold",
     STANDARD_EDGE: "Standard edge",
-    LATE_CONVICTION: "Late conviction",
-    SWING: "Swing trade",
+    TEXAS_HOLDEM: "Texas Hold’em",
   };
   $("#strategy-results").innerHTML = Object.entries(strategyLabels).map(([key, label]) => {
     const result = strategyResults[key] || {};
     const detail = exchangeResults
       ? `${result.entries || 0} entries · ${result.completed_trades || 0} completed · avg ${cents(result.average_entry_price)} → ${cents(result.average_exit_price)} · ${money(result.actual_fees || 0, 4)} fees`
-      : key === "SWING"
-      ? `${result.entries || 0} entries · ${result.completed_trades || 0} completed · avg ${cents(result.average_entry_price)} → ${cents(result.average_exit_price)} · ${result.average_holding_seconds == null ? "--" : `${Math.round(result.average_holding_seconds)}s`} held · ${percent(result.return_on_deployed_capital, 1)} return`
       : `${result.entries || 0} entries · ${result.settled_trades || 0} settled · avg ${percent(result.average_entry_probability, 1)} at ${cents(result.average_entry_price)} · EV ${result.average_entry_ev == null ? "--" : money(result.average_entry_ev, 3)}`;
-    const rate = key === "SWING" && !exchangeResults
-      ? `${percent(result.target_hit_rate, 1)} target`
-      : `${percent(result.win_rate, 1)} wins`;
+    const rate = `${percent(result.win_rate, 1)} wins`;
     return `<div class="strategy-result-row">
       <span><strong>${label}</strong><small>${detail}</small></span>
-      <span title="${key === "SWING" ? "Target-hit rate" : "Win rate"}">${rate}</span>
+      <span title="Win rate">${rate}</span>
       <span class="${Number(result.realized_pnl) > 0 ? "positive" : Number(result.realized_pnl) < 0 ? "negative" : ""}" title="Realized profit and loss">${money(result.realized_pnl || 0)}</span>
     </div>`;
   }).join("");
@@ -2666,6 +2798,9 @@ function bindEvents() {
   });
   $("#run-backtest").addEventListener("click", runBacktest);
   $("#standard-edge-gate-release").addEventListener("change", toggleStandardEdgeGateRelease);
+  ["#texas-flop-target", "#texas-turn-target", "#texas-river-target", "#texas-river-stop"].forEach((selector) => {
+    $(selector).addEventListener("change", updateTexasQuickSetting);
+  });
   $("#reset-paper-round").addEventListener("click", resetPaperRound);
   $("#run-bootstrap").addEventListener("click", runBootstrap);
   $("#backup-database").addEventListener("click", backupDatabase);

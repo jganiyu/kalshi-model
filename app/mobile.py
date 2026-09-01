@@ -47,6 +47,9 @@ def mobile_snapshot(dashboard: dict[str, Any]) -> dict[str, Any]:
     readiness = current.get("standard_edge_readiness") or (
         current.get("automatic_entry") or {}
     ).get("standard_edge_readiness")
+    texas_holdem = current.get("texas_holdem") or (
+        current.get("automatic_entry") or {}
+    ).get("texas_holdem") or {}
     if mode == "PAPER":
         trades = (dashboard.get("paper") or {}).get("recent_paper_trades") or []
     else:
@@ -96,6 +99,18 @@ def mobile_snapshot(dashboard: dict[str, Any]) -> dict[str, Any]:
             "threshold_breach_exit": _safe_copy(
                 position.get("threshold_breach_exit")
             ),
+            "texas_holdem_exit": _safe_copy(
+                {
+                    "status": position.get("texas_exit_status")
+                    or texas_holdem.get("status"),
+                    "reason": position.get("texas_exit_reason")
+                    or texas_holdem.get("blocker"),
+                    "phase": texas_holdem.get("phase"),
+                    "active_target": texas_holdem.get("active_target"),
+                    "current_bid": texas_holdem.get("executable_bid"),
+                    "targets": texas_holdem.get("targets"),
+                }
+            ) if (position.get("strategy") == "TEXAS_HOLDEM") else None,
         }
         for position in (selected.get("positions") or [])
     ]
@@ -114,10 +129,12 @@ def mobile_snapshot(dashboard: dict[str, Any]) -> dict[str, Any]:
                 else None
             ),
             "time_remaining_seconds": current.get("time_remaining_seconds"),
+            "open_time": current.get("open_time"),
             "up_price": current.get("yes_ask"),
             "down_price": current.get("no_ask"),
         },
         "readiness": _safe_copy(readiness),
+        "texas_holdem": _safe_copy(texas_holdem),
         "open_trades": positions,
         "available_cash": selected.get("available_cash"),
         "recent_trades": recent_trades,

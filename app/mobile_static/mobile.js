@@ -5,6 +5,8 @@ let followsSystemTheme = !storedTheme;
 let reconnectDelay = 1000;
 let socket;
 let timerDeadline = null;
+let texasState = null;
+let texasAnimation = null;
 
 function applyTheme(theme) {
   const dark = theme === "dark";
@@ -171,10 +173,73 @@ function renderHud(readiness) {
   $("#hud-blocker").textContent = readiness?.blocker || "Waiting for live trade data.";
 }
 
+function texasTiming(openTime) {
+  const opened = new Date(openTime || "").getTime();
+  const elapsed = Number.isFinite(opened)
+    ? Math.max(0, Math.min(900, (Date.now() - opened) / 1000))
+    : 0;
+  return { elapsed, phase: elapsed < 300 ? "FLOP" : elapsed < 600 ? "TURN" : "RIVER" };
+}
+
+function animateTexasHud() {
+  const hud = $("#texas-mobile-hud");
+  if (!hud || hud.hidden || !texasState) {
+    texasAnimation = null;
+    return;
+  }
+  const timing = texasTiming(texasState.market_open_time);
+  const starts = { FLOP: 0, TURN: 300, RIVER: 600 };
+  document.querySelectorAll("[data-mobile-phase]").forEach((row) => {
+    const key = row.dataset.mobilePhase;
+    const progress = Math.max(0, Math.min(1, (timing.elapsed - starts[key]) / 300));
+    row.querySelector(".track i").style.width = `${(progress * 100).toFixed(3)}%`;
+    row.classList.toggle("complete", progress >= 1);
+    row.classList.toggle("active", key === timing.phase);
+  });
+  $("#texas-mobile-phase").textContent = `THE ${timing.phase}`;
+  texasAnimation = window.requestAnimationFrame(animateTexasHud);
+}
+
+function renderTexasHud(texas = {}) {
+  const enabled = Boolean(texas.enabled);
+  $("#standard-hud-content").hidden = enabled;
+  $("#texas-mobile-hud").hidden = !enabled;
+  texasState = enabled ? texas : null;
+  if (!enabled) {
+    if (texasAnimation) window.cancelAnimationFrame(texasAnimation);
+    texasAnimation = null;
+    return;
+  }
+  const phase = String(texas.phase?.key || texasTiming(texas.market_open_time).phase);
+  $("#texas-mobile-phase").textContent = `THE ${phase}`;
+  $("#texas-mobile-status").textContent = String(texas.status || "WAITING").replaceAll("_", " ");
+  $("#texas-mobile-status").dataset.status = String(texas.status || "WATCHING").toLowerCase();
+  $("#texas-mobile-flop-target").textContent = `${cents(texas.targets?.flop, 0)} target`;
+  $("#texas-mobile-turn-target").textContent = `${cents(texas.targets?.turn, 0)} target`;
+  $("#texas-mobile-river-target").textContent = `${cents(texas.targets?.river, 0)} target · ${cents(texas.targets?.river_stop, 0)} stop`;
+  $("#texas-mobile-side").textContent = sideLabel(texas.side);
+  $("#texas-mobile-cap").textContent = cents(texas.entry_price_cap, 0);
+  $("#texas-mobile-attempts").textContent = `${Number(texas.attempt_count || 0)} / ${Number(texas.maximum_attempts || 3)}`;
+  $("#texas-mobile-filled").textContent = texas.target_contracts == null
+    ? compact(texas.filled_contracts || 0)
+    : `${compact(texas.filled_contracts || 0)} / ${compact(texas.target_contracts)}`;
+  $("#texas-mobile-bid").textContent = cents(texas.executable_bid);
+  $("#texas-mobile-active-target").textContent = cents(texas.active_target, 0);
+  $("#texas-mobile-blocker").textContent = texas.blocker || "Opening play is active.";
+  if (!texasAnimation) texasAnimation = window.requestAnimationFrame(animateTexasHud);
+}
+
 function tradeResult(trade) {
   const status = String(trade.display_status || trade.status || trade.action || "Open");
-  const exitLabel = String(trade.exit_reason || "").toUpperCase() === "THRESHOLD_BREACH_EXIT"
-    ? " · Threshold breach exit" : "";
+  const reason = String(trade.exit_reason || "").toUpperCase();
+  const exitLabels = {
+    THRESHOLD_BREACH_EXIT: "Threshold breach exit",
+    TEXAS_FLOP_TARGET: "Texas Hold’em · Flop target",
+    TEXAS_TURN_TARGET: "Texas Hold’em · Turn target",
+    TEXAS_RIVER_TARGET: "Texas Hold’em · River target",
+    TEXAS_RIVER_STOP: "Texas Hold’em · River stop",
+  };
+  const exitLabel = exitLabels[reason] ? ` · ${exitLabels[reason]}` : "";
   return trade.realized_pnl == null
     ? `${status}${exitLabel}`
     : `${status}${exitLabel} · ${money(trade.realized_pnl)}`;
@@ -191,6 +256,17 @@ function thresholdBreachExitText(protection = {}) {
   if (protection.reason) fields.push(`Reason: ${protection.reason}`);
   if (protection.last_attempt_at) fields.push(`Last attempt ${timeLabel(protection.last_attempt_at)}`);
   if (protection.remaining_contracts != null) fields.push(`Remaining ${compact(protection.remaining_contracts)} contracts`);
+  return fields.join(" · ");
+}
+
+function texasExitText(state = {}) {
+  const fields = [
+    `Texas Hold’em exit: ${state.status || "Watching"}`,
+    `Phase ${state.phase?.label || "Opening play"}`,
+    `Active target ${cents(state.active_target, 0)}`,
+    `Current bid ${cents(state.current_bid)}`,
+  ];
+  if (state.reason) fields.push(`Reason: ${state.reason}`);
   return fields.join(" · ");
 }
 
@@ -236,7 +312,7 @@ function renderOpenTrades(trades, mode, availableCash, market) {
       <div class="open-trade-head"><strong class="${sideClass}">${escapeHtml(sideLabel(trade.side))}</strong><span>${escapeHtml(strategy)}</span></div>
       <p title="${escapeHtml(trade.ticker)}">${escapeHtml(trade.ticker || "Current market")}</p>
       <div><span>${escapeHtml(compact(trade.contracts))} contracts</span><span>${escapeHtml(cents(trade.entry_price))} entry</span><span>${escapeHtml(money(trade.exposure))} exposure</span></div>
-      <p class="threshold-breach-state">${escapeHtml(thresholdBreachExitText(trade.threshold_breach_exit || {}))}</p>
+      <p class="threshold-breach-state">${escapeHtml(String(trade.strategy).toUpperCase() === "TEXAS_HOLDEM" ? texasExitText(trade.texas_holdem_exit || {}) : thresholdBreachExitText(trade.threshold_breach_exit || {}))}</p>
     </article>`;
   }).join("");
 }
@@ -253,6 +329,7 @@ function render(data) {
   timerDeadline = Number.isFinite(remaining) ? Date.now() + Math.max(0, remaining) * 1000 : null;
   updateTimer();
   renderHud(data?.readiness);
+  renderTexasHud(data?.texas_holdem || {});
   renderOpenTrades(data?.open_trades || [], mode, data?.available_cash, data?.market);
   renderTrades(data?.recent_trades || [], mode);
 }

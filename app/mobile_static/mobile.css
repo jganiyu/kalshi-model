@@ -37,7 +37,7 @@ h1, h2, p { margin: 0; }
 h1 { font-size: 23px; letter-spacing: -.035em; }
 h2 { font-size: 22px; letter-spacing: -.03em; }
 .eyebrow { margin-bottom: 3px; color: var(--muted); font-size: 9px; font-weight: 750; letter-spacing: .16em; }
-.theme-switch { display: flex; align-items: center; gap: 6px; color: var(--muted); font-size: 10px; }
+.theme-switch { display: flex; flex: 0 0 auto; align-items: center; gap: 6px; color: var(--muted); font-size: 10px; white-space: nowrap; }
 .theme-switch input { position: absolute; opacity: 0; pointer-events: none; }
 .theme-switch i { position: relative; width: 34px; height: 20px; border-radius: 999px; background: var(--line); }
 .theme-switch i::after { position: absolute; top: 2px; left: 2px; width: 16px; height: 16px; border-radius: 50%; background: var(--surface); box-shadow: 0 1px 3px #0003; content: ""; transition: transform .16s ease; }
@@ -74,6 +74,17 @@ h2 { font-size: 22px; letter-spacing: -.03em; }
 .gate small { display: block; overflow: hidden; margin-top: 2px; color: var(--muted); font-size: 9px; font-weight: 450; text-overflow: ellipsis; white-space: nowrap; }
 .cushion { margin: 0 0 12px; color: var(--muted); font-size: 10px; font-variant-numeric: tabular-nums; }
 .blocker { padding-top: 13px; border-top: 1px solid var(--line); color: var(--red); font-size: 11px; line-height: 1.4; }
+.texas-mobile-phase { margin-bottom: 17px; }
+.texas-mobile-phase > div:first-child { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 7px; color: var(--muted); font-size: 11px; font-weight: 620; }
+.texas-mobile-phase strong { color: var(--ink); font-size: 11px; }
+.texas-mobile-phase .track i { background: var(--amber); will-change: width; }
+.texas-mobile-phase.complete .track i { background: var(--green); }
+.texas-mobile-phase.active > div:first-child > span { color: var(--ink); }
+.texas-mobile-details { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 11px 9px; padding: 2px 0 15px; }
+.texas-mobile-details span { min-width: 0; }
+.texas-mobile-details small, .texas-mobile-details strong { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.texas-mobile-details small { margin-bottom: 3px; color: var(--muted); font-size: 8px; text-transform: uppercase; }
+.texas-mobile-details strong { font-size: 10px; font-variant-numeric: tabular-nums; }
 .section-heading { padding-bottom: 13px; }
 .section-heading > span { color: var(--muted); font-size: 9px; text-transform: uppercase; }
 .section-heading h2 { font-size: 17px; }
@@ -118,6 +129,7 @@ h2 { font-size: 22px; letter-spacing: -.03em; }
 
 @media (max-width: 340px) {
   .mobile-shell { padding-left: max(12px, env(safe-area-inset-left)); padding-right: max(12px, env(safe-area-inset-right)); }
+  .theme-switch { gap: 5px; padding-right: 2px; font-size: 9px; }
   .hud, .open-trades, .trades { padding: 14px 12px; }
   .trade-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .market-strip > div { padding-inline: 8px; }

@@ -626,6 +626,13 @@ def clean_settings_payload(payload: dict[str, Any]) -> dict[str, Any]:
         "directional_momentum_lookback_seconds": (5.0, 120.0),
         "directional_momentum_minimum_movement_dollars": (0.0, 100_000.0),
         "maximum_margin_volatility": (0.0, 10.0),
+        "texas_holdem_max_entry_price": (0.01, 0.99),
+        "texas_holdem_flop_target": (0.01, 0.99),
+        "texas_holdem_turn_target": (0.01, 0.99),
+        "texas_holdem_river_target": (0.01, 0.99),
+        "texas_holdem_river_stop": (0.01, 0.99),
+        "texas_holdem_entry_window_seconds": (1.0, 120.0),
+        "texas_holdem_additional_retries": (0, 10),
         "early_bankroll_pct": (0.0, 1.0),
         "early_min_probability": (0.50, 0.99),
         "early_min_net_ev": (0.0, 0.50),
@@ -706,6 +713,7 @@ def clean_settings_payload(payload: dict[str, Any]) -> dict[str, Any]:
         "training_history_days", "benchmark_history_samples", "training_max_samples",
         "promotion_min_samples", "promotion_min_days", "retraining_cadence_hours",
         "initial_retrain_settlements", "chart_window_minutes",
+        "texas_holdem_entry_window_seconds", "texas_holdem_additional_retries",
         "demo_max_open_orders", "live_max_open_orders",
         "demo_max_daily_order_count", "live_max_daily_order_count",
         "demo_min_liquidity", "live_min_liquidity",
@@ -744,6 +752,7 @@ def clean_settings_payload(payload: dict[str, Any]) -> dict[str, Any]:
             cleaned[key] = int(number) if key in integer_settings else number
         elif key in {
             "paper_trading_enabled", "risk_controls_enabled",
+            "texas_holdem_enabled",
             "early_threshold_enabled", "late_conviction_enabled", "swing_enabled",
             "global_profit_take_enabled",
             "threshold_breach_exit_enabled",
@@ -833,6 +842,7 @@ async def database_info() -> dict[str, Any]:
         "trade_review_links",
         "btc_volume_observations", "btc_trade_ticks", "kalshi_trade_ticks",
         "volume_signal_snapshots",
+        "texas_holdem_rounds", "texas_holdem_attempts",
     ):
         counts[table] = db.fetch_one(f"SELECT COUNT(*) AS count FROM {table}")["count"]
     return {

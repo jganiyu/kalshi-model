@@ -21,9 +21,9 @@ A local macOS research and trading app for Kalshi's 15-minute Bitcoin Up or Down
 - **BTC proxy:** Median Coinbase, Kraken, and Bitstamp price with learned BRTI uncertainty.
 - **Three modes:** Paper, isolated Kalshi Demo, and deliberately armed Kalshi Live.
 - **Mobile Monitor:** Read-only HUD, market metrics, and recent trades on iPhone through Tailscale.
-- **Strategies:** Standard Edge, Early Threshold, Late Conviction, and Swing.
+- **Strategies:** Standard Edge probability-and-value entries, plus an optional Texas Hold’em opening play with Flop, Turn, and River exits.
 - **Protective exits:** Configurable profit take, stop-loss, and Threshold Breach Exit rules.
-- **Calibration:** Tune strategies and review probability, volatility, and volume evidence.
+- **Calibration:** Tune Standard Edge, exits, risk controls, and review probability, volatility, and volume evidence.
 - **Trade review:** Expand a settled trade to replay its BTC, probability, MVI, readiness, and execution history.
 - **Local data:** Settings, evidence, trades, review snapshots, reports, and backups stay in SQLite on your Mac.
 
@@ -52,6 +52,8 @@ A local macOS research and trading app for Kalshi's 15-minute Bitcoin Up or Down
 - **MVI** scores 30-minute threshold-margin volatility from 0–10; cushion compares today’s margin with the expected remaining move.
 - Hover over an info icon for a plain-language explanation of any metric.
 
+When Texas Hold’em is enabled, this card becomes a three-street strategy HUD. Its Flop, Turn, and River bars fill smoothly through each five-minute phase, show the active exit target and River stop, and allow quick target edits on the Mac. The iPhone monitor mirrors the state without exposing controls.
+
 ## Calibration
 
 ![Calibration controls for Threshold Breach Exit](docs/screenshots/calibration-threshold-breach-dark-20260830.png)
@@ -60,6 +62,7 @@ A local macOS research and trading app for Kalshi's 15-minute Bitcoin Up or Down
 - Results show settled samples, Brier score, and calibration in 10-point probability ranges.
 - Margin Volatility has one maximum setting; `0` leaves the gate off while evidence accumulates.
 - Automatic entries still require a valid price, positive Buy EV, confirmation, liquidity, and risk approval.
+- The Texas Hold’em section controls its 50¢ opening cap, 20-second attempt window, two fresh-market-state retries, phase targets, and River stop. It is off by default.
 
 ## Kalshi credentials
 
@@ -99,15 +102,19 @@ The model has one simple loop: estimate the odds, compare them with the price, t
 
 ### What can open a trade
 
-Standard Edge looks for a sustained pricing advantage. Early Threshold uses a threshold available before the market opens, Late Conviction looks near settlement, and Swing buys a deeply discounted early contract for a defined target exit. Only one automatic strategy can enter a market.
+Standard Edge looks for a sustained pricing advantage and confirms it against the configured probability, value, data, market-quality, and risk requirements before entering.
 
 Every entry must clear probability, EV, spread, liquidity, data, confidence, threshold distance, BTC directional momentum, volatility, confirmation, allocation, and risk checks. By default, a 15-second BTC-proxy regression must move at least $1 upward for Up or downward for Down. The HUD shows these checks live so it is clear what the model is waiting on.
+
+Texas Hold’em is an alternative automatic strategy. Once the official market opens and To Beat is known, it buys the contract opposite BTC’s opening position versus the threshold—Down when BTC is above it, Up when BTC is below it—only when the all-in executable price is 50¢ or less. It sends one IOC attempt and up to two remaining-quantity retries on genuinely new market state during the first 20 seconds; otherwise it folds until the next market. Standard Edge entries are disabled while this strategy is on.
 
 ### How it protects a trade
 
 Margin Volatility measures how choppily BTC is moving around To Beat. It can block automatic entries when the configured maximum is exceeded; its cushion is recorded for review, not used as an entry gate.
 
 Profit take exits at a configured executable bid—99¢ by default—and stop-losses remain optional. Threshold Breach Exit is the model's fold: its signed buffer can trigger before To Beat or tolerate a configured adverse move beyond it before closing. These are safeguards, not guarantees of an exit price or fill.
+
+Texas Hold’em positions use their own market-state exits: 60¢ during the Flop, 50¢ during the Turn, and 95¢ during the River by default. A 60¢ River stop becomes active only in the final five minutes. Texas positions deliberately ignore Threshold Breach Exit and the ordinary stop because the opening play begins contrarian; phase exits use aggressive reduce-only IOC sells and never reverse the position.
 
 ### How it improves
 
@@ -163,7 +170,7 @@ Stop-losses and the global profit take are app-managed in Demo and Live. They wo
 
 ## Mobile Monitor
 
-The read-only iPhone view shows To Beat, BTC Proxy, the Kalshi timer, Standard Edge readiness, and the latest 10 trades for the environment selected on the Mac.
+The read-only iPhone view shows To Beat, BTC Proxy, the Kalshi timer, Standard Edge or Texas Hold’em readiness, and the latest 10 trades for the environment selected on the Mac.
 
 1. Install Tailscale on the Mac and iPhone, then enable **Settings → Mobile Monitor**.
 2. Click **Copy command**, paste it into Terminal, and press Return. The app uses the full CLI command required by Mac App Store installations.

@@ -100,6 +100,7 @@ def dashboard(mode: str = "PAPER") -> dict:
         "btc": {"price": 79_500.25},
         "current": {
             "strike": 79_450.0,
+            "open_time": "2026-08-28T11:45:00+00:00",
             "time_remaining_seconds": 182,
             "yes_ask": 0.80,
             "no_ask": 0.21,
@@ -130,9 +131,11 @@ def test_mobile_snapshot_matches_dashboard_hud_market_and_recent_trades() -> Non
         "btc_proxy": 79_500.25,
         "btc_margin": 50.25,
         "time_remaining_seconds": 182,
+        "open_time": "2026-08-28T11:45:00+00:00",
         "up_price": 0.80,
         "down_price": 0.21,
     }
+    assert payload["texas_holdem"] == {}
     assert payload["recent_trades"] == source["paper"]["recent_paper_trades"][:10]
     assert payload["available_cash"] == 995.0
     assert payload["open_trades"] == [{
@@ -140,6 +143,7 @@ def test_mobile_snapshot_matches_dashboard_hud_market_and_recent_trades() -> Non
         "entry_price": 0.51, "exposure": 5.1,
         "strategy": "STANDARD_EDGE", "status": None,
         "threshold_breach_exit": None,
+        "texas_holdem_exit": None,
     }]
 
 

@@ -932,6 +932,65 @@ MIGRATIONS: list[tuple[int, str]] = [
         WHERE raw_json<>'{}';
         """,
     ),
+    (
+        20,
+        """
+        CREATE TABLE texas_holdem_rounds (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            environment TEXT NOT NULL CHECK(environment IN ('PAPER','DEMO','LIVE')),
+            ticker TEXT NOT NULL,
+            market_open_time TEXT,
+            threshold REAL,
+            opening_btc_proxy REAL,
+            side TEXT CHECK(side IN ('YES','NO')),
+            status TEXT NOT NULL DEFAULT 'WAITING',
+            entry_price_cap REAL NOT NULL,
+            target_contracts REAL,
+            filled_contracts REAL NOT NULL DEFAULT 0,
+            attempt_count INTEGER NOT NULL DEFAULT 0,
+            last_quote_marker TEXT,
+            fold_reason TEXT,
+            flop_target REAL NOT NULL,
+            turn_target REAL NOT NULL,
+            river_target REAL NOT NULL,
+            river_stop REAL NOT NULL,
+            entry_price REAL,
+            entry_fees REAL NOT NULL DEFAULT 0,
+            exit_reason TEXT,
+            exit_trigger_bid REAL,
+            exited_at TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(environment,ticker)
+        );
+        CREATE INDEX idx_texas_holdem_rounds_environment_status
+            ON texas_holdem_rounds(environment,status,updated_at);
+
+        CREATE TABLE texas_holdem_attempts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            round_id INTEGER NOT NULL,
+            attempt_number INTEGER NOT NULL,
+            observed_at TEXT NOT NULL,
+            quote_marker TEXT,
+            side TEXT NOT NULL CHECK(side IN ('YES','NO')),
+            executable_price REAL,
+            requested_contracts REAL,
+            filled_contracts REAL NOT NULL DEFAULT 0,
+            status TEXT NOT NULL,
+            blocker TEXT,
+            broker_client_order_id TEXT,
+            evidence_json TEXT NOT NULL DEFAULT '{}',
+            FOREIGN KEY(round_id) REFERENCES texas_holdem_rounds(id) ON DELETE CASCADE,
+            UNIQUE(round_id,attempt_number)
+        );
+
+        ALTER TABLE broker_positions ADD COLUMN strategy_metadata_json TEXT;
+        ALTER TABLE broker_positions ADD COLUMN texas_exit_status TEXT;
+        ALTER TABLE broker_positions ADD COLUMN texas_exit_reason TEXT;
+        ALTER TABLE broker_positions ADD COLUMN texas_exit_last_attempt_at TEXT;
+        ALTER TABLE broker_positions ADD COLUMN texas_exit_last_attempt_bid REAL;
+        """,
+    ),
 ]
 
 

@@ -333,6 +333,22 @@ nav { display: grid; gap: 2px; }
 .standard-edge-hud-arm:hover { border-color: var(--ink); background: var(--surface-hover); }
 .standard-edge-hud-arm.confirming { border-color: var(--amber); color: var(--amber); }
 .standard-edge-hud-arm.armed { border-color: color-mix(in srgb, var(--red) 55%, var(--line-strong)); color: var(--red); }
+.texas-holdem-hud { gap: 0; }
+.texas-phase-row { margin-bottom: 13px; }
+.texas-phase-row > div:first-child { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 6px; }
+.texas-phase-row span { color: var(--muted); font-size: 9px; font-weight: 650; }
+.texas-phase-row strong { display: flex; align-items: center; gap: 3px; color: var(--muted); font-family: var(--number-font); font-size: 9px; font-weight: 560; white-space: nowrap; }
+.texas-phase-row input { width: 30px; padding: 1px 2px; border: 0; border-bottom: 1px solid var(--line-strong); border-radius: 0; background: transparent; color: var(--ink); font: inherit; text-align: right; }
+.texas-phase-row input:focus { border-color: var(--green); outline: 0; }
+.texas-phase-track { --progress: 0%; height: 5px; overflow: hidden; background: var(--surface-hover); }
+.texas-phase-track i { display: block; width: var(--progress); height: 100%; background: var(--amber); will-change: width; }
+.texas-phase-row.complete .texas-phase-track i { background: var(--green); }
+.texas-phase-row.active > div:first-child span { color: var(--ink); }
+.texas-holdem-details { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px 14px; margin-top: 4px; padding-top: 12px; border-top: 1px solid var(--line); }
+.texas-holdem-details span { min-width: 0; }
+.texas-holdem-details small, .texas-holdem-details strong { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.texas-holdem-details small { margin-bottom: 3px; color: var(--muted); font-size: 8px; }
+.texas-holdem-details strong { font-family: var(--number-font); font-size: 9px; font-weight: 600; font-variant-numeric: tabular-nums; }
 .hud-help {
   position: relative;
   display: inline-grid;

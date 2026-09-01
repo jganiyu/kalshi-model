@@ -82,7 +82,7 @@ def test_order_migration_preserves_existing_paper_trades(tmp_path: Path) -> None
     preserved = db.fetch_one("SELECT * FROM paper_trades WHERE ticker='LEGACY'")
     assert preserved and preserved["contracts"] == 5
     assert preserved["source"] == "automatic"
-    assert db.fetch_one("SELECT MAX(version) AS version FROM schema_migrations")["version"] == 19
+    assert db.fetch_one("SELECT MAX(version) AS version FROM schema_migrations")["version"] == 20
 
 
 def test_market_orders_use_best_prices_and_enforce_position(tmp_path: Path) -> None:

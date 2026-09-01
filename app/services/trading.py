@@ -14,6 +14,7 @@ import httpx
 from app.config import AppConfig
 from app.db import Database
 from app.domain import kalshi_fee, parse_time, threshold_breach_exit_state
+from app.domain import texas_holdem_exit_reason
 from app.services.broker import (
     fill_aggregate,
     KalshiBroker,
@@ -68,6 +69,13 @@ def protective_exit_reason(
     threshold: float | None = None,
     data_reliable: bool = True,
 ) -> tuple[str | None, int | None]:
+    if position.get("strategy") == "TEXAS_HOLDEM":
+        texas_reason, _ = texas_holdem_exit_reason(bid, seconds_remaining, settings)
+        if texas_reason:
+            return texas_reason, 0
+        # Texas positions intentionally begin on the opposite side of To Beat;
+        # their dedicated River stop replaces generic stops and breach exits.
+        return None, None
     if settings.get("global_profit_take_enabled", True) and bid + 1e-12 >= float(
         settings.get("global_profit_take_price", 0.99)
     ):
@@ -708,6 +716,9 @@ class TradingCoordinator:
         fallback_exit_seconds: float | None = None,
         strategy_metadata: dict[str, Any] | None = None,
         enforce_duplicate_guard: bool = True,
+        requested_contracts: int | None = None,
+        time_in_force: str | None = None,
+        maximum_entry_price: float | None = None,
     ) -> tuple[KalshiBroker | None, OrderIntent | None, float, str | None]:
         mode = self.selected_mode
         if mode == "PAPER":
@@ -721,7 +732,11 @@ class TradingCoordinator:
         if side not in {"YES", "NO"} or price is None:
             return broker, None, 0.0, "An executable automatic candidate is unavailable."
         if enforce_duplicate_guard and (
-            key in self._pending_automatic_keys or broker.has_automatic_entry(ticker)
+            key in self._pending_automatic_keys
+            or broker.has_automatic_entry(
+                ticker,
+                exclude_strategy="TEXAS_HOLDEM" if strategy == "TEXAS_HOLDEM" else None,
+            )
         ):
             return broker, None, 0.0, "An automatic entry already exists for this market."
         settings = self.db.settings()
@@ -765,6 +780,8 @@ class TradingCoordinator:
             side=side,
             price_ranges=assessment.get("price_ranges"),
         )
+        if maximum_entry_price is not None and price > float(maximum_entry_price) + 1e-12:
+            return broker, None, effective, "The executable entry exceeds the Texas Hold'em price cap."
         unit = float(price) + kalshi_fee(float(price))
         if (
             exchange_index is not None
@@ -782,6 +799,8 @@ class TradingCoordinator:
         ask_size = assessment.get("ask_size")
         if ask_size is not None:
             contracts = min(contracts, math.floor(max(0.0, float(ask_size))))
+        if requested_contracts is not None:
+            contracts = min(contracts, max(0, int(requested_contracts)))
         if contracts < 1:
             return broker, None, effective, "The allocation is too small for one contract."
         configured_stop = (
@@ -800,6 +819,8 @@ class TradingCoordinator:
             limit_price=float(price),
             strategy=strategy,
             source="automatic",
+            time_in_force=time_in_force or "good_till_canceled",
+            cancel_order_on_pause=(time_in_force != "immediate_or_cancel"),
             price_ranges=assessment.get("price_ranges"),
             stop_loss_price=stop_price,
             target_exit_price=target_exit_price,
@@ -807,7 +828,7 @@ class TradingCoordinator:
             fallback_exit_seconds=fallback_exit_seconds,
             cancel_after_seconds=float(
                 settings.get(f"{mode.lower()}_entry_timeout_seconds", 15)
-            ),
+            ) if time_in_force != "immediate_or_cancel" else None,
             decision_snapshot={
                 "model_version": model_version,
                 "reason": reason,
@@ -834,6 +855,14 @@ class TradingCoordinator:
                 "exchange_index": exchange_index,
             },
         )
+        if strategy == "TEXAS_HOLDEM":
+            self.db.execute(
+                """
+                UPDATE texas_holdem_rounds SET target_contracts=COALESCE(target_contracts,?),
+                    updated_at=? WHERE environment=? AND ticker=?
+                """,
+                (contracts, datetime_now(), mode, ticker),
+            )
         return broker, intent, effective, None
 
     def preview_automatic_risk(self, **kwargs: Any) -> dict[str, Any]:
@@ -848,13 +877,18 @@ class TradingCoordinator:
                 "effective_bankroll_allocation": effective,
             }
         assessment = kwargs.get("assessment") or {}
+        texas = kwargs.get("strategy") == "TEXAS_HOLDEM"
         risk = broker.risk_check(
             intent,
             spread=assessment.get("spread"),
             liquidity=assessment.get("ask_size"),
-            data_quality=str(assessment.get("decision_confidence") or "Low"),
+            data_quality=(
+                "High" if texas and assessment.get("data_reliable")
+                else str(assessment.get("decision_confidence") or "Low")
+            ),
             data_reliable=bool(
-                assessment.get("data_reliable") and assessment.get("trade_allowed")
+                assessment.get("data_reliable")
+                and (texas or assessment.get("trade_allowed"))
             ),
             market_open=True,
         )
@@ -874,6 +908,9 @@ class TradingCoordinator:
         fallback_exit_mode: str | None = None,
         fallback_exit_seconds: float | None = None,
         strategy_metadata: dict[str, Any] | None = None,
+        requested_contracts: int | None = None,
+        time_in_force: str | None = None,
+        maximum_entry_price: float | None = None,
         **_: Any,
     ) -> tuple[bool, float]:
         broker, intent, effective, _ = self._prepare_automatic_intent(
@@ -888,6 +925,9 @@ class TradingCoordinator:
             fallback_exit_mode=fallback_exit_mode,
             fallback_exit_seconds=fallback_exit_seconds,
             strategy_metadata=strategy_metadata,
+            requested_contracts=requested_contracts,
+            time_in_force=time_in_force,
+            maximum_entry_price=maximum_entry_price,
         )
         if not broker or not intent:
             return False, effective
@@ -895,9 +935,13 @@ class TradingCoordinator:
             intent,
             spread=assessment.get("spread"),
             liquidity=assessment.get("ask_size"),
-            data_quality=str(assessment.get("decision_confidence") or "Low"),
+            data_quality=(
+                "High" if strategy == "TEXAS_HOLDEM" and assessment.get("data_reliable")
+                else str(assessment.get("decision_confidence") or "Low")
+            ),
             data_reliable=bool(
-                assessment.get("data_reliable") and assessment.get("trade_allowed")
+                assessment.get("data_reliable")
+                and (strategy == "TEXAS_HOLDEM" or assessment.get("trade_allowed"))
             ),
             market_open=True,
         )
@@ -915,6 +959,40 @@ class TradingCoordinator:
         try:
             result = await broker.submit(intent)
             await broker.reconcile()
+            if intent.strategy == "TEXAS_HOLDEM" and intent.action == "BUY":
+                attempt_number = int(
+                    (intent.decision_snapshot.get("strategy_metadata") or {}).get(
+                        "attempt_number", 0
+                    ) or 0
+                )
+                fill = self.db.fetch_one(
+                    """
+                    SELECT COALESCE(SUM(contracts),0) amount
+                    FROM broker_fills
+                    WHERE mode=? AND client_order_id=? AND action='BUY'
+                    """,
+                    (intent.mode, intent.client_order_id),
+                ) or {}
+                if attempt_number:
+                    self.db.execute(
+                        """
+                        UPDATE texas_holdem_attempts SET broker_client_order_id=?,
+                            requested_contracts=?,filled_contracts=?,status=?,blocker=NULL
+                        WHERE round_id=(
+                            SELECT id FROM texas_holdem_rounds
+                            WHERE environment=? AND ticker=?
+                        ) AND attempt_number=?
+                        """,
+                        (
+                            intent.client_order_id,
+                            intent.contracts,
+                            float(fill.get("amount") or 0.0),
+                            str(result.get("status") or "ACKNOWLEDGED"),
+                            intent.mode,
+                            intent.ticker,
+                            attempt_number,
+                        ),
+                    )
             if (
                 intent.action == "SELL"
                 and intent.source == "threshold_breach_exit"
@@ -938,20 +1016,117 @@ class TradingCoordinator:
                         intent.side,
                     ),
                 )
+            if intent.action == "SELL" and intent.source.startswith("texas_"):
+                position = self.db.fetch_one(
+                    "SELECT contracts,status FROM broker_positions WHERE mode=? AND ticker=? AND side=?",
+                    (intent.mode, intent.ticker, intent.side),
+                ) or {}
+                remaining = float(position.get("contracts") or 0.0)
+                exited = remaining <= 1e-9 or position.get("status") == "closed"
+                status = "EXITED" if exited else "EXIT_FAILED"
+                reason = None if exited else (
+                    "Kalshi accepted the Texas exit but it did not fully fill; "
+                    "waiting for a new executable quote."
+                )
+                self.db.execute(
+                    """
+                    UPDATE broker_positions SET texas_exit_status=?,texas_exit_reason=COALESCE(?,texas_exit_reason)
+                    WHERE mode=? AND ticker=? AND side=?
+                    """,
+                    ("Exited" if exited else "Exit failed", reason, intent.mode, intent.ticker, intent.side),
+                )
+                self.db.execute(
+                    """
+                    UPDATE texas_holdem_rounds SET status=?,fold_reason=?,
+                        filled_contracts=?,exited_at=CASE WHEN ? THEN ? ELSE exited_at END,
+                        updated_at=? WHERE environment=? AND ticker=?
+                    """,
+                    (
+                        status, reason, remaining, int(exited), datetime_now(),
+                        datetime_now(), intent.mode, intent.ticker,
+                    ),
+                )
             if intent.action == "BUY":
                 self.db.execute(
                     """
                     UPDATE broker_positions SET strategy=?,source=?,stop_loss_price=?,
-                        target_exit_price=?,fallback_exit_mode=?,fallback_exit_seconds=?
+                        target_exit_price=?,fallback_exit_mode=?,fallback_exit_seconds=?,
+                        strategy_metadata_json=?,threshold_breach_enabled=CASE
+                            WHEN ?='TEXAS_HOLDEM' THEN 0 ELSE threshold_breach_enabled END,
+                        threshold_exit_status=CASE WHEN ?='TEXAS_HOLDEM' THEN 'Watching'
+                            ELSE threshold_exit_status END,
+                        threshold_exit_block_reason=CASE WHEN ?='TEXAS_HOLDEM'
+                            THEN 'Threshold Breach Exit is inactive for Texas Hold''em positions.'
+                            ELSE threshold_exit_block_reason END
                     WHERE mode=? AND ticker=? AND side=? AND status='open'
                     """,
                     (
                         intent.strategy, intent.source, intent.stop_loss_price,
                         intent.target_exit_price, intent.fallback_exit_mode,
-                        intent.fallback_exit_seconds, intent.mode, intent.ticker, intent.side,
+                        intent.fallback_exit_seconds,
+                        json.dumps(intent.decision_snapshot.get("strategy_metadata") or {}, sort_keys=True),
+                        intent.strategy, intent.strategy, intent.strategy,
+                        intent.mode, intent.ticker, intent.side,
                     ),
                 )
+                if intent.strategy == "TEXAS_HOLDEM":
+                    position = self.db.fetch_one(
+                        "SELECT contracts,average_price,fees FROM broker_positions WHERE mode=? AND ticker=? AND side=? AND status='open'",
+                        (intent.mode, intent.ticker, intent.side),
+                    ) or {}
+                    filled = float(position.get("contracts") or 0.0)
+                    target = self.db.fetch_one(
+                        "SELECT target_contracts FROM texas_holdem_rounds WHERE environment=? AND ticker=?",
+                        (intent.mode, intent.ticker),
+                    ) or {}
+                    target_contracts = float(target.get("target_contracts") or 0.0)
+                    round_status = (
+                        "ENTERED" if filled > 0 and (target_contracts <= 0 or filled + 1e-9 >= target_contracts)
+                        else "PARTIALLY_FILLED" if filled > 0 else "WAITING"
+                    )
+                    self.db.execute(
+                        """
+                        UPDATE texas_holdem_rounds SET filled_contracts=?,entry_price=?,
+                            entry_fees=?,status=?,updated_at=? WHERE environment=? AND ticker=?
+                        """,
+                        (
+                            filled, position.get("average_price"), position.get("fees") or 0,
+                            round_status, datetime_now(), intent.mode, intent.ticker,
+                        ),
+                    )
         except (KalshiTradingError, ValueError) as exc:
+            if intent.strategy == "TEXAS_HOLDEM" and intent.action == "BUY":
+                attempt_number = int(
+                    (intent.decision_snapshot.get("strategy_metadata") or {}).get(
+                        "attempt_number", 0
+                    ) or 0
+                )
+                if attempt_number:
+                    self.db.execute(
+                        """
+                        UPDATE texas_holdem_attempts SET broker_client_order_id=?,
+                            requested_contracts=?,status='REJECTED',blocker=?
+                        WHERE round_id=(
+                            SELECT id FROM texas_holdem_rounds
+                            WHERE environment=? AND ticker=?
+                        ) AND attempt_number=?
+                        """,
+                        (
+                            intent.client_order_id,
+                            intent.contracts,
+                            str(exc),
+                            intent.mode,
+                            intent.ticker,
+                            attempt_number,
+                        ),
+                    )
+                    self.db.execute(
+                        """
+                        UPDATE texas_holdem_rounds SET fold_reason=?,updated_at=?
+                        WHERE environment=? AND ticker=?
+                        """,
+                        (str(exc), datetime_now(), intent.mode, intent.ticker),
+                    )
             if intent.action == "SELL":
                 if intent.source == "threshold_breach_exit":
                     error = _exchange_error_detail(exc)
@@ -974,6 +1149,22 @@ class TradingCoordinator:
                             intent.side,
                         ),
                     )
+                elif intent.source.startswith("texas_"):
+                    self.db.execute(
+                        """
+                        UPDATE broker_positions SET texas_exit_status='Exit failed',
+                            texas_exit_reason=?,texas_exit_last_attempt_at=?
+                        WHERE mode=? AND ticker=? AND side=? AND status='open'
+                        """,
+                        (str(exc), datetime_now(), intent.mode, intent.ticker, intent.side),
+                    )
+                    self.db.execute(
+                        """
+                        UPDATE texas_holdem_rounds SET status='EXIT_FAILED',
+                            fold_reason=?,updated_at=? WHERE environment=? AND ticker=?
+                        """,
+                        (str(exc), datetime_now(), intent.mode, intent.ticker),
+                    )
                 try:
                     await broker.reconcile()
                 except (KalshiTradingError, ValueError):
@@ -983,14 +1174,20 @@ class TradingCoordinator:
             if intent.source == "automatic":
                 self._pending_automatic_keys.discard((intent.mode, intent.ticker))
 
-    def has_automatic_entry(self, mode: str, ticker: str) -> bool:
+    def has_automatic_entry(
+        self, mode: str, ticker: str, *, strategy: str | None = None
+    ) -> bool:
         normalized = normalize_mode(mode)
         broker = self.broker(normalized)
         return (
             (normalized, ticker) in self._pending_automatic_keys
             or (
                 isinstance(broker, KalshiBroker)
-                and broker.has_automatic_entry(ticker)
+                and broker.has_automatic_entry(
+                    ticker,
+                    exclude_strategy="TEXAS_HOLDEM"
+                    if strategy == "TEXAS_HOLDEM" else None,
+                )
             )
         )
 
@@ -1091,11 +1288,15 @@ class TradingCoordinator:
             if position.get("ticker") != ticker:
                 continue
             side = str(position.get("side"))
+            texas_position = position.get("strategy") == "TEXAS_HOLDEM"
             threshold_exit = threshold_breach_exit_state(
                 side,
                 btc_proxy,
                 threshold,
-                enabled=bool(settings.get("threshold_breach_exit_enabled", True)),
+                enabled=(
+                    bool(settings.get("threshold_breach_exit_enabled", True))
+                    and not texas_position
+                ),
                 buffer_dollars=float(
                     settings.get("threshold_breach_exit_buffer_dollars", 0.0)
                 ),
@@ -1154,7 +1355,7 @@ class TradingCoordinator:
             # Kalshi has no unpriced market order. A threshold-breach exit uses
             # the lowest valid outcome price as a reduce-only IOC limit, which
             # sweeps every executable bid without leaving a resting order.
-            market_style_exit = reason == "THRESHOLD_BREACH_EXIT"
+            market_style_exit = reason == "THRESHOLD_BREACH_EXIT" or reason.startswith("TEXAS_")
             candidate_limit = normalize_order_price(
                 _MARKET_STYLE_EXIT_FLOOR
                 if market_style_exit else max(0.01, bid - slippage),
@@ -1230,6 +1431,9 @@ class TradingCoordinator:
                 "submitted_limit_floor": candidate_limit
                 if market_style_exit else None,
             }
+            if reason.startswith("TEXAS_"):
+                _, texas_state = texas_holdem_exit_reason(bid, seconds_remaining, settings)
+                decision_snapshot["texas_holdem"] = texas_state
             if reason == "THRESHOLD_BREACH_EXIT":
                 decision_snapshot.update(
                     {
@@ -1240,6 +1444,23 @@ class TradingCoordinator:
                         "threshold_trigger_threshold": threshold,
                         "threshold_triggered_at": datetime_now(),
                     }
+                )
+            elif reason.startswith("TEXAS_"):
+                self.db.execute(
+                    """
+                    UPDATE broker_positions SET texas_exit_status='Exit pending',
+                        texas_exit_reason=?,texas_exit_last_attempt_at=?,
+                        texas_exit_last_attempt_bid=?
+                    WHERE mode=? AND ticker=? AND side=? AND status='open'
+                    """,
+                    (reason, datetime_now(), bid, broker.mode, ticker, side),
+                )
+                self.db.execute(
+                    """
+                    UPDATE texas_holdem_rounds SET status='EXIT_PENDING',exit_reason=?,
+                        exit_trigger_bid=?,updated_at=? WHERE environment=? AND ticker=?
+                    """,
+                    (reason, bid, datetime_now(), broker.mode, ticker),
                 )
             intent = OrderIntent(
                 mode=broker.mode,

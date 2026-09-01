@@ -497,8 +497,9 @@ def test_standard_readiness_separates_data_from_entry_quality(tmp_path: Path) ->
 
 def test_early_threshold_waits_for_stability_and_next_quote(tmp_path: Path) -> None:
     db = make_db(tmp_path)
+    db.update_settings({"early_threshold_enabled": True})
     add_market(db, "EARLY")
-    service = PaperTradingService(db)
+    service = PaperTradingService(db, enable_retired_strategy_entries=True)
     side_assessments = assessments()
     unstable = {
         "first_observed_at": "2026-08-24T11:59:30+00:00",
@@ -556,6 +557,45 @@ def test_early_threshold_waits_for_stability_and_next_quote(tmp_path: Path) -> N
     assert entry["entry_cost"] + entry["entry_fees"] <= 30
 
 
+def test_retired_early_and_late_settings_cannot_open_entries(
+    tmp_path: Path,
+) -> None:
+    db = make_db(tmp_path)
+    db.update_settings({
+        "early_threshold_enabled": True,
+        "late_conviction_enabled": True,
+    })
+    add_market(db, "RETIRED-EARLY")
+    add_market(db, "RETIRED-LATE")
+    service = PaperTradingService(db)
+
+    early = strategy_call(
+        service,
+        ticker="RETIRED-EARLY",
+        side_assessments=assessments(),
+        observed_at="2026-08-24T12:00:03+00:00",
+        threshold_state={
+            "first_observed_at": "2026-08-24T11:59:30+00:00",
+            "latest_observed_at": "2026-08-24T11:59:58+00:00",
+        },
+        now=3,
+    )
+    late = strategy_call(
+        service,
+        ticker="RETIRED-LATE",
+        side_assessments=assessments(0.90, yes_bid=0.87, yes_ask=0.88),
+        observed_at="2026-08-24T12:14:03+00:00",
+        seconds_remaining=57,
+        coverage=0.90,
+        z_distance=3.0,
+        now=3,
+    )
+
+    assert early["active_strategy"] is None
+    assert late["active_strategy"] is None
+    assert db.fetch_one("SELECT COUNT(*) count FROM paper_entries")["count"] == 0
+
+
 def test_unopened_market_cannot_enter(tmp_path: Path) -> None:
     db = make_db(tmp_path)
     add_market(db, "UNOPENED", status="initialized")
@@ -580,8 +620,11 @@ def test_unopened_market_cannot_enter(tmp_path: Path) -> None:
 def test_negative_ev_high_probability_cannot_enter_late(tmp_path: Path) -> None:
     db = make_db(tmp_path)
     add_market(db, "NEGATIVE")
-    db.update_settings({"late_min_probability": 0.80})
-    service = PaperTradingService(db)
+    db.update_settings({
+        "late_conviction_enabled": True,
+        "late_min_probability": 0.80,
+    })
+    service = PaperTradingService(db, enable_retired_strategy_entries=True)
     expensive = assessments(0.80, yes_bid=0.82, yes_ask=0.83)
 
     for now in (0, 4):
@@ -602,8 +645,9 @@ def test_negative_ev_high_probability_cannot_enter_late(tmp_path: Path) -> None:
 
 def test_late_conviction_confirms_and_uses_three_percent(tmp_path: Path) -> None:
     db = make_db(tmp_path)
+    db.update_settings({"late_conviction_enabled": True})
     add_market(db, "LATE")
-    service = PaperTradingService(db)
+    service = PaperTradingService(db, enable_retired_strategy_entries=True)
     high_probability = assessments(0.90, yes_bid=0.87, yes_ask=0.88)
 
     armed = strategy_call(
@@ -638,8 +682,11 @@ def test_late_conviction_confirms_and_uses_three_percent(tmp_path: Path) -> None
 def test_custom_risk_limit_caps_fixed_strategy(tmp_path: Path) -> None:
     db = make_db(tmp_path)
     add_market(db, "CAPPED")
-    db.update_settings({"max_risk_per_trade_pct": 0.02})
-    service = PaperTradingService(db)
+    db.update_settings({
+        "early_threshold_enabled": True,
+        "max_risk_per_trade_pct": 0.02,
+    })
+    service = PaperTradingService(db, enable_retired_strategy_entries=True)
     stable = {
         "first_observed_at": "2026-08-24T11:59:30+00:00",
         "latest_observed_at": "2026-08-24T11:59:58+00:00",
@@ -670,8 +717,9 @@ def test_custom_risk_limit_caps_fixed_strategy(tmp_path: Path) -> None:
 
 def test_one_automatic_entry_across_all_strategies(tmp_path: Path) -> None:
     db = make_db(tmp_path)
+    db.update_settings({"early_threshold_enabled": True})
     add_market(db, "ONCE")
-    service = PaperTradingService(db)
+    service = PaperTradingService(db, enable_retired_strategy_entries=True)
     stable = {
         "first_observed_at": "2026-08-24T11:59:30+00:00",
         "latest_observed_at": "2026-08-24T11:59:58+00:00",
@@ -964,7 +1012,7 @@ def test_dashboard_markup_has_two_fixed_books_and_paper_trade_history() -> None:
     assert 'id="standard-edge-confirmation-track"' in markup
     assert 'id="standard-edge-quality-gate"' in markup
     assert '<b>Confidence <button class="hud-help"' in markup
-    assert markup.count('class="hud-help"') == 14
+    assert markup.count('class="hud-help"') == 16
     assert 'id="standard-edge-direction-gate"' in markup
     assert 'id="standard-edge-volatility-gate"' in markup
     assert 'id="standard-edge-cushion"' in markup
@@ -972,6 +1020,10 @@ def test_dashboard_markup_has_two_fixed_books_and_paper_trade_history() -> None:
     assert 'id="standard-edge-gate-release-label"' in markup
     assert '"/api/standard-edge/gate-release"' in script
     assert 'state.chartWindow >= 15' in script
+    assert 'const drawMarketPhases = () =>' in script
+    assert 'const phases = ["FLOP", "TURN", "RIVER"]' in script
+    assert script.index('const drawMarketPhases = () =>') > script.index('function drawChart(')
+    assert 'context.moveTo(left, levelY); context.lineTo(plotRight, levelY)' in script
     assert 'const tag = entryEvent ? "Entry" : exitEvent ? "Exit" : null;' in script
     assert 'data-chart-mode="volatility"' in markup
     assert 'id: "maximum_margin_volatility"' in script

@@ -869,15 +869,23 @@ class KalshiBroker(Broker):
             + reserved(pending, "requested_contracts")
         )
 
-    def has_automatic_entry(self, ticker: str) -> bool:
+    def has_automatic_entry(
+        self, ticker: str, *, exclude_strategy: str | None = None
+    ) -> bool:
+        strategy_clause = ""
+        params: list[Any] = [self.mode, ticker]
+        if exclude_strategy:
+            strategy_clause = " AND strategy<>?"
+            params.append(str(exclude_strategy))
         row = self.db.fetch_one(
-            """
+            f"""
             SELECT id FROM broker_order_intents
             WHERE mode=? AND ticker=? AND source='automatic'
               AND action='BUY' AND status NOT IN ('CANCELED','REJECTED','EXPIRED','SETTLED')
+              {strategy_clause}
             LIMIT 1
             """,
-            (self.mode, ticker),
+            tuple(params),
         )
         return row is not None
 
@@ -1557,7 +1565,10 @@ class KalshiBroker(Broker):
             )
         }
         result: dict[str, dict[str, Any]] = {}
-        for strategy in ("STANDARD_EDGE", "EARLY_THRESHOLD", "LATE_CONVICTION", "SWING"):
+        for strategy in (
+            "STANDARD_EDGE", "EARLY_THRESHOLD", "LATE_CONVICTION", "SWING",
+            "TEXAS_HOLDEM",
+        ):
             rows = [row for row in fills if row.get("strategy") == strategy]
             buys = [row for row in rows if row.get("action") == "BUY"]
             groups: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
