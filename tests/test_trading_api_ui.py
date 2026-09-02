@@ -134,6 +134,7 @@ def test_dashboard_theme_switch_reuses_persisted_theme_without_header_metadata()
     assert 'localStorage.setItem("kalshi-theme-v2", preference)' in script
     assert '$("#dashboard-theme-toggle").addEventListener("change"' in script
     assert ".theme-switch input:checked + i { background: var(--green); }" in styles
+    assert "#texas-pass-next-round + .standard-edge-hud-arm { margin-top: 6px; }" in styles
 
 
 def test_private_stream_accepts_current_singular_event_types() -> None:
