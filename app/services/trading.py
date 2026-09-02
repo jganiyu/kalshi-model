@@ -28,6 +28,7 @@ from app.services.broker import (
 )
 from app.services.credentials import resolve_trading_credentials
 from app.services.kalshi_trading import (
+    AmbiguousSubmissionError,
     KalshiTradingClient,
     KalshiTradingError,
     normalize_order_price,
@@ -144,6 +145,10 @@ class TradingCoordinator:
         }
         self._confirmations: dict[str, tuple[float, OrderIntent]] = {}
         self._submission_tasks: set[asyncio.Task[Any]] = set()
+        # One narrow recovery per exchange order/market is enough. Private
+        # streams can legitimately replay a fill and an order update together;
+        # do not turn that into a REST burst.
+        self._private_event_recovery_tasks: dict[tuple[str, str, str], asyncio.Task[None]] = {}
         self._pending_automatic_keys: set[tuple[str, str]] = set()
         self._pending_exit_keys: set[tuple[str, str, str]] = set()
 
@@ -177,14 +182,17 @@ class TradingCoordinator:
             task.cancel()
         for task in self._submission_tasks:
             task.cancel()
+        for task in self._private_event_recovery_tasks.values():
+            task.cancel()
         await asyncio.gather(
             *self._private_streams.values(), *self._reconciliation_tasks.values(),
-            *self._submission_tasks,
+            *self._submission_tasks, *self._private_event_recovery_tasks.values(),
             return_exceptions=True,
         )
         self._private_streams.clear()
         self._reconciliation_tasks.clear()
         self._submission_tasks.clear()
+        self._private_event_recovery_tasks.clear()
 
     def _configure_broker(self, mode: str) -> None:
         broker = self.brokers[mode]
@@ -258,13 +266,11 @@ class TradingCoordinator:
             # A targeted read is deliberately independent of full history. It
             # verifies incomplete/out-of-order events without blocking socket
             # consumption or claiming that the account is reconciled.
-            task = asyncio.create_task(
-                broker.recover_private_event(
-                    order_id=recovered.get("order_id"), ticker=recovered.get("ticker")
-                )
+            self._schedule_private_event_recovery(
+                mode,
+                order_id=recovered.get("order_id"),
+                ticker=recovered.get("ticker"),
             )
-            self._submission_tasks.add(task)
-            task.add_done_callback(self._submission_tasks.discard)
             # Full reconciliation remains the eventual account-wide backfill.
             self._reconciliation_wake[mode].set()
 
@@ -310,6 +316,40 @@ class TradingCoordinator:
             self._reconciliation_wake[mode].set()
 
         task.add_done_callback(restart_if_unexpectedly_stopped)
+
+    def _schedule_private_event_recovery(
+        self,
+        mode: str,
+        *,
+        order_id: str | None,
+        ticker: str | None,
+    ) -> None:
+        """Debounce replayed private events before their narrow REST check."""
+        key = (mode, str(order_id or ""), str(ticker or ""))
+        if not key[1] and not key[2]:
+            return
+        existing = self._private_event_recovery_tasks.get(key)
+        if existing and not existing.done():
+            return
+        broker = self.brokers[mode]
+        assert isinstance(broker, KalshiBroker)
+
+        async def recover() -> None:
+            # Let a paired order/fill/position event arrive first. This also
+            # makes a busy stream produce one targeted read instead of one per
+            # envelope, without delaying protective logic (the event was
+            # already applied locally above).
+            await asyncio.sleep(0.05)
+            await broker.recover_private_event(order_id=order_id, ticker=ticker)
+
+        task = asyncio.create_task(recover())
+        self._private_event_recovery_tasks[key] = task
+
+        def done(completed: asyncio.Task[None]) -> None:
+            if self._private_event_recovery_tasks.get(key) is completed:
+                self._private_event_recovery_tasks.pop(key, None)
+
+        task.add_done_callback(done)
 
     async def _handle_private_stream_status(
         self,
@@ -1319,6 +1359,11 @@ class TradingCoordinator:
                         (str(exc), datetime_now(), intent.mode, intent.ticker),
                     )
             if intent.action == "SELL":
+                latest_exit = self.db.fetch_one(
+                    "SELECT status FROM broker_order_intents WHERE mode=? AND client_order_id=?",
+                    (intent.mode, intent.client_order_id),
+                ) or {}
+                exit_resolved = str(latest_exit.get("status") or "") == "RESOLVED_EXTERNALLY"
                 if intent.source == "threshold_breach_exit":
                     error = _exchange_error_detail(exc)
                     self.db.execute(
@@ -1339,6 +1384,36 @@ class TradingCoordinator:
                             intent.ticker,
                             intent.side,
                         ),
+                    )
+                elif intent.source.startswith("texas_") and exit_resolved:
+                    # The targeted/private position evidence already made this
+                    # exit terminal. The original timeout must not regress the
+                    # Texas HUD back to a failure.
+                    pass
+                elif intent.source.startswith("texas_") and isinstance(exc, AmbiguousSubmissionError):
+                    adopted = str(latest_exit.get("status") or "")
+                    accepted = adopted in {
+                        "ACKNOWLEDGED", "RESTING", "PARTIALLY_FILLED", "FILLED",
+                    }
+                    exit_status = "Exit pending" if accepted else "Exit submission uncertain"
+                    exit_reason = (
+                        "Kalshi accepted the Texas exit; confirming its remaining position."
+                        if accepted else str(exc)
+                    )
+                    self.db.execute(
+                        """
+                        UPDATE broker_positions SET texas_exit_status=?,
+                            texas_exit_reason=?,texas_exit_last_attempt_at=?
+                        WHERE mode=? AND ticker=? AND side=? AND status='open'
+                        """,
+                        (exit_status, exit_reason, datetime_now(), intent.mode, intent.ticker, intent.side),
+                    )
+                    self.db.execute(
+                        """
+                        UPDATE texas_holdem_rounds SET status='EXIT_PENDING',
+                            fold_reason=?,updated_at=? WHERE environment=? AND ticker=?
+                        """,
+                        (exit_reason, datetime_now(), intent.mode, intent.ticker),
                     )
                 elif intent.source.startswith("texas_"):
                     self.db.execute(
@@ -1600,7 +1675,7 @@ class TradingCoordinator:
             existing = self.db.fetch_one(
                 """
                 SELECT id FROM broker_order_intents WHERE mode=? AND ticker=? AND side=?
-                  AND action='SELL' AND status NOT IN ('CANCELED','REJECTED','EXPIRED','SETTLED')
+                  AND action='SELL' AND status NOT IN ('CANCELED','REJECTED','EXPIRED','SETTLED','RESOLVED_EXTERNALLY')
                 LIMIT 1
                 """,
                 (broker.mode, ticker, side),

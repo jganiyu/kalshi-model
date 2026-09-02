@@ -8,6 +8,8 @@ import random
 import time
 from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
 from pathlib import Path
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from typing import Any
 from urllib.parse import quote, urlparse
 
@@ -23,6 +25,75 @@ logger = logging.getLogger(__name__)
 # deadline used for an order submission (where an unknown result must be
 # handled as ambiguous promptly).
 ACCOUNT_READ_TIMEOUT = httpx.Timeout(15.0, connect=5.0, write=8.0, pool=5.0)
+
+
+@dataclass(frozen=True)
+class _QueuedRequest:
+    priority: int
+    sequence: int
+
+
+class AuthenticatedRequestController:
+    """Small per-account traffic controller for authenticated Kalshi REST.
+
+    It deliberately limits background account scans to one in flight while
+    reserving a second connection for an order or targeted recovery.  This
+    prevents a reconciliation burst from consuming every fresh HTTPS
+    connection when the network is degraded.
+    """
+
+    EXECUTION = 0
+    RECOVERY = 1
+    BACKGROUND = 10
+
+    def __init__(self, *, max_in_flight: int = 2) -> None:
+        self._max_in_flight = max(1, max_in_flight)
+        self._condition = asyncio.Condition()
+        self._queued: list[_QueuedRequest] = []
+        self._sequence = 0
+        self._in_flight = 0
+        self._background_in_flight = 0
+
+    async def run(
+        self,
+        priority: int,
+        operation: Callable[[], Awaitable[Any]],
+    ) -> Any:
+        async with self._condition:
+            ticket = _QueuedRequest(priority, self._sequence)
+            self._sequence += 1
+            self._queued.append(ticket)
+            try:
+                while not self._may_start(ticket):
+                    await self._condition.wait()
+            except asyncio.CancelledError:
+                # A canceled reconciliation page must not remain at the head
+                # of the queue and block the next protective request.
+                self._queued.remove(ticket)
+                self._condition.notify_all()
+                raise
+            self._queued.remove(ticket)
+            self._in_flight += 1
+            if priority >= self.BACKGROUND:
+                self._background_in_flight += 1
+        try:
+            return await operation()
+        finally:
+            async with self._condition:
+                self._in_flight -= 1
+                if priority >= self.BACKGROUND:
+                    self._background_in_flight -= 1
+                self._condition.notify_all()
+
+    def _may_start(self, ticket: _QueuedRequest) -> bool:
+        # Strict priority among waiting requests. A low-priority reconciliation
+        # page cannot begin while an exit/order recovery is waiting.
+        if ticket != min(self._queued, key=lambda item: (item.priority, item.sequence)):
+            return False
+        if self._in_flight >= self._max_in_flight:
+            return False
+        # Keep one connection available for an execution or targeted recovery.
+        return ticket.priority < self.BACKGROUND or self._background_in_flight == 0
 
 
 class KalshiTradingError(RuntimeError):
@@ -174,6 +245,9 @@ class KalshiTradingClient:
         self.environment = normalized
         parsed = urlparse(self.base_url)
         self.api_prefix = parsed.path.rstrip("/")
+        # Each client is scoped to exactly one Demo or Live account.  Do not
+        # share its queue across environments.
+        self._requests = AuthenticatedRequestController()
 
     async def _request(
         self,
@@ -184,9 +258,15 @@ class KalshiTradingClient:
         json: dict[str, Any] | None = None,
         retries: int = 2,
         submission: bool = False,
+        priority: int | None = None,
     ) -> dict[str, Any]:
         signing_path = f"{self.api_prefix}{path}"
         started_at = time.monotonic()
+        request_priority = (
+            self._requests.EXECUTION
+            if submission
+            else self._requests.BACKGROUND if priority is None else priority
+        )
         for attempt in range(retries + 1):
             headers = signed_headers(
                 self.key_id, self.private_key_path, method, signing_path
@@ -199,11 +279,14 @@ class KalshiTradingClient:
                 }
                 if not submission:
                     request_args["timeout"] = ACCOUNT_READ_TIMEOUT
-                response = await self.client.request(
-                    method,
-                    f"{self.base_url}{path}",
-                    **request_args,
-                )
+                async def send() -> httpx.Response:
+                    return await self.client.request(
+                        method,
+                        f"{self.base_url}{path}",
+                        **request_args,
+                    )
+
+                response = await self._requests.run(request_priority, send)
             except (httpx.TimeoutException, httpx.NetworkError) as exc:
                 failure_kind = (
                     "timeout" if isinstance(exc, httpx.TimeoutException) else "network"
@@ -237,7 +320,7 @@ class KalshiTradingClient:
                     delay = min(10.0, max(0.25, float(retry_after or 0)))
                 except ValueError:
                     delay = min(4.0, 0.5 * (2**attempt))
-                await asyncio.sleep(delay)
+                await asyncio.sleep(delay + random.uniform(0, delay * 0.2))
                 continue
             if response.is_success:
                 return response.json() if response.content else {}
@@ -301,12 +384,13 @@ class KalshiTradingClient:
         item_key: str,
         *,
         params: dict[str, Any] | None = None,
+        priority: int | None = None,
     ) -> dict[str, Any]:
         query = {"limit": 1000, **(params or {})}
         items: list[dict[str, Any]] = []
         seen_cursors: set[str] = set()
         while True:
-            payload = await self._request("GET", path, params=query)
+            payload = await self._request("GET", path, params=query, priority=priority)
             items.extend(payload.get(item_key) or [])
             cursor = str(payload.get("cursor") or "")
             if not cursor or cursor in seen_cursors:
@@ -324,7 +408,8 @@ class KalshiTradingClient:
         if cursor:
             params["cursor"] = cursor
         return await self._all_pages(
-            "/portfolio/positions", "market_positions", params=params
+            "/portfolio/positions", "market_positions", params=params,
+            priority=self._requests.RECOVERY if ticker else None,
         )
 
     async def orders(
@@ -341,7 +426,10 @@ class KalshiTradingClient:
             params["ticker"] = ticker
         if cursor:
             params["cursor"] = cursor
-        return await self._all_pages("/portfolio/orders", "orders", params=params)
+        return await self._all_pages(
+            "/portfolio/orders", "orders", params=params,
+            priority=self._requests.RECOVERY if (ticker or status) else None,
+        )
 
     async def fills(self, *, cursor: str | None = None) -> dict[str, Any]:
         params: dict[str, Any] = {}
@@ -364,7 +452,9 @@ class KalshiTradingClient:
         return market if isinstance(market, dict) else payload
 
     async def order_by_client_id(self, client_order_id: str) -> dict[str, Any] | None:
-        payload = await self.orders()
+        payload = await self._all_pages(
+            "/portfolio/orders", "orders", priority=self._requests.RECOVERY
+        )
         for order in payload.get("orders", []):
             if str(order.get("client_order_id") or "") == client_order_id:
                 return order
@@ -372,7 +462,10 @@ class KalshiTradingClient:
 
     async def order(self, order_id: str) -> dict[str, Any] | None:
         """Read one order without paginating the account order history."""
-        payload = await self._request("GET", f"/portfolio/orders/{quote(order_id, safe='')}")
+        payload = await self._request(
+            "GET", f"/portfolio/orders/{quote(order_id, safe='')}",
+            priority=self._requests.RECOVERY,
+        )
         order = payload.get("order")
         return order if isinstance(order, dict) else payload if isinstance(payload, dict) else None
 
@@ -440,4 +533,5 @@ class KalshiTradingClient:
             "DELETE",
             f"/portfolio/events/orders/{exchange_order_id}",
             params=params,
+            priority=self._requests.EXECUTION,
         )

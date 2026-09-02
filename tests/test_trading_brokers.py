@@ -1344,6 +1344,161 @@ async def test_protective_exit_never_retries_while_prior_client_id_is_uncertain(
 
 
 @run_async
+async def test_timed_out_protective_exit_adopts_targeted_filled_order(
+    tmp_path: Path,
+) -> None:
+    db, broker, client = await ready_broker(tmp_path)
+    broker._upsert_position({"ticker": "EXIT-FILLED", "position_fp": "5.00"})
+    intent = OrderIntent(
+        "DEMO", "EXIT-FILLED", "YES", "SELL", 5, .01, "TEXAS_HOLDEM", "texas_turn_target",
+        time_in_force="immediate_or_cancel", decision_snapshot={"protective_exit": True},
+    )
+    client.timeout = True
+    client.remote_orders = [{
+        "order_id": "exit-filled", "client_order_id": intent.client_order_id,
+        "ticker": intent.ticker, "side": "ask", "price": ".01", "count": "5",
+        "fill_count": "5", "remaining_count": "0", "status": "executed", "reduce_only": True,
+    }]
+    position_calls = 0
+
+    async def position_then_flat(**_: object):
+        nonlocal position_calls
+        position_calls += 1
+        return {"market_positions": ([{"ticker": intent.ticker, "position_fp": "5.00"}]
+                                     if position_calls == 1 else [])}
+
+    client.positions = position_then_flat  # type: ignore[method-assign]
+    with pytest.raises(AmbiguousSubmissionError):
+        await broker.submit(intent)
+    row = db.fetch_one("SELECT status FROM broker_order_intents WHERE client_order_id=?", (intent.client_order_id,))
+    assert row == {"status": "FILLED"}
+    position = db.fetch_one("SELECT status,contracts FROM broker_positions WHERE mode='DEMO' AND ticker='EXIT-FILLED'")
+    assert position == {"status": "closed", "contracts": 0.0}
+
+
+@run_async
+async def test_timed_out_protective_exit_reserves_active_or_unknown_quantity(
+    tmp_path: Path,
+) -> None:
+    db, broker, client = await ready_broker(tmp_path)
+    broker._upsert_position({"ticker": "EXIT-RESERVED", "position_fp": "4.00"})
+    intent = OrderIntent(
+        "DEMO", "EXIT-RESERVED", "YES", "SELL", 4, .01, "TEXAS_HOLDEM", "texas_turn_stop",
+        time_in_force="immediate_or_cancel", decision_snapshot={"protective_exit": True},
+    )
+    client.timeout = True
+    client.remote_orders = [{
+        "order_id": "exit-active", "client_order_id": intent.client_order_id,
+        "ticker": intent.ticker, "side": "ask", "price": ".01", "count": "4",
+        "fill_count": "0", "remaining_count": "4", "status": "resting", "reduce_only": True,
+    }]
+    client.remote_positions = [{"ticker": intent.ticker, "position_fp": "4.00"}]
+    with pytest.raises(AmbiguousSubmissionError):
+        await broker.submit(intent)
+    assert db.fetch_one("SELECT status FROM broker_order_intents WHERE client_order_id=?", (intent.client_order_id,)) == {"status": "RESTING"}
+    client.remote_orders = []
+
+    async def failed_orders(**_: object):
+        raise KalshiTradingError("targeted orders unavailable")
+
+    client.orders = failed_orders  # type: ignore[method-assign]
+    second = OrderIntent(
+        "DEMO", "EXIT-RESERVED", "YES", "SELL", 4, .01, "TEXAS_HOLDEM", "texas_turn_stop",
+        time_in_force="immediate_or_cancel", decision_snapshot={"protective_exit": True},
+    )
+    # The active first client ID remains a hard reservation; no second sell.
+    with pytest.raises(ValueError, match="unresolved client ID"):
+        await broker.submit(second)
+    assert client.created == []
+
+
+@run_async
+async def test_unknown_timed_out_protective_exit_keeps_full_quantity_reserved(
+    tmp_path: Path,
+) -> None:
+    _, broker, client = await ready_broker(tmp_path)
+    intent = OrderIntent(
+        "DEMO", "EXIT-UNKNOWN", "NO", "SELL", 2, .01, "TEXAS_HOLDEM", "texas_river_stop",
+        time_in_force="immediate_or_cancel", decision_snapshot={"protective_exit": True},
+    )
+    position_calls = 0
+
+    async def position_once_then_fail(**_: object):
+        nonlocal position_calls
+        position_calls += 1
+        if position_calls == 1:
+            return {"market_positions": [{"ticker": intent.ticker, "position_fp": "-2.00"}]}
+        raise KalshiTradingError("targeted position unavailable")
+
+    async def failed_orders(**_: object):
+        raise KalshiTradingError("targeted order unavailable")
+
+    client.positions = position_once_then_fail  # type: ignore[method-assign]
+    client.orders = failed_orders  # type: ignore[method-assign]
+    client.timeout = True
+    with pytest.raises(AmbiguousSubmissionError):
+        await broker.submit(intent)
+    assert broker.db.fetch_one("SELECT status FROM broker_order_intents WHERE client_order_id=?", (intent.client_order_id,)) == {"status": "RECONCILIATION_REQUIRED"}
+    retry = OrderIntent(
+        "DEMO", "EXIT-UNKNOWN", "NO", "SELL", 2, .01, "TEXAS_HOLDEM", "texas_river_stop",
+        time_in_force="immediate_or_cancel", decision_snapshot={"protective_exit": True},
+    )
+    with pytest.raises(ValueError, match="unresolved client ID"):
+        await broker.submit(retry)
+
+
+@run_async
+async def test_timed_out_canceled_protective_exit_allows_safe_remaining_retry(
+    tmp_path: Path,
+) -> None:
+    db, broker, client = await ready_broker(tmp_path)
+    broker._upsert_position({"ticker": "EXIT-RETRY", "position_fp": "3.00"})
+    first = OrderIntent(
+        "DEMO", "EXIT-RETRY", "YES", "SELL", 3, .01, "TEXAS_HOLDEM", "texas_flop_stop",
+        time_in_force="immediate_or_cancel", decision_snapshot={"protective_exit": True},
+    )
+    client.timeout = True
+    client.remote_orders = [{
+        "order_id": "exit-canceled", "client_order_id": first.client_order_id,
+        "ticker": first.ticker, "side": "ask", "price": ".01", "count": "3",
+        "fill_count": "0", "remaining_count": "0", "status": "canceled", "reduce_only": True,
+    }]
+    client.remote_positions = [{"ticker": first.ticker, "position_fp": "3.00"}]
+    with pytest.raises(AmbiguousSubmissionError):
+        await broker.submit(first)
+    assert db.fetch_one("SELECT status FROM broker_order_intents WHERE client_order_id=?", (first.client_order_id,)) == {"status": "CANCELED"}
+    client.timeout = False
+    retry = OrderIntent(
+        "DEMO", "EXIT-RETRY", "YES", "SELL", 9, .01, "TEXAS_HOLDEM", "texas_flop_stop",
+        time_in_force="immediate_or_cancel", decision_snapshot={"protective_exit": True},
+    )
+    await broker.submit(retry)
+    assert client.created[-1]["contracts"] == 3
+
+
+@run_async
+async def test_private_flat_position_resolves_stale_texas_exit_intent(
+    tmp_path: Path,
+) -> None:
+    db, broker, _ = await ready_broker(tmp_path)
+    broker._upsert_position({"ticker": "EXIT-PRIVATE", "position_fp": "2.00"})
+    db.execute(
+        """
+        INSERT INTO broker_order_intents(mode,client_order_id,ticker,side,action,requested_contracts,
+          limit_price,status,strategy,source,decision_snapshot_json,created_at,updated_at)
+        VALUES ('DEMO','stale-exit','EXIT-PRIVATE','YES','SELL',2,.01,
+          'RECONCILIATION_REQUIRED','TEXAS_HOLDEM','texas_turn_target',?, ?, ?)
+        """,
+        (json.dumps({"protective_exit": True}), iso_now(), iso_now()),
+    )
+    broker.adopt_private_event({"type": "market_position", "msg": {
+        "ticker": "EXIT-PRIVATE", "position_fp": "0.00", "last_updated_ts": iso_now(),
+    }})
+    assert db.fetch_one("SELECT status FROM broker_order_intents WHERE client_order_id='stale-exit'") == {"status": "RESOLVED_EXTERNALLY"}
+    assert db.fetch_one("SELECT status FROM broker_positions WHERE mode='DEMO' AND ticker='EXIT-PRIVATE'") == {"status": "closed"}
+
+
+@run_async
 async def test_protective_exit_uses_confirmed_fill_evidence_when_targeted_lookup_fails(
     tmp_path: Path,
 ) -> None:

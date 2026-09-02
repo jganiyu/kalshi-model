@@ -34,7 +34,12 @@ OPEN_ORDER_STATES = {
     "CANCEL_PENDING",
     "RECONCILIATION_REQUIRED",
 }
-FINAL_ORDER_STATES = {"FILLED", "CANCELED", "REJECTED", "EXPIRED", "SETTLED"}
+FINAL_ORDER_STATES = {
+    "FILLED", "CANCELED", "REJECTED", "EXPIRED", "SETTLED",
+    # Exchange evidence says the position is flat, but a manual close may
+    # mean the fill cannot be attributed to this timed-out client ID.
+    "RESOLVED_EXTERNALLY",
+}
 NON_COUNTED_DAILY_INTENT_STATES = {"INTENT_CREATED", "REJECTED"}
 
 
@@ -1325,6 +1330,25 @@ class KalshiBroker(Broker):
                 last_error=str(exc),
             )
             self._audit("SUBMISSION_AMBIGUOUS", {"error": str(exc)}, intent=intent)
+            if self._is_protective_exit(intent):
+                # Never make a safety sell wait on account-wide history. Start
+                # a short exact-ID/position check before returning uncertainty.
+                try:
+                    await asyncio.wait_for(
+                        self.recover_ambiguous_protective_exit(intent.client_order_id),
+                        timeout=4.0,
+                    )
+                except asyncio.TimeoutError:
+                    self._audit(
+                        "PROTECTIVE_EXIT_RECOVERY_DEFERRED",
+                        {"reason": "targeted recovery timed out", "timeout_seconds": 4},
+                        intent=intent,
+                    )
+                except Exception as recovery_error:
+                    self._audit(
+                        "PROTECTIVE_EXIT_RECOVERY_FAILED",
+                        {"error": str(recovery_error)}, intent=intent,
+                    )
             raise
         except asyncio.CancelledError:
             raise
@@ -1499,6 +1523,93 @@ class KalshiBroker(Broker):
                 for position in result.get("market_positions") or result.get("positions") or []:
                     if isinstance(position, dict):
                         self._upsert_position(position)
+
+    async def recover_ambiguous_protective_exit(
+        self, client_order_id: str
+    ) -> dict[str, Any]:
+        """Recover one uncertain safety sell without full reconciliation.
+
+        Unknown exits retain their client-ID reservation. Only an observed
+        order, a confirmed flat position, or a successful exact-ID absence can
+        release that hold, so a retry cannot oversell existing exposure.
+        """
+        intent = self.db.fetch_one(
+            "SELECT * FROM broker_order_intents WHERE mode=? AND client_order_id=?",
+            (self.mode, client_order_id),
+        )
+        if not intent or str(intent.get("action") or "") != "SELL" or self.client is None:
+            return {"state": "not_protective_exit"}
+        try:
+            snapshot = json.loads(str(intent.get("decision_snapshot_json") or "{}"))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            snapshot = {}
+        if not isinstance(snapshot, dict) or not snapshot.get("protective_exit"):
+            return {"state": "not_protective_exit"}
+        ticker, side = str(intent.get("ticker") or ""), str(intent.get("side") or "")
+        lookup = getattr(self.client, "order_by_client_id", None)
+
+        async def fallback_order_lookup() -> dict[str, Any] | None:
+            payload = await self.client.orders(ticker=ticker)
+            return next(
+                (row for row in payload.get("orders") or []
+                 if str(row.get("client_order_id") or "") == client_order_id),
+                None,
+            )
+
+        order_call = lookup(client_order_id) if callable(lookup) else fallback_order_lookup()
+        order_result, position_result = await asyncio.gather(
+            order_call, self.client.positions(ticker=ticker), return_exceptions=True
+        )
+        order_ok = not isinstance(order_result, Exception)
+        position_ok = not isinstance(position_result, Exception)
+        if isinstance(order_result, dict):
+            self._upsert_order(order_result)
+        if isinstance(position_result, dict):
+            rows = [
+                row for row in (position_result.get("market_positions") or position_result.get("positions") or [])
+                if isinstance(row, dict)
+                and str(row.get("ticker") or row.get("market_ticker") or "") == ticker
+            ]
+            if rows:
+                for row in rows:
+                    self._upsert_position(row)
+            else:
+                # A successful ticker-scoped result without a row is a zero.
+                self._upsert_position({"ticker": ticker, "position_fp": "0"})
+        latest = self.db.fetch_one(
+            "SELECT status FROM broker_order_intents WHERE mode=? AND client_order_id=?",
+            (self.mode, client_order_id),
+        ) or {}
+        status = str(latest.get("status") or "")
+        position = self.db.fetch_one(
+            "SELECT contracts,status FROM broker_positions WHERE mode=? AND ticker=? AND side=?",
+            (self.mode, ticker, side),
+        ) or {}
+        flat = position_ok and (
+            str(position.get("status") or "") == "closed"
+            or _number(position.get("contracts")) < 1
+        )
+        if flat and status in {"SUBMITTING", "RECONCILIATION_REQUIRED"}:
+            self._set_intent(
+                client_order_id, "RESOLVED_EXTERNALLY",
+                error="Position confirmed closed by targeted exchange evidence; uncertain exit no longer reserves exposure.",
+            )
+            self._resolve_closed_protective_exit(ticker)
+            status = "RESOLVED_EXTERNALLY"
+        elif order_ok and order_result is None and status in {"SUBMITTING", "RECONCILIATION_REQUIRED"}:
+            self._set_intent(
+                client_order_id, "REJECTED",
+                error="Targeted exchange lookup did not report this exit order; a new reduce-only retry may use confirmed remaining exposure.",
+            )
+            status = "REJECTED"
+        self._audit(
+            "PROTECTIVE_EXIT_TARGETED_RECOVERY",
+            {"order_lookup_succeeded": order_ok, "position_lookup_succeeded": position_ok,
+             "order_found": isinstance(order_result, dict), "position_flat": flat,
+             "final_state": status or "RECONCILIATION_REQUIRED"},
+            client_order_id=client_order_id, ticker=ticker,
+        )
+        return {"state": status or "RECONCILIATION_REQUIRED", "position_flat": flat}
 
     async def _reconcile_once(self) -> dict[str, Any]:
         if self.client is None:
@@ -2367,6 +2478,7 @@ class KalshiBroker(Broker):
                     str(position.get("last_updated_ts") or iso_now()), self.mode, ticker,
                 ),
             )
+            self._resolve_closed_protective_exit(ticker)
             return
         side = "YES" if signed > 0 else "NO"
         contracts = abs(signed)
@@ -2397,6 +2509,41 @@ class KalshiBroker(Broker):
                 existing.get("fallback_exit_seconds"), existing.get("opened_at") or iso_now(),
                 str(position.get("last_updated_ts") or iso_now()), "open",
             ),
+        )
+
+    def _resolve_closed_protective_exit(self, ticker: str) -> None:
+        """Clear uncertain exit reservations after a private/targeted flat fact."""
+        unresolved = self.db.fetch_all(
+            """
+            SELECT client_order_id FROM broker_order_intents
+            WHERE mode=? AND ticker=? AND action='SELL'
+              AND status IN ('SUBMITTING','RECONCILIATION_REQUIRED')
+            """,
+            (self.mode, ticker),
+        )
+        for intent in unresolved:
+            self._set_intent(
+                str(intent["client_order_id"]), "RESOLVED_EXTERNALLY",
+                error="Position confirmed closed by exchange evidence; uncertain exit no longer reserves exposure.",
+            )
+        if not unresolved:
+            return
+        self.db.execute(
+            """
+            UPDATE broker_positions SET texas_exit_status='Exited',
+                texas_exit_reason=COALESCE(texas_exit_reason,'Position confirmed closed by Kalshi.'),
+                updated_at=?
+            WHERE mode=? AND ticker=? AND status='closed'
+            """,
+            (iso_now(), self.mode, ticker),
+        )
+        self.db.execute(
+            """
+            UPDATE texas_holdem_rounds SET status='EXITED',fold_reason=NULL,
+                exited_at=COALESCE(exited_at,?),updated_at=?
+            WHERE environment=? AND ticker=? AND status IN ('EXIT_PENDING','EXIT_FAILED')
+            """,
+            (iso_now(), iso_now(), self.mode, ticker),
         )
 
     def _replace_positions(self, positions: list[dict[str, Any]]) -> None:
