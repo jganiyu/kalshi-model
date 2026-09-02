@@ -330,6 +330,7 @@ class TradingCoordinator:
                     # or transport failure must not kill the sole recovery task.
                     broker._audit("RECONCILIATION_LOOP_ERROR", {
                         "error": str(exc), "retry_in_seconds": delay,
+                        "exchange_error": _exchange_error_detail(exc),
                     })
                     delay = min(30.0, delay * 2.0)
                     delay = max(0.25, delay + random.uniform(-0.2 * delay, 0.2 * delay))

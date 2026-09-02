@@ -2276,9 +2276,10 @@ async def test_rejected_threshold_exit_records_blocked_reason(tmp_path: Path) ->
             {
                 "code": "invalid_order",
                 "details": {"field": "price", "message": "outside tick schedule", "api_key": "[redacted]"},
-                "message": "Kalshi rejected the exit price",
-                "status_code": 400,
-            },
+                    "message": "Kalshi rejected the exit price",
+                    "status_code": 400,
+                    "transport": False,
+                },
             sort_keys=True,
         ),
     }
@@ -2431,6 +2432,81 @@ async def test_authentication_and_permission_errors_are_clear(tmp_path: Path) ->
     assert "does not have permission" in await request(
         403, {"code": "permission_denied"}
     )
+
+
+@run_async
+async def test_transport_failures_preserve_safe_request_diagnostics(tmp_path: Path) -> None:
+    key_path = private_key(tmp_path)
+
+    def timeout(_: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("socket stalled")
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(timeout))
+    client = KalshiTradingClient(
+        http,
+        "https://external-api.demo.kalshi.co/trade-api/v2",
+        "demo-key-id",
+        key_path,
+        environment="DEMO",
+    )
+    try:
+        with pytest.raises(KalshiTradingError, match="timeout while reading") as error:
+            await client._request("GET", "/portfolio/balance", retries=0)
+    finally:
+        await http.aclose()
+
+    assert error.value.transport is True
+    assert error.value.details == {
+        "failure_kind": "timeout",
+        "transport_error_type": "ReadTimeout",
+        "method": "GET",
+        "path": "/portfolio/balance",
+        "attempts": 1,
+        "elapsed_ms": error.value.details["elapsed_ms"],
+    }
+    assert isinstance(error.value.details["elapsed_ms"], int)
+
+
+@run_async
+async def test_reconciliation_response_error_is_degraded_not_reconnecting(tmp_path: Path) -> None:
+    db, broker, client = await ready_broker(tmp_path)
+
+    async def unavailable_balance():
+        raise KalshiTradingError(
+            "Kalshi is temporarily unavailable.", status_code=503,
+            details={"method": "GET", "path": "/portfolio/balance"},
+        )
+
+    client.balance = unavailable_balance  # type: ignore[method-assign]
+    with pytest.raises(KalshiTradingError):
+        await broker.reconcile()
+
+    readiness = broker.readiness()
+    assert readiness["connected"] is True
+    assert readiness["reconciled"] is False
+    event = next(
+        item for item in broker.audit_history(10)
+        if item["event_type"] == "RECONCILIATION_REQUEST_FAILED"
+    )
+    assert event["detail"]["exchange_error"]["status_code"] == 503
+    assert event["detail"]["exchange_error"]["details"]["path"] == "/portfolio/balance"
+
+
+@run_async
+async def test_reconciliation_transport_failure_marks_reconnecting(tmp_path: Path) -> None:
+    db, broker, client = await ready_broker(tmp_path)
+
+    async def unreachable_balance():
+        raise KalshiTradingError(
+            "Kalshi timeout while reading /portfolio/balance.",
+            transport=True,
+            details={"failure_kind": "timeout", "path": "/portfolio/balance"},
+        )
+
+    client.balance = unreachable_balance  # type: ignore[method-assign]
+    with pytest.raises(KalshiTradingError):
+        await broker.reconcile()
+    assert broker.readiness()["connected"] is False
 
 
 @run_async

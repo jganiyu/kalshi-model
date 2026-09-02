@@ -26,11 +26,16 @@ class KalshiTradingError(RuntimeError):
         status_code: int | None = None,
         code: str | None = None,
         details: object | None = None,
+        transport: bool = False,
     ):
         super().__init__(message)
         self.status_code = status_code
         self.code = code
         self.details = details
+        # A response from Kalshi (including a 4xx/5xx response) proves the
+        # transport is up.  Keep this separate from an actual DNS/TLS/connect/
+        # read failure so reconciliation does not falsely show "Reconnecting".
+        self.transport = transport
 
 
 class AmbiguousSubmissionError(KalshiTradingError):
@@ -174,6 +179,7 @@ class KalshiTradingClient:
         submission: bool = False,
     ) -> dict[str, Any]:
         signing_path = f"{self.api_prefix}{path}"
+        started_at = time.monotonic()
         for attempt in range(retries + 1):
             headers = signed_headers(
                 self.key_id, self.private_key_path, method, signing_path
@@ -187,12 +193,29 @@ class KalshiTradingClient:
                     headers=headers,
                 )
             except (httpx.TimeoutException, httpx.NetworkError) as exc:
+                failure_kind = (
+                    "timeout" if isinstance(exc, httpx.TimeoutException) else "network"
+                )
+                request_detail = {
+                    "failure_kind": failure_kind,
+                    "transport_error_type": type(exc).__name__,
+                    "method": method,
+                    "path": path,
+                    "attempts": attempt + 1,
+                    "elapsed_ms": round((time.monotonic() - started_at) * 1000),
+                }
                 if submission:
                     raise AmbiguousSubmissionError(
-                        "Order submission timed out; reconciliation is required before retrying."
+                        "Order submission timed out; checking its exchange state before retrying.",
+                        details=request_detail,
+                        transport=True,
                     ) from exc
                 if attempt >= retries:
-                    raise KalshiTradingError("Kalshi is unreachable.") from exc
+                    raise KalshiTradingError(
+                        f"Kalshi {failure_kind} while reading {path}.",
+                        details=request_detail,
+                        transport=True,
+                    ) from exc
                 await asyncio.sleep(min(4.0, 0.5 * (2**attempt)))
                 continue
             if response.status_code == 429 and attempt < retries:
@@ -241,11 +264,18 @@ class KalshiTradingClient:
                 message = "Kalshi could not route this order to the requested market."
             else:
                 message = remote_message or "Kalshi rejected the request."
+            request_detail = {
+                "method": method,
+                "path": path,
+                "attempts": attempt + 1,
+                "elapsed_ms": round((time.monotonic() - started_at) * 1000),
+                "response": details,
+            }
             raise KalshiTradingError(
                 message,
                 status_code=response.status_code,
                 code=code,
-                details=details,
+                details=request_detail,
             )
         raise KalshiTradingError("Kalshi request failed.")
 

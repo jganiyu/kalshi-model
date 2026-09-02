@@ -167,6 +167,7 @@ def _exchange_error_detail(exc: Exception) -> dict[str, Any]:
     """Persist useful exchange diagnostics without retaining secrets."""
     detail: dict[str, Any] = {"message": str(exc)}
     if isinstance(exc, KalshiTradingError):
+        detail["transport"] = bool(exc.transport)
         if exc.status_code is not None:
             detail["status_code"] = exc.status_code
         if exc.code:
@@ -1423,8 +1424,12 @@ class KalshiBroker(Broker):
             raise
         except Exception as exc:
             exchange_error = _exchange_error_detail(exc)
+            # An HTTP response (including rate limits and 5xx) confirms that
+            # Kalshi is reachable.  Only a transport failure warrants a
+            # Reconnecting state; all failures still keep entries blocked
+            # until reconciliation is authoritative.
             failed_state: dict[str, Any] = dict(
-                connected=False,
+                connected=not bool(getattr(exc, "transport", False)),
                 reconciled=False,
                 reconciliation_required=True,
                 last_error=str(exc),
@@ -1442,6 +1447,10 @@ class KalshiBroker(Broker):
                         "automatic_will_resume": self.automatic_armed,
                     },
                 )
+            self._audit(
+                "RECONCILIATION_REQUEST_FAILED",
+                {"exchange_error": exchange_error},
+            )
             self._reconciliation_paused = True
             raise
         observed_at = iso_now()
