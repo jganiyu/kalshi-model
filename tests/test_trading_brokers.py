@@ -2510,6 +2510,130 @@ async def test_reconciliation_transport_failure_marks_reconnecting(tmp_path: Pat
 
 
 @run_async
+async def test_slow_reconciliation_does_not_hide_a_healthy_private_stream(
+    tmp_path: Path,
+) -> None:
+    db, broker, client = await ready_broker(tmp_path)
+
+    async def unreachable_balance():
+        raise KalshiTradingError(
+            "Kalshi timeout while reading /portfolio/balance.",
+            transport=True,
+            details={"failure_kind": "timeout", "path": "/portfolio/balance"},
+        )
+
+    client.balance = unreachable_balance  # type: ignore[method-assign]
+    broker.set_private_stream_connected(True)
+    with pytest.raises(KalshiTradingError):
+        await broker.reconcile()
+
+    readiness = broker.readiness()
+    assert readiness["connected"] is True
+    assert readiness["reconciled"] is False
+    event = next(
+        item for item in broker.audit_history(10)
+        if item["event_type"] == "RECONCILIATION_PAUSED"
+    )
+    assert event["detail"]["private_stream_connected"] is True
+
+
+@run_async
+async def test_account_reads_receive_a_longer_bounded_timeout(tmp_path: Path) -> None:
+    captured: dict[str, float] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.update(request.extensions["timeout"])
+        return httpx.Response(200, json={"balance_dollars": "100.00"})
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client = KalshiTradingClient(
+        http,
+        "https://external-api.demo.kalshi.co/trade-api/v2",
+        "demo-key-id",
+        private_key(tmp_path),
+        environment="DEMO",
+    )
+    try:
+        await client.balance()
+    finally:
+        await http.aclose()
+
+    assert captured["connect"] == 5.0
+    assert captured["read"] == 15.0
+    assert captured["write"] == 8.0
+    assert captured["pool"] == 5.0
+
+
+@run_async
+async def test_order_submission_keeps_the_client_execution_timeout(tmp_path: Path) -> None:
+    captured: dict[str, float] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.update(request.extensions["timeout"])
+        return httpx.Response(201, json={"order_id": "ok", "fill_count": "0"})
+
+    http = httpx.AsyncClient(
+        timeout=httpx.Timeout(8.0, connect=5.0),
+        transport=httpx.MockTransport(handler),
+    )
+    client = KalshiTradingClient(
+        http,
+        "https://external-api.demo.kalshi.co/trade-api/v2",
+        "demo-key-id",
+        private_key(tmp_path),
+        environment="DEMO",
+    )
+    try:
+        await client.create_order(
+            ticker="T", client_order_id="timeout-safe", side="YES", action="BUY",
+            contracts=1, limit_price=.40,
+        )
+    finally:
+        await http.aclose()
+
+    assert captured["connect"] == 5.0
+    assert captured["read"] == 8.0
+
+
+@run_async
+async def test_failed_private_stream_task_wakes_its_recovery_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db = make_db(tmp_path)
+    coordinator = TradingCoordinator(
+        AppConfig(database_path=db.path), db, PaperTradingService(db)
+    )
+    broker = coordinator.broker("DEMO")
+    assert isinstance(broker, KalshiBroker)
+    broker.set_client(FakeTradingClient())  # type: ignore[arg-type]
+    key_path = private_key(tmp_path)
+
+    class FailedFeed:
+        def __init__(self, *_: object, **__: object) -> None:
+            pass
+
+        async def run(self) -> None:
+            raise RuntimeError("test stream failure")
+
+    monkeypatch.setattr(
+        "app.services.trading.resolve_trading_credentials",
+        lambda _: ("demo-key-id", key_path, "test"),
+    )
+    monkeypatch.setattr("app.services.trading.KalshiPrivateWebSocketFeed", FailedFeed)
+
+    coordinator._start_private_stream("DEMO")
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+
+    assert "DEMO" not in coordinator._private_streams
+    assert coordinator._reconciliation_wake["DEMO"].is_set()
+    assert any(
+        item["event_type"] == "PRIVATE_STREAM_TASK_RESTART"
+        for item in broker.audit_history(10)
+    )
+
+
+@run_async
 async def test_swing_metadata_is_preserved_in_exchange_intent(tmp_path: Path) -> None:
     db = make_db(tmp_path)
     coordinator = TradingCoordinator(

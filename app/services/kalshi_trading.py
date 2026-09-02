@@ -4,6 +4,7 @@ import asyncio
 import base64
 import logging
 import os
+import random
 import time
 from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
 from pathlib import Path
@@ -16,6 +17,12 @@ from cryptography.hazmat.primitives.asymmetric import padding, rsa
 
 
 logger = logging.getLogger(__name__)
+
+# Account reconciliation is background recovery work. It should tolerate a
+# temporarily slow Kalshi response without changing the shorter execution
+# deadline used for an order submission (where an unknown result must be
+# handled as ambiguous promptly).
+ACCOUNT_READ_TIMEOUT = httpx.Timeout(15.0, connect=5.0, write=8.0, pool=5.0)
 
 
 class KalshiTradingError(RuntimeError):
@@ -185,12 +192,17 @@ class KalshiTradingClient:
                 self.key_id, self.private_key_path, method, signing_path
             )
             try:
+                request_args: dict[str, Any] = {
+                    "params": params,
+                    "json": json,
+                    "headers": headers,
+                }
+                if not submission:
+                    request_args["timeout"] = ACCOUNT_READ_TIMEOUT
                 response = await self.client.request(
                     method,
                     f"{self.base_url}{path}",
-                    params=params,
-                    json=json,
-                    headers=headers,
+                    **request_args,
                 )
             except (httpx.TimeoutException, httpx.NetworkError) as exc:
                 failure_kind = (
@@ -216,7 +228,8 @@ class KalshiTradingClient:
                         details=request_detail,
                         transport=True,
                     ) from exc
-                await asyncio.sleep(min(4.0, 0.5 * (2**attempt)))
+                base_delay = min(4.0, 0.5 * (2**attempt))
+                await asyncio.sleep(base_delay + random.uniform(0, base_delay * 0.2))
                 continue
             if response.status_code == 429 and attempt < retries:
                 retry_after = response.headers.get("Retry-After")

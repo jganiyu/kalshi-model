@@ -233,7 +233,14 @@ class TradingCoordinator:
     def _start_private_stream(self, mode: str) -> None:
         broker = self.brokers[mode]
         assert isinstance(broker, KalshiBroker)
-        if not broker.client or mode in self._private_streams:
+        existing = self._private_streams.get(mode)
+        if existing and existing.done():
+            # A feed normally self-reconnects. If an unexpected task failure
+            # escaped it, discard the dead task so the recovery loop can
+            # restart it instead of treating the mode as permanently active.
+            self._private_streams.pop(mode, None)
+            existing = None
+        if not broker.client or existing:
             return
         _, key_path, _ = resolve_trading_credentials(mode)
         if not key_path:
@@ -273,7 +280,25 @@ class TradingCoordinator:
             on_message,
             on_status,
         )
-        self._private_streams[mode] = asyncio.create_task(feed.run())
+        task = asyncio.create_task(feed.run())
+        self._private_streams[mode] = task
+
+        def restart_if_unexpectedly_stopped(completed: asyncio.Task[None]) -> None:
+            if self._private_streams.get(mode) is completed:
+                self._private_streams.pop(mode, None)
+            if completed.cancelled():
+                return
+            try:
+                error = completed.exception()
+            except asyncio.CancelledError:
+                return
+            if error is None:
+                error = RuntimeError("private stream stopped unexpectedly")
+            broker.set_private_stream_connected(False)
+            broker._audit("PRIVATE_STREAM_TASK_RESTART", {"error": str(error)})
+            self._reconciliation_wake[mode].set()
+
+        task.add_done_callback(restart_if_unexpectedly_stopped)
 
     async def _handle_private_stream_status(
         self,
@@ -283,6 +308,7 @@ class TradingCoordinator:
     ) -> None:
         broker = self.brokers[mode]
         assert isinstance(broker, KalshiBroker)
+        broker.set_private_stream_connected(connected)
         broker._update_mode_state(  # One controlled owner for connection state.
             connected=connected,
             reconciliation_required=True,
@@ -333,6 +359,8 @@ class TradingCoordinator:
                 wake.clear()
                 broker = self.brokers[mode]
                 assert isinstance(broker, KalshiBroker)
+                # A dead feed task should never become a permanent blind spot.
+                self._start_private_stream(mode)
                 if not broker.client:
                     delay = 30.0
                     continue

@@ -245,9 +245,14 @@ class KalshiBroker(Broker):
         self._reconcile_lock = asyncio.Lock()
         self._reconcile_generation = 0
         self._reconciliation_paused = False
+        # A private stream is independent evidence that the authenticated
+        # Kalshi connection is alive. A single slow REST reconciliation
+        # endpoint must not falsely label that healthy stream "unreachable".
+        self._private_stream_connected = False
 
     def set_client(self, client: KalshiTradingClient | None) -> None:
         self.client = client
+        self._private_stream_connected = False
         self.disarm("Credentials changed.")
         self._update_mode_state(
             connected=False,
@@ -1455,7 +1460,10 @@ class KalshiBroker(Broker):
             # Reconnecting state; all failures still keep entries blocked
             # until reconciliation is authoritative.
             failed_state: dict[str, Any] = dict(
-                connected=not bool(getattr(exc, "transport", False)),
+                connected=(
+                    self._private_stream_connected
+                    or not bool(getattr(exc, "transport", False))
+                ),
                 reconciled=False,
                 reconciliation_required=True,
                 last_error=str(exc),
@@ -1469,6 +1477,7 @@ class KalshiBroker(Broker):
                     {
                         "reason": str(exc),
                         "exchange_error": exchange_error,
+                        "private_stream_connected": self._private_stream_connected,
                         "session_will_resume": self.session_armed,
                         "automatic_will_resume": self.automatic_armed,
                     },
@@ -2474,6 +2483,10 @@ class KalshiBroker(Broker):
             f"UPDATE broker_mode_state SET {assignments},updated_at=? WHERE mode=?",
             (*cleaned.values(), iso_now(), self.mode),
         )
+
+    def set_private_stream_connected(self, connected: bool) -> None:
+        """Record transient stream health without a new persistence field."""
+        self._private_stream_connected = bool(connected)
 
     def _audit(
         self,
