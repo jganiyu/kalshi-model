@@ -186,6 +186,21 @@ def test_phase_boundaries_and_exit_targets() -> None:
     assert texas_holdem_exit_reason(0.60, 200, settings)[0] == "TEXAS_RIVER_STOP"
     assert texas_holdem_exit_reason(0.75, 200, settings)[0] is None
 
+    # Zero is an explicit phase-stop opt-out, not a 0¢ trigger. Targets still
+    # work independently in every phase.
+    disabled = {
+        **settings,
+        "texas_holdem_flop_stop": 0,
+        "texas_holdem_turn_stop": 0,
+        "texas_holdem_river_stop": 0,
+        "texas_holdem_flop_target": .95,
+        "texas_holdem_turn_target": .95,
+        "texas_holdem_river_target": .99,
+    }
+    assert texas_holdem_exit_reason(.01, 800, disabled)[0] is None
+    assert texas_holdem_exit_reason(.01, 500, disabled)[0] is None
+    assert texas_holdem_exit_reason(.01, 200, disabled)[0] is None
+
 
 def test_opening_play_is_contrarian_and_threshold_exit_exempt(tmp_path: Path) -> None:
     db = make_db(tmp_path)

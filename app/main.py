@@ -414,6 +414,9 @@ async def arm_trading(mode: str, payload: dict[str, Any] = Body(...)) -> dict[st
             confirmation=str(payload.get("confirmation") or ""),
             automatic=bool(payload.get("automatic", False)),
         )
+        # Do not leave /api/dashboard or the WebSocket on the pre-arm
+        # snapshot while the next market update is pending.
+        engine.refresh_trading_dashboard()
         engine.trading.schedule_process(engine.dashboard.get("current"))
         return readiness
     except ValueError as exc:
@@ -426,6 +429,9 @@ async def disarm_trading(mode: str) -> dict[str, Any]:
     if not isinstance(broker, KalshiBroker):
         raise HTTPException(status_code=422, detail="Paper mode does not require arming.")
     broker.disarm("Disarmed by the user.")
+    # Disarming has no market-side work that would otherwise refresh the
+    # dashboard, so publish this safety state synchronously.
+    engine.refresh_trading_dashboard()
     return broker.readiness()
 
 
@@ -645,11 +651,11 @@ def clean_settings_payload(payload: dict[str, Any]) -> dict[str, Any]:
         "maximum_margin_volatility": (0.0, 10.0),
         "texas_holdem_max_entry_price": (0.01, 0.99),
         "texas_holdem_flop_target": (0.01, 0.99),
-        "texas_holdem_flop_stop": (0.01, 0.99),
+        "texas_holdem_flop_stop": (0.0, 0.99),
         "texas_holdem_turn_target": (0.01, 0.99),
-        "texas_holdem_turn_stop": (0.01, 0.99),
+        "texas_holdem_turn_stop": (0.0, 0.99),
         "texas_holdem_river_target": (0.01, 0.99),
-        "texas_holdem_river_stop": (0.01, 0.99),
+        "texas_holdem_river_stop": (0.0, 0.99),
         "texas_holdem_entry_window_seconds": (1.0, 120.0),
         "texas_holdem_additional_retries": (0, 10),
         "early_bankroll_pct": (0.0, 1.0),

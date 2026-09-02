@@ -25,6 +25,10 @@ const state = {
   trading: {
     mode: "PAPER", pendingConfirmation: null, switching: false,
     armConfirmation: { mode: null, confirming: false, submitting: false, action: null, timer: null },
+    // The broker increments this for every arm-state transition. Keep the
+    // most recently confirmed readiness so an older dashboard fetch or
+    // WebSocket frame cannot visually reverse a completed safety action.
+    armGenerations: {}, armReadiness: {},
   },
   tradeReview: {
     tradeRef: null, mode: null, data: null, chartMode: "btc",
@@ -568,8 +572,9 @@ async function updateTexasQuickSetting(event) {
     "texas-river-stop": "texas_holdem_river_stop",
   };
   const centsValue = Number(input.value);
-  if (!Number.isFinite(centsValue) || centsValue < 1 || centsValue > 99) {
-    showToast("Texas Hold’em setting not changed", "Enter a value from 1¢ through 99¢.");
+  const isStop = mapping[input.id]?.endsWith("_stop");
+  if (!Number.isFinite(centsValue) || centsValue < (isStop ? 0 : 1) || centsValue > 99) {
+    showToast("Texas Hold’em setting not changed", isStop ? "Enter 0¢ to disable, or 1¢ through 99¢." : "Enter a value from 1¢ through 99¢.");
     await refreshDashboard();
     return;
   }
@@ -627,7 +632,41 @@ async function toggleStandardEdgeGateRelease(event) {
   }
 }
 
+function preserveConfirmedArmingReadiness(dashboard) {
+  const trading = dashboard?.trading;
+  if (!trading?.modes) return dashboard;
+  for (const mode of ["DEMO", "LIVE"]) {
+    const incoming = trading.modes[mode]?.readiness;
+    if (!incoming) continue;
+    const generation = Number(incoming.arming_generation);
+    const knownGeneration = state.trading.armGenerations[mode];
+    if (Number.isFinite(generation) && generation >= 0) {
+      if (Number.isFinite(knownGeneration) && generation < knownGeneration) {
+        trading.modes[mode] = {
+          ...trading.modes[mode], readiness: state.trading.armReadiness[mode],
+        };
+      } else {
+        state.trading.armGenerations[mode] = generation;
+        state.trading.armReadiness[mode] = incoming;
+      }
+    } else if (Number.isFinite(knownGeneration)) {
+      // A legacy or malformed snapshot must not undo a confirmed action.
+      trading.modes[mode] = {
+        ...trading.modes[mode], readiness: state.trading.armReadiness[mode],
+      };
+    }
+  }
+  const selectedMode = trading.selected_mode;
+  if (trading.selected && trading.modes[selectedMode]?.readiness) {
+    trading.selected = {
+      ...trading.selected, readiness: trading.modes[selectedMode].readiness,
+    };
+  }
+  return dashboard;
+}
+
 function renderDashboard(data) {
+  data = preserveConfirmedArmingReadiness(data);
   state.dashboard = data;
   const trading = selectedTrading(data);
   state.trading.mode = trading.mode;
@@ -1089,6 +1128,11 @@ function syncArmButton(readiness = selectedTrading().selected?.readiness || {}, 
 function applyConfirmedTradingReadiness(mode, readiness) {
   const trading = state.dashboard?.trading;
   if (!trading || !readiness) return;
+  const generation = Number(readiness.arming_generation);
+  if (Number.isFinite(generation) && generation >= 0) {
+    state.trading.armGenerations[mode] = generation;
+    state.trading.armReadiness[mode] = readiness;
+  }
   if (trading.modes?.[mode]) trading.modes[mode] = { ...trading.modes[mode], readiness };
   if (trading.selected_mode === mode && trading.selected) {
     trading.selected = { ...trading.selected, readiness };
@@ -1734,11 +1778,11 @@ const calibrationGroups = [
     { id: "texas_holdem_enabled", label: "Enable Texas Hold’em Strategy", type: "toggle", tip: "Runs one contrarian opening play per market and replaces Standard Edge automatic entries while enabled. Default: off." },
     { id: "texas_holdem_max_entry_price", label: "Maximum entry price", unit: "cents", min: 1, max: 99, step: 1, scale: 100, tip: "Highest all-in executable contract price allowed for the opening IOC buy. Default: 50 cents." },
     { id: "texas_holdem_flop_target", label: "Flop target", unit: "cents", min: 1, max: 99, step: 1, scale: 100, tip: "Executable bid that closes the position during minutes 0–5. Default: 60 cents." },
-    { id: "texas_holdem_flop_stop", label: "Flop stop", unit: "cents", min: 1, max: 99, step: 1, scale: 100, tip: "Executable bid that folds during minutes 0–5. Default: 60 cents." },
+    { id: "texas_holdem_flop_stop", label: "Flop stop", unit: "cents", min: 0, max: 99, step: 1, scale: 100, tip: "Executable bid that folds during minutes 0–5. Use 0 to disable. Default: 60 cents." },
     { id: "texas_holdem_turn_target", label: "Turn target", unit: "cents", min: 1, max: 99, step: 1, scale: 100, tip: "Executable bid that closes the position during minutes 5–10. Default: 50 cents." },
-    { id: "texas_holdem_turn_stop", label: "Turn stop", unit: "cents", min: 1, max: 99, step: 1, scale: 100, tip: "Executable bid that folds during minutes 5–10. Default: 60 cents." },
+    { id: "texas_holdem_turn_stop", label: "Turn stop", unit: "cents", min: 0, max: 99, step: 1, scale: 100, tip: "Executable bid that folds during minutes 5–10. Use 0 to disable. Default: 60 cents." },
     { id: "texas_holdem_river_target", label: "River target", unit: "cents", min: 1, max: 99, step: 1, scale: 100, tip: "Executable bid that takes profit during minutes 10–15. Default: 95 cents." },
-    { id: "texas_holdem_river_stop", label: "River stop", unit: "cents", min: 1, max: 99, step: 1, scale: 100, tip: "Executable bid at or below which the position folds during the River. It is inactive during the Flop and Turn. Default: 60 cents." },
+    { id: "texas_holdem_river_stop", label: "River stop", unit: "cents", min: 0, max: 99, step: 1, scale: 100, tip: "Executable bid at or below which the position folds during the River. Use 0 to disable. Default: 60 cents." },
     { id: "texas_holdem_entry_window_seconds", label: "Opening-play window", unit: "seconds", min: 1, max: 120, step: 1, integer: true, tip: "Time after official market open in which the initial attempt and fresh-quote retries may occur." },
     { id: "texas_holdem_additional_retries", label: "Additional retries", unit: "retries", min: 0, max: 10, step: 1, integer: true, tip: "Fresh-quote IOC retries after the initial attempt. Default: 2." },
   ]],

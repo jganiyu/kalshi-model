@@ -427,6 +427,8 @@ def texas_holdem_exit_reason(
     price = float(bid)
     if price + 1e-12 >= target:
         return f"TEXAS_{key}_TARGET", state
-    if price <= stop + 1e-12:
+    # Zero is the explicit disabled value for a phase stop.  It must never
+    # become an implicit 0¢ exit trigger.
+    if stop > 0 and price <= stop + 1e-12:
         return f"TEXAS_{key}_STOP", state
     return None, state
