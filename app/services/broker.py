@@ -1540,20 +1540,33 @@ class KalshiBroker(Broker):
             remote = by_client.get(str(intent["client_order_id"]))
             settled_without_fill = False
             closed_without_fill = False
+            confirmed_fill_contracts = 0.0
+            market_closed = False
             if not remote:
+                confirmed_fill_contracts = self._matching_fill_contracts(intent)
                 settled_without_fill = self._settled_without_matching_fill(
                     intent, remote_settlements
                 )
-                closed_without_fill = (
-                    not settled_without_fill
-                    and await self._closed_without_matching_fill(intent)
-                )
+                market_closed = await self._closed_without_matching_fill(intent)
+                closed_without_fill = not settled_without_fill and not confirmed_fill_contracts and market_closed
             if remote:
                 self._set_intent(
                     str(intent["client_order_id"]),
                     self._order_status(remote),
                     exchange_order_id=str(remote.get("order_id") or "") or None,
                     error=None,
+                )
+            elif (self._market_is_settled(intent, remote_settlements) or market_closed) and (
+                confirmed_fill_contracts >= float(intent.get("requested_contracts") or 0)
+            ):
+                # Kalshi confirmed the requested same-side quantity after the
+                # market settled but did not retain the client ID.  It may be a
+                # manual close, so resolve the safety hold without attributing
+                # that fill to this timed-out request.
+                self._set_intent(
+                    str(intent["client_order_id"]),
+                    "RESOLVED_AFTER_SETTLEMENT",
+                    error="A confirmed same-side exchange fill resolved this timed-out request after settlement.",
                 )
             elif settled_without_fill or closed_without_fill:
                 # A settled or closed market cannot create future exposure. If
@@ -1624,7 +1637,7 @@ class KalshiBroker(Broker):
         closed (or its close time has passed), an absent order with no matching
         fill cannot create exposure later.
         """
-        if self.client is None or self._has_matching_fill(intent):
+        if self.client is None:
             return False
         ticker = str(intent.get("ticker") or "")
         if not ticker:
@@ -1649,11 +1662,13 @@ class KalshiBroker(Broker):
         )
 
     def _has_matching_fill(self, intent: dict[str, Any]) -> bool:
-        return self.db.fetch_one(
+        return self._matching_fill_contracts(intent) > 0
+
+    def _matching_fill_contracts(self, intent: dict[str, Any]) -> float:
+        row = self.db.fetch_one(
             """
-            SELECT 1 FROM broker_fills
+            SELECT COALESCE(SUM(contracts),0) AS contracts FROM broker_fills
             WHERE mode=? AND ticker=? AND side=? AND action=? AND filled_at>=?
-            LIMIT 1
             """,
             (
                 self.mode,
@@ -1662,7 +1677,8 @@ class KalshiBroker(Broker):
                 str(intent.get("action") or ""),
                 str(intent.get("created_at") or ""),
             ),
-        ) is not None
+        ) or {}
+        return float(row.get("contracts") or 0)
 
     def _settled_without_matching_fill(
         self, intent: dict[str, Any], remote_settlements: list[dict[str, Any]]
@@ -1676,6 +1692,13 @@ class KalshiBroker(Broker):
         reconciled fill history also contains no matching side/action after the
         request began.
         """
+        if not self._market_is_settled(intent, remote_settlements):
+            return False
+        return not self._has_matching_fill(intent)
+
+    def _market_is_settled(
+        self, intent: dict[str, Any], remote_settlements: list[dict[str, Any]]
+    ) -> bool:
         ticker = str(intent.get("ticker") or "")
         remotely_settled = any(
             str(row.get("ticker") or row.get("market_ticker") or "") == ticker
@@ -1685,9 +1708,7 @@ class KalshiBroker(Broker):
             "SELECT 1 FROM broker_settlements WHERE mode=? AND ticker=? LIMIT 1",
             (self.mode, ticker),
         ) is not None
-        if not ticker or not (remotely_settled or previously_settled):
-            return False
-        return not self._has_matching_fill(intent)
+        return bool(ticker) and (remotely_settled or previously_settled)
 
     async def kill(self) -> dict[str, Any]:
         self.disarm("Kill switch activated.")

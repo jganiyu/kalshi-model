@@ -1031,11 +1031,12 @@ async function reconcileSelectedTrading() {
   try {
     const portfolio = await api(`/api/trading/${mode}/reconcile`, { method: "POST" });
     if (!portfolio.readiness?.reconciled) {
-      throw new Error(
+      showToast("Reconciliation incomplete",
         portfolio.readiness?.last_error
         || portfolio.readiness?.blocker
         || "Account reconciliation is still incomplete."
       );
+      return;
     }
     await refreshDashboard();
     await loadPaper();

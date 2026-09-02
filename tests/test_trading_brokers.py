@@ -363,7 +363,7 @@ async def test_reconcile_clears_unseen_ambiguous_order_when_market_closes(
 
 
 @run_async
-async def test_reconcile_does_not_clear_closed_ambiguous_order_with_matching_fill(
+async def test_reconcile_resolves_closed_ambiguous_order_with_matching_fill(
     tmp_path: Path,
 ) -> None:
     db, broker, client = await ready_broker(tmp_path)
@@ -392,8 +392,8 @@ async def test_reconcile_does_not_clear_closed_ambiguous_order_with_matching_fil
         "SELECT status FROM broker_order_intents WHERE client_order_id=?",
         (intent.client_order_id,),
     )
-    assert row == {"status": "RECONCILIATION_REQUIRED"}
-    assert broker.readiness()["reconciled"] is False
+    assert row == {"status": "RESOLVED_AFTER_SETTLEMENT"}
+    assert broker.readiness()["reconciled"] is True
 
 
 @run_async
