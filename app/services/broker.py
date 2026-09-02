@@ -1349,6 +1349,25 @@ class KalshiBroker(Broker):
                         "PROTECTIVE_EXIT_RECOVERY_FAILED",
                         {"error": str(recovery_error)}, intent=intent,
                     )
+            elif intent.action == "BUY":
+                # An uncertain entry must never be re-submitted blindly, but
+                # it also must not require a manual account-wide refresh just
+                # to learn whether this exact client order reached Kalshi.
+                try:
+                    await asyncio.wait_for(
+                        self.recover_ambiguous_entry(intent), timeout=4.0
+                    )
+                except asyncio.TimeoutError:
+                    self._audit(
+                        "ENTRY_RECOVERY_DEFERRED",
+                        {"reason": "targeted recovery timed out", "timeout_seconds": 4},
+                        intent=intent,
+                    )
+                except Exception as recovery_error:
+                    self._audit(
+                        "ENTRY_RECOVERY_FAILED", {"error": str(recovery_error)},
+                        intent=intent,
+                    )
             raise
         except asyncio.CancelledError:
             raise
@@ -1610,6 +1629,63 @@ class KalshiBroker(Broker):
             client_order_id=client_order_id, ticker=ticker,
         )
         return {"state": status or "RECONCILIATION_REQUIRED", "position_flat": flat}
+
+    async def recover_ambiguous_entry(self, intent: OrderIntent) -> dict[str, Any]:
+        """Resolve one uncertain buy from exact, targeted exchange evidence.
+
+        This never retries the buy. A positive exact-order result is adopted;
+        An absent result is not proof that a delayed create cannot still
+        appear, so it remains reserved for normal reconciliation.
+        """
+        if self.client is None or intent.action != "BUY":
+            return {"state": "not_entry"}
+        lookup = getattr(self.client, "order_by_client_id", None)
+
+        async def fallback_order_lookup() -> dict[str, Any] | None:
+            payload = await self.client.orders(ticker=intent.ticker)
+            return next(
+                (row for row in payload.get("orders") or []
+                 if str(row.get("client_order_id") or "") == intent.client_order_id),
+                None,
+            )
+
+        order_call = lookup(intent.client_order_id) if callable(lookup) else fallback_order_lookup()
+        order_result, position_result = await asyncio.gather(
+            order_call, self.client.positions(ticker=intent.ticker), return_exceptions=True
+        )
+        order_ok = not isinstance(order_result, Exception)
+        position_ok = not isinstance(position_result, Exception)
+        if isinstance(order_result, dict):
+            self._upsert_order(order_result)
+            filled = _number(
+                order_result.get("filled_contracts")
+                or order_result.get("fill_count_fp")
+                or order_result.get("fill_count")
+            )
+            if intent.strategy == "TEXAS_HOLDEM" and filled > 0:
+                self._adopt_texas_acknowledged_fill(intent, filled)
+        position_rows: list[dict[str, Any]] = []
+        if isinstance(position_result, dict):
+            position_rows = [
+                row for row in (position_result.get("market_positions") or position_result.get("positions") or [])
+                if isinstance(row, dict)
+                and str(row.get("ticker") or row.get("market_ticker") or "") == intent.ticker
+            ]
+            for row in position_rows:
+                self._upsert_position(row)
+        latest = self.db.fetch_one(
+            "SELECT status FROM broker_order_intents WHERE mode=? AND client_order_id=?",
+            (self.mode, intent.client_order_id),
+        ) or {}
+        status = str(latest.get("status") or "RECONCILIATION_REQUIRED")
+        self._audit(
+            "ENTRY_TARGETED_RECOVERY",
+            {"order_lookup_succeeded": order_ok, "position_lookup_succeeded": position_ok,
+             "order_found": isinstance(order_result, dict), "position_found": bool(position_rows),
+             "final_state": status},
+            intent=intent,
+        )
+        return {"state": status}
 
     async def _reconcile_once(self) -> dict[str, Any]:
         if self.client is None:

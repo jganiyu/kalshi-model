@@ -262,7 +262,7 @@ async def test_filled_exchange_position_is_unsettled_not_an_open_order(
 
 
 @run_async
-async def test_ambiguous_timeout_requires_reconciliation_without_retry(tmp_path: Path) -> None:
+async def test_ambiguous_entry_absent_from_targeted_lookup_remains_reserved(tmp_path: Path) -> None:
     db, broker, client = await ready_broker(tmp_path)
     client.timeout = True
     intent = OrderIntent("DEMO", "TICKER", "YES", "BUY", 1, 0.40, "MANUAL", "manual")
@@ -272,6 +272,34 @@ async def test_ambiguous_timeout_requires_reconciliation_without_retry(tmp_path:
     assert row and row["status"] == "RECONCILIATION_REQUIRED"
     assert broker.readiness()["reconciliation_required"] is True
     assert len(client.created) == 0
+
+
+@run_async
+async def test_ambiguous_texas_entry_adopts_exact_targeted_fill(tmp_path: Path) -> None:
+    db, broker, client = await ready_broker(tmp_path)
+    intent = OrderIntent(
+        "DEMO", "TARGETED-TEXAS", "YES", "BUY", 2, .40,
+        "TEXAS_HOLDEM", "automatic",
+    )
+    client.timeout = True
+    client.remote_orders = [{
+        "order_id": "targeted-entry", "client_order_id": intent.client_order_id,
+        "ticker": intent.ticker, "side": "bid", "price": ".40", "count": "2",
+        "fill_count": "2", "remaining_count": "0", "status": "executed",
+    }]
+    client.remote_positions = [{"ticker": intent.ticker, "position_fp": "2.00"}]
+
+    with pytest.raises(AmbiguousSubmissionError):
+        await broker.submit(intent)
+
+    assert db.fetch_one(
+        "SELECT status FROM broker_order_intents WHERE client_order_id=?",
+        (intent.client_order_id,),
+    ) == {"status": "FILLED"}
+    assert db.fetch_one(
+        "SELECT status,contracts FROM broker_positions WHERE mode='DEMO' AND ticker=?",
+        (intent.ticker,),
+    ) == {"status": "open", "contracts": 2.0}
 
 
 @run_async

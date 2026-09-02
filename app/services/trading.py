@@ -1333,31 +1333,60 @@ class TradingCoordinator:
                     ) or 0
                 )
                 if attempt_number:
-                    self.db.execute(
+                    # A timeout is still raised to prevent a blind retry, but
+                    # the broker may already have adopted exact-ID evidence.
+                    # Do not overwrite that accepted/fill state as rejected.
+                    latest = self.db.fetch_one(
+                        "SELECT status FROM broker_order_intents WHERE mode=? AND client_order_id=?",
+                        (intent.mode, intent.client_order_id),
+                    ) or {}
+                    adopted_status = str(latest.get("status") or "")
+                    accepted = adopted_status in {
+                        "ACKNOWLEDGED", "RESTING", "PARTIALLY_FILLED", "FILLED",
+                    }
+                    fill = self.db.fetch_one(
                         """
-                        UPDATE texas_holdem_attempts SET broker_client_order_id=?,
-                            requested_contracts=?,status='REJECTED',blocker=?
-                        WHERE round_id=(
-                            SELECT id FROM texas_holdem_rounds
+                        SELECT filled_contracts AS amount FROM broker_orders
+                        WHERE mode=? AND client_order_id=? AND action='BUY'
+                        ORDER BY id DESC LIMIT 1
+                        """,
+                        (intent.mode, intent.client_order_id),
+                    ) or {}
+                    if accepted:
+                        filled = float(fill.get("amount") or 0.0)
+                        self.db.execute(
+                            """
+                            UPDATE texas_holdem_attempts SET broker_client_order_id=?,
+                                requested_contracts=?,filled_contracts=?,status=?,blocker=NULL
+                            WHERE round_id=(SELECT id FROM texas_holdem_rounds
+                                            WHERE environment=? AND ticker=?)
+                              AND attempt_number=?
+                            """,
+                            (intent.client_order_id, intent.contracts, filled,
+                             adopted_status, intent.mode, intent.ticker, attempt_number),
+                        )
+                    else:
+                        self.db.execute(
+                            """
+                            UPDATE texas_holdem_attempts SET broker_client_order_id=?,
+                                requested_contracts=?,status='REJECTED',blocker=?
+                            WHERE round_id=(
+                                SELECT id FROM texas_holdem_rounds
+                                WHERE environment=? AND ticker=?
+                            ) AND attempt_number=?
+                            """,
+                            (
+                                intent.client_order_id, intent.contracts, str(exc),
+                                intent.mode, intent.ticker, attempt_number,
+                            ),
+                        )
+                        self.db.execute(
+                            """
+                            UPDATE texas_holdem_rounds SET fold_reason=?,updated_at=?
                             WHERE environment=? AND ticker=?
-                        ) AND attempt_number=?
-                        """,
-                        (
-                            intent.client_order_id,
-                            intent.contracts,
-                            str(exc),
-                            intent.mode,
-                            intent.ticker,
-                            attempt_number,
-                        ),
-                    )
-                    self.db.execute(
-                        """
-                        UPDATE texas_holdem_rounds SET fold_reason=?,updated_at=?
-                        WHERE environment=? AND ticker=?
-                        """,
-                        (str(exc), datetime_now(), intent.mode, intent.ticker),
-                    )
+                            """,
+                            (str(exc), datetime_now(), intent.mode, intent.ticker),
+                        )
             if intent.action == "SELL":
                 latest_exit = self.db.fetch_one(
                     "SELECT status FROM broker_order_intents WHERE mode=? AND client_order_id=?",
