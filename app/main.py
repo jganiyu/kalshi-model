@@ -122,6 +122,23 @@ async def set_standard_edge_gate_release(
     return state
 
 
+@app.post("/api/texas-holdem/pass-next-round")
+async def pass_texas_holdem_next_round() -> dict[str, Any]:
+    current = engine.dashboard.get("current") or {}
+    ticker = str(current.get("ticker") or "")
+    opened = current.get("open_time") or current.get("market_open_time")
+    if not ticker or not opened:
+        raise HTTPException(status_code=409, detail="There is no active Texas market to pass from.")
+    settings = db.settings()
+    mode = str(settings.get("trading_mode") or "PAPER").upper()
+    try:
+        return engine.paper.texas_holdem_pass_next_round(
+            environment=mode, source_ticker=ticker, market_open_time=str(opened)
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
 @app.websocket("/ws/live")
 async def live(websocket: WebSocket) -> None:
     await websocket.accept()

@@ -991,6 +991,25 @@ MIGRATIONS: list[tuple[int, str]] = [
         ALTER TABLE broker_positions ADD COLUMN texas_exit_last_attempt_bid REAL;
         """,
     ),
+    (
+        21,
+        """
+        -- A one-round Texas pass is deliberately separate from arming and
+        -- settings.  It is consumed only by its scheduled market.
+        CREATE TABLE texas_holdem_passes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            environment TEXT NOT NULL CHECK(environment IN ('PAPER','DEMO','LIVE')),
+            source_ticker TEXT NOT NULL,
+            target_open_epoch REAL NOT NULL,
+            target_open_time TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            consumed_at TEXT,
+            UNIQUE(environment, target_open_epoch)
+        );
+        CREATE INDEX idx_texas_holdem_passes_target
+            ON texas_holdem_passes(environment, target_open_epoch);
+        """,
+    ),
 ]
 
 

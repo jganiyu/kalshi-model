@@ -47,6 +47,8 @@ function syncThemeButtons() {
     button.classList.toggle("active", selected);
     button.setAttribute("aria-pressed", String(selected));
   });
+  const dashboardToggle = $("#dashboard-theme-toggle");
+  if (dashboardToggle) dashboardToggle.checked = document.documentElement.dataset.theme === "dark";
 }
 
 function applyTheme(preference = state.themePreference) {
@@ -529,6 +531,12 @@ function renderTexasHoldemHud(texas = {}) {
   $("#texas-active-target").textContent = cents(texas.active_target, 0);
   $("#texas-holdem-blocker").textContent = texas.blocker
     || (texas.status === "ENTERED" ? "Position entered. Watching the active street exit." : "Opening play is active.");
+  const passButton = $("#texas-pass-next-round");
+  const pass = texas.pass || {};
+  passButton.disabled = Boolean(pass.passed || pass.scheduled);
+  passButton.textContent = pass.passed
+    ? "Round passed"
+    : pass.scheduled ? "Next round passed" : "Pass next round";
   const values = {
     "#texas-flop-target": texas.targets?.flop,
     "#texas-flop-stop": texas.targets?.flop_stop,
@@ -571,6 +579,19 @@ async function updateTexasQuickSetting(event) {
     showToast("Texas Hold’em updated", "The active position is using the new phase value.");
   } catch (error) {
     showToast("Texas Hold’em setting not changed", error.message);
+    await refreshDashboard();
+  }
+}
+
+async function passTexasHoldemNextRound() {
+  const button = $("#texas-pass-next-round");
+  button.disabled = true;
+  try {
+    const state = await api("/api/texas-holdem/pass-next-round", { method: "POST" });
+    await refreshDashboard();
+    showToast("Next Texas round passed", `The ${state.environment} session remains armed.`);
+  } catch (error) {
+    showToast("Texas round not passed", error.message);
     await refreshDashboard();
   }
 }
@@ -628,9 +649,6 @@ function renderDashboard(data) {
   $("#sidebar-status").textContent = state.liveConnected
     ? "Streaming live"
     : system.status === "live" ? "REST fallback" : "Data guarded";
-  $("#last-update").textContent = system.updated_at ? `Updated ${new Date(system.updated_at).toLocaleTimeString([], { hour: "numeric", minute: "2-digit", second: "2-digit" })}` : "Connecting";
-  $("#header-model-version").textContent = data.model?.version || "baseline-1.0";
-
   const position = forecastPosition(forecast);
   const pill = $("#signal-pill");
   pill.dataset.position = position;
@@ -2811,6 +2829,7 @@ function bindEvents() {
   ["#texas-flop-target", "#texas-flop-stop", "#texas-turn-target", "#texas-turn-stop", "#texas-river-target", "#texas-river-stop"].forEach((selector) => {
     $(selector).addEventListener("change", updateTexasQuickSetting);
   });
+  $("#texas-pass-next-round").addEventListener("click", passTexasHoldemNextRound);
   $("#reset-paper-round").addEventListener("click", resetPaperRound);
   $("#run-bootstrap").addEventListener("click", runBootstrap);
   $("#backup-database").addEventListener("click", backupDatabase);
@@ -2884,6 +2903,9 @@ function bindEvents() {
   $$('[data-theme-choice]').forEach((button) => button.addEventListener("click", () => {
     applyTheme(button.dataset.themeChoice);
   }));
+  $("#dashboard-theme-toggle").addEventListener("change", (event) => {
+    applyTheme(event.target.checked ? "dark" : "light");
+  });
   themeMedia.addEventListener("change", () => {
     if (state.themePreference === "system") applyTheme("system");
   });

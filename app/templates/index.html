@@ -47,10 +47,12 @@
               <button type="button" data-trading-mode="LIVE" aria-pressed="false">Live</button>
             </div>
           </div>
-          <div class="header-meta">
-            <div class="header-status"><span class="live-dot"></span><span id="last-update">Connecting</span></div>
-            <strong id="header-model-version">baseline-1.0</strong>
-          </div>
+          <label class="theme-switch dashboard-theme-switch" title="Switch between light and dark mode">
+            <span>Light</span>
+            <input id="dashboard-theme-toggle" type="checkbox" aria-label="Use dark mode">
+            <i aria-hidden="true"></i>
+            <span>Dark</span>
+          </label>
         </header>
 
         <section class="decision-band" id="decision-band">
@@ -256,6 +258,7 @@
                 <span><small>Active target</small><strong id="texas-active-target">--</strong></span>
               </div>
               <p class="standard-edge-hud-blocker"><button class="hud-help" type="button" aria-label="About the opening play status" data-tooltip="Shows the opening IOC state, phase exit state, or the first blocker preventing the play.">i</button><span id="texas-holdem-blocker">Waiting for the opening play.</span></p>
+              <button class="standard-edge-hud-arm" id="texas-pass-next-round" type="button">Pass next round</button>
               <button class="standard-edge-hud-arm" id="texas-hud-arm-trading" data-arm-session type="button" hidden>Arm session</button>
             </div>
           </section>

@@ -4,7 +4,7 @@ import json
 import math
 import time
 from collections import deque
-from datetime import date
+from datetime import date, timedelta
 from typing import Any, Callable
 
 from app.db import Database
@@ -94,6 +94,61 @@ class PaperTradingService:
             (str(environment).upper(), ticker),
         )
 
+    def texas_holdem_pass_next_round(
+        self, *, environment: str, source_ticker: str, market_open_time: str | None
+    ) -> dict[str, Any]:
+        """Persist a one-shot entry pass for the market following this one."""
+        opened = parse_time(market_open_time)
+        if opened is None:
+            raise ValueError("The active market's opening time is unavailable.")
+        mode = str(environment).upper()
+        if mode not in {"PAPER", "DEMO", "LIVE"}:
+            raise ValueError("Trading environment is invalid.")
+        target = opened + timedelta(minutes=15)
+        target_epoch = target.timestamp()
+        self.db.execute(
+            """
+            INSERT OR IGNORE INTO texas_holdem_passes(
+                environment,source_ticker,target_open_epoch,target_open_time,created_at
+            ) VALUES (?,?,?,?,?)
+            """,
+            (mode, source_ticker, target_epoch, target.isoformat(), iso_now()),
+        )
+        row = self.db.fetch_one(
+            """SELECT * FROM texas_holdem_passes
+               WHERE environment=? AND target_open_epoch=?""",
+            (mode, target_epoch),
+        ) or {}
+        return {
+            "environment": mode,
+            "source_ticker": row.get("source_ticker"),
+            "target_open_time": row.get("target_open_time"),
+            "passed": True,
+            "consumed": bool(row.get("consumed_at")),
+        }
+
+    def _texas_holdem_pass(
+        self, environment: str, market_open_time: str | None
+    ) -> dict[str, Any] | None:
+        opened = parse_time(market_open_time)
+        if opened is None:
+            return None
+        return self.db.fetch_one(
+            """SELECT * FROM texas_holdem_passes
+               WHERE environment=? AND ABS(target_open_epoch - ?) < 0.5""",
+            (str(environment).upper(), opened.timestamp()),
+        )
+
+    def _scheduled_texas_holdem_pass(
+        self, environment: str, source_ticker: str
+    ) -> dict[str, Any] | None:
+        return self.db.fetch_one(
+            """SELECT * FROM texas_holdem_passes
+               WHERE environment=? AND source_ticker=? AND consumed_at IS NULL
+               ORDER BY id DESC LIMIT 1""",
+            (str(environment).upper(), source_ticker),
+        )
+
     def _texas_filled_contracts(
         self, environment: str, ticker: str, side: str
     ) -> float:
@@ -157,6 +212,7 @@ class PaperTradingService:
             "YES" if margin is not None and margin < 0 else None
         )
         row = self._texas_round(mode, ticker)
+        passed = self._texas_holdem_pass(mode, market_open_time)
         if row is None:
             now_iso = market_observed_at or iso_now()
             market_row = self.db.fetch_one(
@@ -177,12 +233,17 @@ class PaperTradingService:
                 """,
                 (
                     mode, ticker, market_open_time, threshold,
-                    opening_proxy, proposed_side, "WAITING", maximum_price,
+                    opening_proxy, proposed_side, "PASSED" if passed else "WAITING", maximum_price,
                     targets["flop"], targets["turn"], targets["river"],
                     targets["river_stop"], now_iso, now_iso,
                 ),
             )
             row = self._texas_round(mode, ticker) or {}
+        if passed and not passed.get("consumed_at"):
+            self.db.execute(
+                "UPDATE texas_holdem_passes SET consumed_at=? WHERE id=?",
+                (market_observed_at or iso_now(), passed["id"]),
+            )
         stored_side = str(row.get("side") or "") or None
         side = stored_side or proposed_side
         filled = self._texas_filled_contracts(mode, ticker, side) if side else 0.0
@@ -197,7 +258,14 @@ class PaperTradingService:
                 "UPDATE texas_holdem_rounds SET filled_contracts=?,status=?,updated_at=? WHERE id=?",
                 (filled, status, market_observed_at or iso_now(), row["id"]),
             )
-        if status not in {"ENTERED", "FOLDED", "EXITED"} and not (
+        if passed and filled <= 0:
+            status = "PASSED"
+            blocker = "This Texas Hold’em round was passed. The next round remains eligible."
+            self.db.execute(
+                "UPDATE texas_holdem_rounds SET status=?,fold_reason=?,updated_at=? WHERE id=?",
+                (status, blocker, market_observed_at or iso_now(), row["id"]),
+            )
+        elif status not in {"ENTERED", "FOLDED", "EXITED", "PASSED"} and not (
             status == "PARTIALLY_FILLED" and blocker
         ):
             if not automatic_enabled:
@@ -331,6 +399,7 @@ class PaperTradingService:
         side_assessment = assessments.get(side) if side else None
         bid = ((side_assessment or {}).get("sell") or {}).get("raw_price")
         active_target = targets[str(phase["key"]).lower()]
+        scheduled_pass = self._scheduled_texas_holdem_pass(mode, ticker)
         return {
             "strategy": "TEXAS_HOLDEM",
             "enabled": True,
@@ -347,6 +416,11 @@ class PaperTradingService:
             "active_target": active_target,
             "blocker": blocker,
             "market_open_time": market_open_time,
+            "pass": {
+                "passed": status == "PASSED",
+                "scheduled": bool(scheduled_pass),
+                "next_open_time": (scheduled_pass or {}).get("target_open_time"),
+            },
             "threshold_breach_exempt": True,
         }
 

@@ -122,6 +122,20 @@ def test_trading_ui_contains_mode_safety_and_confirmation_controls() -> None:
     assert "if (!portfolio.readiness?.reconciled)" in script
 
 
+def test_dashboard_theme_switch_reuses_persisted_theme_without_header_metadata() -> None:
+    root = Path(__file__).resolve().parents[1]
+    template = (root / "app/templates/index.html").read_text()
+    script = (root / "app/static/app.js").read_text()
+    styles = (root / "app/static/styles.css").read_text()
+
+    assert 'id="dashboard-theme-toggle"' in template
+    assert 'id="last-update"' not in template
+    assert 'id="header-model-version"' not in template
+    assert 'localStorage.setItem("kalshi-theme-v2", preference)' in script
+    assert '$("#dashboard-theme-toggle").addEventListener("change"' in script
+    assert ".theme-switch input:checked + i { background: var(--green); }" in styles
+
+
 def test_private_stream_accepts_current_singular_event_types() -> None:
     root = Path(__file__).resolve().parents[1]
     source = (root / "app/services/streaming.py").read_text()

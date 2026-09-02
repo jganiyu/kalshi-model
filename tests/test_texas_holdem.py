@@ -81,14 +81,16 @@ def run_strategy(
     margin: float,
     observed_at: str = "2026-09-01T12:00:01+00:00",
     seconds_remaining: float = 899,
+    ticker: str = "TEXAS",
+    market_open_time: str = "2026-09-01T12:00:00+00:00",
 ) -> dict:
     return service.consider_strategies(
-        ticker="TEXAS",
+        ticker=ticker,
         assessments=side_assessments,
         standard_decisions={},
         seconds_remaining=seconds_remaining,
         market_status="active",
-        market_open_time="2026-09-01T12:00:00+00:00",
+        market_open_time=market_open_time,
         market_observed_at=observed_at,
         threshold_state={},
         settlement_window={},
@@ -96,6 +98,60 @@ def run_strategy(
         threshold_margin_dollars=margin,
         model_version="test",
     )
+
+
+def test_texas_pass_skips_only_next_round_persists_and_keeps_environment_isolated(
+    tmp_path: Path,
+) -> None:
+    db = make_db(tmp_path)
+    service = PaperTradingService(db)
+    quotes = assessments(yes_bid=.45, yes_ask=.46)
+
+    scheduled = service.texas_holdem_pass_next_round(
+        environment="DEMO", source_ticker="PREVIOUS",
+        market_open_time="2026-09-01T11:45:00+00:00",
+    )
+    # Repeated clicks schedule the same round, rather than a second pass.
+    assert service.texas_holdem_pass_next_round(
+        environment="DEMO", source_ticker="PREVIOUS",
+        market_open_time="2026-09-01T11:45:00+00:00",
+    ) == scheduled
+
+    # A DEMO pass does not alter Paper, and does not alter the user's settings.
+    paper = run_strategy(service, quotes, margin=10, observed_at="2026-09-01T12:00:01+00:00")
+    assert paper["texas_holdem"]["status"] != "PASSED"
+    assert db.settings()["paper_trading_enabled"] is True
+
+    # Recreating the service proves the pending pass is durable across restart.
+    restored = PaperTradingService(db)
+    passed = run_strategy(
+        restored, quotes, margin=10, ticker="DEMO-TEXAS",
+        observed_at="2026-09-01T12:00:01+00:00",
+    )
+    # That was PAPER again; its entry remains eligible.
+    assert passed["texas_holdem"]["status"] != "PASSED"
+    demo_passed = restored._texas_holdem_state(
+        ticker="DEMO-TEXAS", assessments=quotes, opening_elapsed=1,
+        seconds_remaining=899, threshold_margin_dollars=10,
+        market_open_time="2026-09-01T12:00:00+00:00",
+        market_observed_at="2026-09-01T12:00:01+00:00", status_open=True,
+        execution_mode="DEMO", automatic_enabled=True,
+        execution_block_reason=None, entry_exists=False, model_version="test",
+        fixed_entry_handler=lambda **_: (True, .45), execution_risk_by_side={},
+    )
+    assert demo_passed["status"] == "PASSED"
+    assert "next round remains eligible" in demo_passed["blocker"]
+
+    next_round = restored._texas_holdem_state(
+        ticker="DEMO-NEXT", assessments=quotes, opening_elapsed=1,
+        seconds_remaining=899, threshold_margin_dollars=10,
+        market_open_time="2026-09-01T12:15:00+00:00",
+        market_observed_at="2026-09-01T12:15:01+00:00", status_open=True,
+        execution_mode="DEMO", automatic_enabled=True,
+        execution_block_reason=None, entry_exists=False, model_version="test",
+        fixed_entry_handler=lambda **_: (True, .45), execution_risk_by_side={},
+    )
+    assert next_round["status"] != "PASSED"
 
 
 def test_phase_boundaries_and_exit_targets() -> None:
