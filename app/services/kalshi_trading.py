@@ -268,18 +268,21 @@ class KalshiTradingClient:
             else self._requests.BACKGROUND if priority is None else priority
         )
         for attempt in range(retries + 1):
-            headers = signed_headers(
-                self.key_id, self.private_key_path, method, signing_path
-            )
             try:
                 request_args: dict[str, Any] = {
                     "params": params,
                     "json": json,
-                    "headers": headers,
                 }
                 if not submission:
                     request_args["timeout"] = ACCOUNT_READ_TIMEOUT
+
                 async def send() -> httpx.Response:
+                    # Kalshi rejects stale signatures. Sign only after this
+                    # request has won a controller slot, never while it is
+                    # still waiting behind recovery/background work.
+                    request_args["headers"] = signed_headers(
+                        self.key_id, self.private_key_path, method, signing_path
+                    )
                     return await self.client.request(
                         method,
                         f"{self.base_url}{path}",

@@ -1416,20 +1416,23 @@ class TradingCoordinator:
                         (exit_reason, datetime_now(), intent.mode, intent.ticker),
                     )
                 elif intent.source.startswith("texas_"):
+                    blocked_by_auth = "authentication is not verified" in str(exc).lower()
+                    exit_status = "Exit blocked" if blocked_by_auth else "Exit failed"
                     self.db.execute(
                         """
-                        UPDATE broker_positions SET texas_exit_status='Exit failed',
+                        UPDATE broker_positions SET texas_exit_status=?,
                             texas_exit_reason=?,texas_exit_last_attempt_at=?
                         WHERE mode=? AND ticker=? AND side=? AND status='open'
                         """,
-                        (str(exc), datetime_now(), intent.mode, intent.ticker, intent.side),
+                        (exit_status, str(exc), datetime_now(), intent.mode, intent.ticker, intent.side),
                     )
                     self.db.execute(
                         """
-                        UPDATE texas_holdem_rounds SET status='EXIT_FAILED',
+                        UPDATE texas_holdem_rounds SET status=?,
                             fold_reason=?,updated_at=? WHERE environment=? AND ticker=?
                         """,
-                        (str(exc), datetime_now(), intent.mode, intent.ticker),
+                        ("EXIT_BLOCKED" if blocked_by_auth else "EXIT_FAILED",
+                         str(exc), datetime_now(), intent.mode, intent.ticker),
                     )
                 try:
                     await broker.reconcile()

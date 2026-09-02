@@ -1,8 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 
-from app.services.kalshi_trading import AuthenticatedRequestController
+import httpx
+
+from app.services.kalshi_trading import (
+    AuthenticatedRequestController,
+    KalshiTradingClient,
+)
 
 
 def test_priority_recovery_uses_reserved_lane_while_reconciliation_is_slow() -> None:
@@ -97,5 +103,44 @@ def test_cancelled_background_waiter_cannot_block_later_exit_work() -> None:
         exit_work = asyncio.create_task(controller.run(controller.EXECUTION, quick))
         release.set()
         await asyncio.gather(running, exit_work)
+
+    asyncio.run(scenario())
+
+
+def test_request_is_signed_only_after_it_leaves_the_queue(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    async def scenario() -> None:
+        signed: list[str] = []
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        def sign(*_: object) -> dict[str, str]:
+            signed.append("signed")
+            return {"KALSHI-ACCESS-TIMESTAMP": "fresh"}
+
+        async def slow_background() -> None:
+            started.set()
+            await release.wait()
+
+        http = httpx.AsyncClient(
+            transport=httpx.MockTransport(lambda _: httpx.Response(200, json={}))
+        )
+        client = KalshiTradingClient(
+            http, "https://example.test/trade-api/v2", "key", tmp_path / "key.pem",
+            environment="DEMO",
+        )
+        monkeypatch.setattr("app.services.kalshi_trading.signed_headers", sign)
+        holding = asyncio.create_task(
+            client._requests.run(client._requests.BACKGROUND, slow_background)
+        )
+        await started.wait()
+        queued = asyncio.create_task(client._request("GET", "/portfolio/balance", retries=0))
+        await asyncio.sleep(0)
+        assert signed == []
+        release.set()
+        await asyncio.gather(holding, queued)
+        await http.aclose()
+        assert signed == ["signed"]
 
     asyncio.run(scenario())
