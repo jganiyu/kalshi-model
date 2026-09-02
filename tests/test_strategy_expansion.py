@@ -1019,7 +1019,9 @@ def test_dashboard_markup_has_two_fixed_books_and_paper_trade_history() -> None:
     assert 'id="standard-edge-gate-release"' in markup
     assert 'id="standard-edge-gate-release-label"' in markup
     assert '"/api/standard-edge/gate-release"' in script
-    assert 'state.chartWindow >= 15' in script
+    assert 'chartWindow: 5' in script
+    assert 'api(`/api/chart?minutes=${state.chartWindow}`)' in script
+    assert 'state.chartWindow <= 5' in script
     assert 'const drawMarketPhases = () =>' in script
     assert 'const phases = ["FLOP", "TURN", "RIVER"]' in script
     assert script.index('const drawMarketPhases = () =>') > script.index('function drawChart(')

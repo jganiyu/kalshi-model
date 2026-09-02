@@ -62,7 +62,7 @@ def test_trading_api_exposes_isolated_structured_account_state(
     assert payload["selected_mode"] == "DEMO"
     selected = payload["selected"]
     for field in (
-        "readiness", "risk_state", "reconciliation_state", "positions",
+        "readiness", "risk_state", "reconciliation_state", "protective_exit_state", "positions",
         "orders", "fills", "intents", "settlements", "stop_loss_state",
         "profit_take_state", "strategy_results", "allocation_cap",
         "remaining_allocation",

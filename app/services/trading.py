@@ -432,10 +432,10 @@ class TradingCoordinator:
                 mode != "PAPER"
                 and state["breached"]
                 and state["status"] == "Breached"
-                and not readiness.get("ready_for_manual")
+                and not readiness.get("ready_for_protective_exit")
             ):
                 state["status"] = "Blocked"
-                state["reason"] = readiness.get("blocker") or (
+                state["reason"] = readiness.get("protective_exit_blocker") or (
                     f"The {mode.title()} session is not ready for an exit."
                 )
             state["last_attempt_at"] = position.get("threshold_exit_last_attempt_at")
@@ -1524,6 +1524,7 @@ class TradingCoordinator:
                 continue
             decision_snapshot: dict[str, Any] = {
                 "trigger": reason,
+                "protective_exit": True,
                 "executable_bid": bid,
                 "priority": priority,
                 "market_style_ioc": market_style_exit,

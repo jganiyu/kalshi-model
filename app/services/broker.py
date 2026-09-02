@@ -7,7 +7,7 @@ import math
 import time
 import uuid
 from collections import defaultdict, deque
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -374,6 +374,17 @@ class KalshiBroker(Broker):
             reasons.append("The kill switch is active.")
         if not self.session_armed:
             reasons.append(f"The {self.mode.title()} session is disarmed.")
+        protective_reasons: list[str] = []
+        if not credentials:
+            protective_reasons.append(
+                f"{self.mode.title()} trading credentials are not configured."
+            )
+        if not state.get("authenticated"):
+            protective_reasons.append("Account authentication is not verified.")
+        if state.get("kill_switch"):
+            protective_reasons.append("The kill switch is active.")
+        if not self.session_armed:
+            protective_reasons.append(f"The {self.mode.title()} session is disarmed.")
         return {
             "mode": self.mode,
             "credentials_configured": credentials,
@@ -388,6 +399,17 @@ class KalshiBroker(Broker):
             "limits_reviewed": bool(state.get("limits_reviewed_at")),
             "ready_for_manual": not reasons,
             "ready_for_automatic": not reasons and self.automatic_armed,
+            # Protective exits intentionally use a narrower lane.  A failed
+            # account-wide reconciliation blocks new exposure, but must not
+            # strand a known position when a reduce-only order can be sized
+            # from a targeted exchange read or durable fill ledger.
+            "ready_for_protective_exit": not protective_reasons,
+            "protective_exit_degraded": bool(
+                not state.get("reconciled") or state.get("reconciliation_required")
+            ),
+            "protective_exit_blocker": (
+                protective_reasons[0] if protective_reasons else None
+            ),
             "blocker": reasons[0] if reasons else None,
             "automatic_blocker": (
                 reasons[0]
@@ -486,6 +508,16 @@ class KalshiBroker(Broker):
                 "required": readiness["reconciliation_required"],
                 "last_reconciled_at": readiness["last_reconciled_at"],
                 "last_error": readiness["last_error"],
+            },
+            "protective_exit_state": {
+                "ready": readiness["ready_for_protective_exit"],
+                "degraded": readiness["protective_exit_degraded"],
+                "blocker": readiness["protective_exit_blocker"],
+                "warning": (
+                    "New entries are blocked until reconciliation completes. "
+                    "Protective exits use only confirmed position evidence."
+                    if readiness["protective_exit_degraded"] else None
+                ),
             },
             "stop_loss_state": {
                 "active_positions": len(stop_positions),
@@ -891,6 +923,102 @@ class KalshiBroker(Broker):
         )
         return row is not None
 
+    @staticmethod
+    def _is_protective_exit(intent: OrderIntent) -> bool:
+        return bool(
+            intent.action == "SELL"
+            and intent.decision_snapshot.get("protective_exit")
+        )
+
+    async def _safe_protective_exit_intent(self, intent: OrderIntent) -> OrderIntent:
+        """Size an exit from evidence that remains safe during a bad full refresh.
+
+        An unresolved sell has an unknown exchange outcome, so it is a hard
+        stop rather than an invitation to submit a second client id.  A healthy
+        targeted position read is preferred; confirmed, persisted fills are a
+        conservative fallback when only the account-wide refresh is down.
+        """
+        readiness = self.readiness()
+        if not readiness["ready_for_protective_exit"]:
+            raise ValueError(str(readiness["protective_exit_blocker"]))
+        unresolved = self.db.fetch_one(
+            """
+            SELECT client_order_id FROM broker_order_intents
+            WHERE mode=? AND ticker=? AND side=? AND action='SELL'
+              AND client_order_id<>?
+              AND status IN ('INTENT_CREATED','SUBMITTING','RECONCILIATION_REQUIRED',
+                             'ACKNOWLEDGED','RESTING','PARTIALLY_FILLED','CANCEL_PENDING')
+            LIMIT 1
+            """,
+            (self.mode, intent.ticker, intent.side, intent.client_order_id),
+        )
+        if unresolved:
+            raise ValueError(
+                "A prior protective exit has an unresolved client ID; waiting "
+                "for its exchange outcome to avoid an oversell."
+            )
+
+        quantity = 0
+        evidence = ""
+        lookup_error: Exception | None = None
+        targeted_lookup_succeeded = False
+        try:
+            assert self.client is not None
+            payload = await self.client.positions(ticker=intent.ticker)
+            targeted_lookup_succeeded = True
+            for row in payload.get("market_positions") or payload.get("positions") or []:
+                if str(row.get("ticker") or row.get("market_ticker") or "") != intent.ticker:
+                    continue
+                signed = _number(row.get("position_fp") or row.get("position"))
+                if (intent.side == "YES" and signed > 0) or (
+                    intent.side == "NO" and signed < 0
+                ):
+                    quantity = math.floor(abs(signed))
+                    evidence = "targeted_exchange_position"
+                    break
+        except Exception as exc:  # The durable ledger fallback below is intentional.
+            lookup_error = exc
+
+        # A successful zero-position response is authoritative.  Fall back to
+        # ledger fills only when the targeted exchange read itself is unavailable.
+        if not quantity and not targeted_lookup_succeeded:
+            fills = self.db.fetch_one(
+                """
+                SELECT COALESCE(SUM(CASE WHEN action='BUY' THEN contracts
+                                         WHEN action='SELL' THEN -contracts ELSE 0 END),0)
+                       AS contracts
+                FROM broker_fills WHERE mode=? AND ticker=? AND side=?
+                """,
+                (self.mode, intent.ticker, intent.side),
+            ) or {}
+            signed_fills = _number(fills.get("contracts"))
+            if signed_fills > 0:
+                quantity = math.floor(signed_fills)
+                evidence = "durable_confirmed_fills"
+
+        if quantity < 1:
+            detail = (
+                f" Targeted lookup failed: {lookup_error}." if lookup_error else ""
+            )
+            raise ValueError(
+                "Protective exit is deferred: no confirmed reducible contracts are "
+                f"available for {intent.ticker}/{intent.side}.{detail}"
+            )
+        safe_quantity = min(intent.contracts, quantity)
+        snapshot = {
+            **intent.decision_snapshot,
+            "protective_exit_quantity": safe_quantity,
+            "protective_exit_quantity_source": evidence,
+            "protective_exit_degraded": readiness["protective_exit_degraded"],
+        }
+        self._audit(
+            "PROTECTIVE_EXIT_EVIDENCE",
+            {"contracts": safe_quantity, "source": evidence,
+             "degraded": readiness["protective_exit_degraded"]},
+            intent=intent,
+        )
+        return replace(intent, contracts=safe_quantity, decision_snapshot=snapshot)
+
     def risk_check(
         self,
         intent: OrderIntent,
@@ -906,10 +1034,14 @@ class KalshiBroker(Broker):
         prefix = self.mode.lower()
         readiness = self.readiness()
         failures: list[str] = []
+        protective_exit = self._is_protective_exit(intent)
         ready_key = (
             "ready_for_automatic" if intent.source == "automatic" else "ready_for_manual"
         )
-        if not allow_unarmed and not readiness[ready_key]:
+        if protective_exit:
+            if not readiness["ready_for_protective_exit"]:
+                failures.append(str(readiness["protective_exit_blocker"] or "Protective exit is not ready."))
+        elif not allow_unarmed and not readiness[ready_key]:
             failures.append(
                 str(
                     readiness.get(
@@ -1053,6 +1185,15 @@ class KalshiBroker(Broker):
                         "The daily realized and unrealized loss limit is active."
                     )
         else:
+            if protective_exit:
+                return {
+                    "passed": not failures,
+                    "failures": failures,
+                    "primary_blocker": failures[0] if failures else None,
+                    "order_exposure": exposure,
+                    "remaining_allocation": remaining_allocation,
+                    "checked_at": iso_now(),
+                }
             position = self.db.fetch_one(
                 "SELECT contracts FROM broker_positions WHERE mode=? AND ticker=? AND side=? AND status='open'",
                 (self.mode, intent.ticker, intent.side),
@@ -1091,6 +1232,8 @@ class KalshiBroker(Broker):
         )
         if existing:
             return existing
+        if self._is_protective_exit(intent):
+            intent = await self._safe_protective_exit_intent(intent)
         now = iso_now()
         deadline = None
         if intent.cancel_after_seconds:

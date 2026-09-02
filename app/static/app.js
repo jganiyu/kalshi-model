@@ -642,6 +642,7 @@ function renderDashboard(data) {
   const paper = trading.selected || {};
   const modeName = modeLabel(trading.mode);
   const readiness = paper.readiness || {};
+  const protectiveExit = paper.protective_exit_state || {};
   $("#dashboard-trading-label").textContent = modeName.toUpperCase();
   $("#recent-trades-label").textContent = modeName.toUpperCase();
   $("#recent-trades-badge").textContent = trading.mode === "PAPER" ? "SIMULATED" : trading.mode;
@@ -2321,6 +2322,7 @@ async function loadPaper() {
     state.dashboard.trading = { ...state.dashboard.trading, ...trading };
   }
   const readiness = data.readiness || {};
+  const protectiveExit = data.protective_exit_state || {};
   $("#trading-page-title").textContent = modeLabel(mode);
   $("#trading-page-kicker").textContent = mode === "PAPER" ? "FORWARD TEST" : "KALSHI ACCOUNT";
   $("#trading-page-badge").textContent = mode === "PAPER" ? "SIMULATED ONLY" : mode;
@@ -2330,7 +2332,9 @@ async function loadPaper() {
   $("#position-section").hidden = mode === "PAPER";
   $("#trading-command-status").textContent = mode === "PAPER"
     ? "Paper is ready. No exchange order is placed."
-    : readiness.blocker || `${modeLabel(mode)} is reconciled and ${readiness.session_armed ? "armed" : "disarmed"}.`;
+    : protectiveExit.degraded && protectiveExit.ready
+      ? "Entries paused for reconciliation; confirmed reduce-only protective exits remain active."
+      : readiness.blocker || `${modeLabel(mode)} is reconciled and ${readiness.session_armed ? "armed" : "disarmed"}.`;
   $("#trading-command-status").classList.toggle("blocked", mode !== "PAPER" && !readiness.ready_for_manual);
   if (readiness.session_armed || state.trading.armConfirmation.mode !== mode) {
     clearTimeout(state.trading.armConfirmation.timer);
@@ -2380,7 +2384,7 @@ async function loadPaper() {
     const profitTake = data.profit_take_state || {};
     const stopState = data.stop_loss_state || {};
     const thresholdState = data.threshold_breach_exit_state || {};
-    $("#protection-warning").textContent = `${stopState.warning || "Stop-loss execution requires the Kalshi Model to remain running and connected."} ${profitTake.warning || "Profit taking requires an armed, reconciled connection."} ${thresholdState.warning || "Threshold Breach Exit uses the BTC proxy versus To Beat."}`;
+    $("#protection-warning").textContent = `${protectiveExit.warning || ""} ${stopState.warning || "Stop-loss execution requires the Kalshi Model to remain running and connected."} ${profitTake.warning || "Profit taking requires an armed, reconciled connection."} ${thresholdState.warning || "Threshold Breach Exit uses the BTC proxy versus To Beat."}`.trim();
     $("#position-table").innerHTML = (data.positions || []).length ? data.positions.map((position) => `
       <tr><td>${position.ticker}</td><td>${marketSideLabel(position.side)}</td><td>${position.contracts}</td>
       <td>${money(position.market_exposure)}</td><td>${position.stop_loss_price == null ? "Off" : cents(position.stop_loss_price)}</td>

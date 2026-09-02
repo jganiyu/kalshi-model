@@ -1259,6 +1259,120 @@ async def test_live_reconciliation_failure_pauses_then_resumes_trading(
 
 
 @run_async
+async def test_degraded_reconciliation_blocks_entries_but_uses_targeted_protective_exit(
+    tmp_path: Path,
+) -> None:
+    db = make_db(tmp_path)
+    coordinator = TradingCoordinator(
+        AppConfig(database_path=db.path), db, PaperTradingService(db)
+    )
+    broker = coordinator.broker("DEMO")
+    assert isinstance(broker, KalshiBroker)
+    client = FakeTradingClient()
+    client.remote_positions = [{
+        "ticker": "DEGRADED-EXIT", "position_fp": "3.00",
+        "market_exposure_dollars": "1.50", "last_updated_ts": iso_now(),
+    }]
+    broker.set_client(client)  # type: ignore[arg-type]
+    await broker.reconcile()
+    broker.arm(confirmation="ARM DEMO TRADING", automatic=True)
+    db.update_settings({"global_profit_take_enabled": True, "global_profit_take_price": .99})
+
+    async def failed_balance():
+        raise KalshiTradingError("account reconciliation unavailable")
+
+    client.balance = failed_balance  # type: ignore[method-assign]
+    with pytest.raises(KalshiTradingError):
+        await broker.reconcile()
+    readiness = broker.readiness()
+    assert readiness["ready_for_automatic"] is False
+    assert readiness["ready_for_protective_exit"] is True
+    assert readiness["protective_exit_degraded"] is True
+
+    await coordinator._process_exits(
+        broker,
+        {
+            "ticker": "DEGRADED-EXIT", "status": "active", "observed_at": iso_now(),
+            "time_remaining_seconds": 100, "yes_bid": .99, "no_bid": .01,
+            "data_quality": {"reliable": True},
+        },
+    )
+    await asyncio.gather(*list(coordinator._submission_tasks))
+    assert len(client.created) == 1
+    assert client.created[0]["reduce_only"] is True
+    assert client.created[0]["contracts"] == 3
+    intent = db.fetch_one(
+        "SELECT decision_snapshot_json FROM broker_order_intents WHERE ticker='DEGRADED-EXIT'"
+    ) or {}
+    evidence = json.loads(intent["decision_snapshot_json"])
+    assert evidence["protective_exit_quantity_source"] == "targeted_exchange_position"
+    assert evidence["protective_exit_degraded"] is True
+    entry = OrderIntent(
+        "DEMO", "NEW-ENTRY", "YES", "BUY", 1, .40, "STANDARD_EDGE", "automatic",
+        risk_snapshot={"data_reliable": True, "market_open": True},
+    )
+    assert broker.risk_check(entry)["passed"] is False
+    assert broker.portfolio()["protective_exit_state"]["degraded"] is True
+
+
+@run_async
+async def test_protective_exit_never_retries_while_prior_client_id_is_uncertain(
+    tmp_path: Path,
+) -> None:
+    db, broker, client = await ready_broker(tmp_path)
+    client.remote_positions = [{
+        "ticker": "UNCERTAIN-EXIT", "position_fp": "4.00",
+        "market_exposure_dollars": "2.00",
+    }]
+    db.execute(
+        """
+        INSERT INTO broker_order_intents(
+            mode,client_order_id,ticker,side,action,requested_contracts,limit_price,
+            status,strategy,source,created_at,updated_at
+        ) VALUES ('DEMO','prior-exit','UNCERTAIN-EXIT','YES','SELL',4,.01,
+                  'RECONCILIATION_REQUIRED','MANUAL','stop_loss',?,?)
+        """,
+        (iso_now(), iso_now()),
+    )
+    protected = OrderIntent(
+        "DEMO", "UNCERTAIN-EXIT", "YES", "SELL", 4, .01, "MANUAL", "stop_loss",
+        decision_snapshot={"protective_exit": True},
+    )
+    with pytest.raises(ValueError, match="unresolved client ID"):
+        await broker.submit(protected)
+    assert client.created == []
+
+
+@run_async
+async def test_protective_exit_uses_confirmed_fill_evidence_when_targeted_lookup_fails(
+    tmp_path: Path,
+) -> None:
+    db, broker, client = await ready_broker(tmp_path)
+    db.execute(
+        """
+        INSERT INTO broker_fills(
+            mode,fill_id,ticker,side,action,contracts,price,fee,filled_at
+        ) VALUES ('DEMO','durable-buy','DURABLE-EXIT','NO','BUY',2,.40,0,?)
+        """,
+        (iso_now(),),
+    )
+
+    async def failed_positions(**_: object):
+        raise KalshiTradingError("targeted position lookup unavailable")
+
+    client.positions = failed_positions  # type: ignore[method-assign]
+    protected = OrderIntent(
+        "DEMO", "DURABLE-EXIT", "NO", "SELL", 9, .01, "MANUAL", "stop_loss",
+        decision_snapshot={"protective_exit": True},
+    )
+    result = await broker.submit(protected)
+    assert result["requested_contracts"] == 2
+    assert client.created[0]["contracts"] == 2
+    evidence = json.loads(result["decision_snapshot_json"])
+    assert evidence["protective_exit_quantity_source"] == "durable_confirmed_fills"
+
+
+@run_async
 async def test_overlapping_reconciliations_are_coalesced(tmp_path: Path) -> None:
     db = make_db(tmp_path)
     client = FakeTradingClient()

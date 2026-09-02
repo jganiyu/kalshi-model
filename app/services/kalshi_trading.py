@@ -272,8 +272,12 @@ class KalshiTradingClient:
             query["cursor"] = cursor
         return {item_key: items, "cursor": ""}
 
-    async def positions(self, *, cursor: str | None = None) -> dict[str, Any]:
+    async def positions(
+        self, *, ticker: str | None = None, cursor: str | None = None
+    ) -> dict[str, Any]:
         params: dict[str, Any] = {}
+        if ticker:
+            params["ticker"] = ticker
         if cursor:
             params["cursor"] = cursor
         return await self._all_pages(
