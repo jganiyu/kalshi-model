@@ -33,6 +33,9 @@ class ApiTrading:
             portfolio.pop(key, None)
         return {"selected_mode": "DEMO", "selected": portfolio}
 
+    def schedule_process(self, _current=None):
+        return None
+
 
 def test_trading_api_exposes_isolated_structured_account_state(
     tmp_path: Path, monkeypatch,
@@ -77,6 +80,47 @@ def test_trading_api_exposes_isolated_structured_account_state(
         assert field not in selected_response.json()["selected"]
     assert audit.status_code == 200
     assert audit.json() == {"mode": "DEMO", "events": []}
+
+
+def test_arm_disarm_immediately_refreshes_dashboard_with_monotonic_readiness(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """A pre-action dashboard snapshot must not re-arm a confirmed disarm."""
+    db = Database(tmp_path / "arming.db")
+    db.initialize()
+    broker = KalshiBroker("DEMO", db)
+    broker._update_mode_state(authenticated=True, reconciled=True, reconciliation_required=False)
+    trading = ApiTrading(broker)
+    fake_engine = SimpleNamespace(trading=trading, dashboard={"current": None})
+
+    def refresh_trading_dashboard() -> None:
+        fake_engine.dashboard["trading"] = trading.summary()
+
+    fake_engine.refresh_trading_dashboard = refresh_trading_dashboard
+    monkeypatch.setattr(main, "engine", fake_engine)
+
+    async def request():
+        transport = httpx.ASGITransport(app=main.app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            armed = await client.post(
+                "/api/trading/DEMO/arm",
+                json={"confirmation": "ARM DEMO TRADING", "automatic": False},
+            )
+            # This represents a response already in flight before disarm.
+            stale_dashboard = dict(fake_engine.dashboard["trading"])
+            disarmed = await client.post("/api/trading/DEMO/disarm")
+        return armed, disarmed, stale_dashboard
+
+    armed, disarmed, stale_dashboard = asyncio.run(request())
+    assert armed.status_code == 200
+    assert disarmed.status_code == 200
+    assert armed.json()["arming_generation"] < disarmed.json()["arming_generation"]
+    assert stale_dashboard["selected"]["readiness"]["session_armed"] is True
+    assert fake_engine.dashboard["trading"]["selected"]["readiness"]["session_armed"] is False
+    assert (
+        stale_dashboard["selected"]["readiness"]["arming_generation"]
+        < fake_engine.dashboard["trading"]["selected"]["readiness"]["arming_generation"]
+    )
 
 
 def test_trading_ui_contains_mode_safety_and_confirmation_controls() -> None:
@@ -127,6 +171,8 @@ def test_trading_ui_contains_mode_safety_and_confirmation_controls() -> None:
     assert 'passButton.disabled = Boolean(pass.scheduled)' in script
     assert 'pass.passed ? "Pass following round" : "Pass next round"' in script
     assert 'button.textContent = "Next round passed"' in script
+    assert "preserveConfirmedArmingReadiness(dashboard)" in script
+    assert "arming_generation" in script
 
 
 def test_dashboard_theme_switch_reuses_persisted_theme_without_header_metadata() -> None:

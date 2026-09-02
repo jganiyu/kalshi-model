@@ -237,6 +237,10 @@ class KalshiBroker(Broker):
         self.client = client
         self.session_armed = False
         self.automatic_armed = False
+        # Dashboard snapshots are produced independently of the arm/disarm
+        # endpoints.  This monotonically increasing revision lets clients
+        # reject an older snapshot after a confirmed local safety action.
+        self._arming_generation = 0
         self._last_connection_at: float | None = None
         self._reconcile_lock = asyncio.Lock()
         self._reconcile_generation = 0
@@ -302,6 +306,7 @@ class KalshiBroker(Broker):
     def disarm(self, reason: str | None = None) -> None:
         self.session_armed = False
         self.automatic_armed = False
+        self._arming_generation += 1
         if reason:
             self._audit("DISARMED", {"reason": reason})
 
@@ -322,13 +327,17 @@ class KalshiBroker(Broker):
             raise ValueError("Release the kill switch before arming.")
         self.session_armed = True
         self.automatic_armed = bool(automatic)
+        self._arming_generation += 1
         self._audit("ARMED", {"automatic": self.automatic_armed})
         return self.readiness()
 
     def set_automatic_armed(self, enabled: bool) -> dict[str, Any]:
         if enabled and not self.session_armed:
             raise ValueError(f"Arm the {self.mode.title()} session first.")
-        self.automatic_armed = bool(enabled)
+        requested = bool(enabled)
+        if self.automatic_armed != requested:
+            self._arming_generation += 1
+        self.automatic_armed = requested
         self._audit("AUTOMATIC_ARMING_CHANGED", {"enabled": self.automatic_armed})
         return self.readiness()
 
@@ -395,6 +404,7 @@ class KalshiBroker(Broker):
             "reconciliation_required": bool(state.get("reconciliation_required")),
             "session_armed": self.session_armed,
             "automatic_armed": self.automatic_armed,
+            "arming_generation": self._arming_generation,
             "kill_switch": bool(state.get("kill_switch")),
             "demo_verified": bool(state.get("demo_verified_at")),
             "limits_reviewed": bool(state.get("limits_reviewed_at")),

@@ -428,6 +428,11 @@ class AnalysisEngine:
     def unsubscribe(self, queue: asyncio.Queue[None]) -> None:
         self._subscribers.discard(queue)
 
+    def refresh_trading_dashboard(self) -> None:
+        """Publish current broker safety state without waiting for a market tick."""
+        self.dashboard["trading"] = self.trading.summary(self.dashboard.get("current"))
+        self._schedule_publish()
+
     def _schedule_publish(self) -> None:
         if self._publish_task and not self._publish_task.done():
             return
