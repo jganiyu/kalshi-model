@@ -120,6 +120,13 @@ def test_trading_ui_contains_mode_safety_and_confirmation_controls() -> None:
     assert 'api("/api/calibration/evidence")' in script
     assert "Loading evidence in background" in script
     assert "if (!portfolio.readiness?.reconciled)" in script
+    assert "applyConfirmedTradingReadiness(mode, readiness)" in script
+    assert "refreshTradingControlData()" in script
+    assert '"Disarming…"' in script
+    assert 'void loadPaper().catch(() => {});' in script
+    assert 'passButton.disabled = Boolean(pass.scheduled)' in script
+    assert 'pass.passed ? "Pass following round" : "Pass next round"' in script
+    assert 'button.textContent = "Next round passed"' in script
 
 
 def test_dashboard_theme_switch_reuses_persisted_theme_without_header_metadata() -> None:

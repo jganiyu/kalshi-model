@@ -24,7 +24,7 @@ const state = {
   paperReset: { confirming: false, resetting: false, timer: null },
   trading: {
     mode: "PAPER", pendingConfirmation: null, switching: false,
-    armConfirmation: { mode: null, confirming: false, submitting: false, timer: null },
+    armConfirmation: { mode: null, confirming: false, submitting: false, action: null, timer: null },
   },
   tradeReview: {
     tradeRef: null, mode: null, data: null, chartMode: "btc",
@@ -533,10 +533,13 @@ function renderTexasHoldemHud(texas = {}) {
     || (texas.status === "ENTERED" ? "Position entered. Watching the active street exit." : "Opening play is active.");
   const passButton = $("#texas-pass-next-round");
   const pass = texas.pass || {};
-  passButton.disabled = Boolean(pass.passed || pass.scheduled);
-  passButton.textContent = pass.passed
-    ? "Round passed"
-    : pass.scheduled ? "Next round passed" : "Pass next round";
+  // A consumed pass belongs to this market, so it must not prevent the user
+  // from passing the following market.  Only an already-scheduled following
+  // market disables the one-shot control.
+  passButton.disabled = Boolean(pass.scheduled);
+  passButton.textContent = pass.scheduled
+    ? "Next round passed"
+    : pass.passed ? "Pass following round" : "Pass next round";
   const values = {
     "#texas-flop-target": texas.targets?.flop,
     "#texas-flop-stop": texas.targets?.flop_stop,
@@ -586,10 +589,14 @@ async function updateTexasQuickSetting(event) {
 async function passTexasHoldemNextRound() {
   const button = $("#texas-pass-next-round");
   button.disabled = true;
+  button.textContent = "Passing next round…";
   try {
-    const state = await api("/api/texas-holdem/pass-next-round", { method: "POST" });
-    await refreshDashboard();
-    showToast("Next Texas round passed", `The ${state.environment} session remains armed.`);
+    const passState = await api("/api/texas-holdem/pass-next-round", { method: "POST" });
+    // Confirm the action immediately; the normal dashboard refresh will
+    // subsequently reconcile the full Texas state without delaying feedback.
+    button.textContent = "Next round passed";
+    showToast("Next Texas round passed", `The ${passState.environment} session remains armed.`);
+    refreshDashboard();
   } catch (error) {
     showToast("Texas round not passed", error.message);
     await refreshDashboard();
@@ -1065,15 +1072,33 @@ async function reconcileSelectedTrading() {
 function syncArmButton(readiness = selectedTrading().selected?.readiness || {}, mode = selectedTrading().mode) {
   const confirmation = state.trading.armConfirmation;
   const pending = confirmation.confirming && confirmation.mode === mode && !readiness.session_armed;
+  const submitting = confirmation.submitting && confirmation.mode === mode;
   $$('[data-arm-session]').forEach((button) => {
     button.hidden = mode === "PAPER";
     button.classList.toggle("confirming", pending);
     button.classList.toggle("armed", Boolean(readiness.session_armed));
-    button.disabled = confirmation.submitting;
+    button.disabled = submitting;
     button.textContent = readiness.session_armed
-      ? "Disarm session"
-      : confirmation.submitting ? "Arming…" : pending ? "Confirm" : "Arm session";
+      ? submitting && confirmation.action === "disarm" ? "Disarming…" : "Disarm session"
+      : submitting ? "Arming…" : pending ? "Confirm" : "Arm session";
   });
+}
+
+// Arm/disarm are local, durable state changes.  Do not make their visible
+// confirmation wait for the slower dashboard/chart and account reloads.
+function applyConfirmedTradingReadiness(mode, readiness) {
+  const trading = state.dashboard?.trading;
+  if (!trading || !readiness) return;
+  if (trading.modes?.[mode]) trading.modes[mode] = { ...trading.modes[mode], readiness };
+  if (trading.selected_mode === mode && trading.selected) {
+    trading.selected = { ...trading.selected, readiness };
+  }
+  renderDashboard(state.dashboard);
+}
+
+function refreshTradingControlData() {
+  void refreshDashboard();
+  void loadPaper().catch(() => {});
 }
 
 function resetArmConfirmation() {
@@ -1082,6 +1107,7 @@ function resetArmConfirmation() {
   confirmation.mode = null;
   confirmation.confirming = false;
   confirmation.submitting = false;
+  confirmation.action = null;
   confirmation.timer = null;
   syncArmButton();
 }
@@ -1091,9 +1117,22 @@ async function armSelectedTrading() {
   if (mode === "PAPER") return;
   if (selected?.readiness?.session_armed) {
     resetArmConfirmation();
-    await api(`/api/trading/${mode}/disarm`, { method: "POST" });
-    await refreshDashboard();
-    await loadPaper();
+    const confirmation = state.trading.armConfirmation;
+    confirmation.mode = mode;
+    confirmation.submitting = true;
+    confirmation.action = "disarm";
+    syncArmButton(selected?.readiness, mode);
+    try {
+      const readiness = await api(`/api/trading/${mode}/disarm`, { method: "POST" });
+      applyConfirmedTradingReadiness(mode, readiness);
+      showToast(`${modeLabel(mode)} disarmed`, "New orders are no longer authorized for this session.");
+      refreshTradingControlData();
+    } catch (error) {
+      showToast("Session remains armed", error.message);
+      refreshTradingControlData();
+    } finally {
+      resetArmConfirmation();
+    }
     return;
   }
 
@@ -1113,17 +1152,19 @@ async function armSelectedTrading() {
 
   clearTimeout(confirmationState.timer);
   confirmationState.submitting = true;
+  confirmationState.action = "arm";
   syncArmButton(selected?.readiness, mode);
   const phrase = mode === "LIVE" ? "ARM LIVE TRADING" : "ARM DEMO TRADING";
   try {
-    await api(`/api/trading/${mode}/arm`, {
+    const readiness = await api(`/api/trading/${mode}/arm`, {
       method: "POST", body: JSON.stringify({ confirmation: phrase, automatic: false }),
     });
-    await refreshDashboard();
-    await loadPaper();
+    applyConfirmedTradingReadiness(mode, readiness);
     showToast(`${modeLabel(mode)} armed`, "Manual limit orders are now authorized for this session.");
+    refreshTradingControlData();
   } catch (error) {
     showToast("Session not armed", error.message);
+    refreshTradingControlData();
   } finally {
     resetArmConfirmation();
   }

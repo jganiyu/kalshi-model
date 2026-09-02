@@ -142,6 +142,14 @@ def test_texas_pass_skips_only_next_round_persists_and_keeps_environment_isolate
     assert demo_passed["status"] == "PASSED"
     assert "next round remains eligible" in demo_passed["blocker"]
 
+    # A consumed pass does not lock the control: while the passed market is
+    # current, schedule exactly its following market for a separate pass.
+    following = restored.texas_holdem_pass_next_round(
+        environment="DEMO", source_ticker="DEMO-TEXAS",
+        market_open_time="2026-09-01T12:00:00+00:00",
+    )
+    assert following["target_open_time"].startswith("2026-09-01T12:15:00")
+
     next_round = restored._texas_holdem_state(
         ticker="DEMO-NEXT", assessments=quotes, opening_elapsed=1,
         seconds_remaining=899, threshold_margin_dollars=10,
@@ -151,7 +159,7 @@ def test_texas_pass_skips_only_next_round_persists_and_keeps_environment_isolate
         execution_block_reason=None, entry_exists=False, model_version="test",
         fixed_entry_handler=lambda **_: (True, .45), execution_risk_by_side={},
     )
-    assert next_round["status"] != "PASSED"
+    assert next_round["status"] == "PASSED"
 
 
 def test_phase_boundaries_and_exit_targets() -> None:
