@@ -2634,6 +2634,73 @@ async def test_failed_private_stream_task_wakes_its_recovery_loop(
 
 
 @run_async
+async def test_private_fill_is_adopted_during_full_reconciliation_outage(
+    tmp_path: Path,
+) -> None:
+    db, broker, client = await ready_broker(tmp_path)
+    intent = OrderIntent("DEMO", "PRIVATE-FILL", "YES", "BUY", 5, .37, "TEXAS_HOLDEM", "automatic")
+    submitted = await broker.submit(intent)
+
+    async def fills_unavailable(**_: object):
+        raise KalshiTradingError("Kalshi timeout while reading /portfolio/fills.", transport=True)
+
+    client.fills = fills_unavailable  # type: ignore[method-assign]
+    with pytest.raises(KalshiTradingError):
+        await broker.reconcile()
+
+    message = {
+        "type": "fill",
+        "msg": {
+            "fill_id": "private-fill-1", "order_id": submitted["exchange_order_id"],
+            "client_order_id": intent.client_order_id, "ticker": "PRIVATE-FILL",
+            "outcome_side": "yes", "book_side": "bid", "action": "buy",
+            "count_fp": "5.00", "yes_price_dollars": "0.3700",
+            "fee_cost_dollars": "0.0100", "created_time": iso_now(),
+        },
+    }
+    broker.adopt_private_event(message)
+    order = db.fetch_one("SELECT status,filled_contracts FROM broker_orders WHERE mode='DEMO' AND exchange_order_id=?", (submitted["exchange_order_id"],))
+    attempt = db.fetch_one("SELECT status FROM broker_order_intents WHERE mode='DEMO' AND client_order_id=?", (intent.client_order_id,))
+    assert order == {"status": "FILLED", "filled_contracts": 5.0}
+    assert attempt == {"status": "FILLED"}
+    assert broker.readiness()["reconciled"] is False
+
+
+@run_async
+async def test_private_fill_replay_is_exactly_once_and_stale_order_cannot_regress_it(
+    tmp_path: Path,
+) -> None:
+    db, broker, _ = await ready_broker(tmp_path)
+    intent = OrderIntent("DEMO", "PRIVATE-REPLAY", "YES", "BUY", 2, .40, "MANUAL", "manual")
+    result = await broker.submit(intent)
+    fill = {
+        "type": "fill",
+        "msg": {
+            "fill_id": "private-replay-fill", "order_id": result["exchange_order_id"],
+            "client_order_id": intent.client_order_id, "ticker": "PRIVATE-REPLAY",
+            "outcome_side": "yes", "book_side": "bid", "action": "buy",
+            "count_fp": "2.00", "yes_price_dollars": "0.4000", "created_time": iso_now(),
+        },
+    }
+    broker.adopt_private_event(fill)
+    broker.adopt_private_event(fill)
+    broker.adopt_private_event({
+        "type": "user_order",
+        "msg": {
+            "order_id": result["exchange_order_id"], "client_order_id": intent.client_order_id,
+            "ticker": "PRIVATE-REPLAY", "outcome_side": "yes", "book_side": "bid",
+            "action": "buy", "status": "resting", "initial_count_fp": "2.00",
+            "fill_count_fp": "0.00", "remaining_count_fp": "2.00", "yes_price_dollars": "0.4000",
+        },
+    })
+    order = db.fetch_one("SELECT status,filled_contracts,remaining_contracts FROM broker_orders WHERE mode='DEMO' AND exchange_order_id=?", (result["exchange_order_id"],))
+    assert order == {"status": "FILLED", "filled_contracts": 2.0, "remaining_contracts": 0.0}
+    assert db.fetch_one("SELECT COUNT(*) count FROM broker_fills WHERE mode='DEMO' AND fill_id='private-replay-fill'") == {"count": 1}
+    events = [item for item in broker.audit_history(50) if item["event_type"] == "FILL_RECORDED"]
+    assert len([item for item in events if item["detail"]["fill_id"] == "private-replay-fill"]) == 1
+
+
+@run_async
 async def test_swing_metadata_is_preserved_in_exchange_intent(tmp_path: Path) -> None:
     db = make_db(tmp_path)
     coordinator = TradingCoordinator(
@@ -2709,3 +2776,74 @@ async def test_texas_entry_is_marketable_ioc_but_never_exceeds_cap(tmp_path: Pat
     assert client.created[0]["limit_price"] == pytest.approx(.50)
     assert client.created[0]["time_in_force"] == "immediate_or_cancel"
     assert client.created[0]["exchange_index"] == 7
+
+
+@run_async
+async def test_confirmed_texas_ack_survives_failed_full_reconciliation(tmp_path: Path) -> None:
+    db = make_db(tmp_path)
+    coordinator = TradingCoordinator(
+        AppConfig(database_path=db.path), db, PaperTradingService(db)
+    )
+    broker = coordinator.broker("DEMO")
+    assert isinstance(broker, KalshiBroker)
+    client = FakeTradingClient()
+    broker.set_client(client)  # type: ignore[arg-type]
+    await broker.reconcile()
+    broker.arm(confirmation="ARM DEMO TRADING", automatic=True)
+    now = iso_now()
+    db.execute(
+        """
+        INSERT INTO texas_holdem_rounds(
+            environment,ticker,side,status,entry_price_cap,target_contracts,
+            flop_target,turn_target,river_target,river_stop,created_at,updated_at
+        ) VALUES ('DEMO','ACK-TEXAS','YES','ATTEMPTING',.50,5,.60,.50,.95,.60,?,?)
+        """,
+        (now, now),
+    )
+    round_id = db.fetch_one(
+        "SELECT id FROM texas_holdem_rounds WHERE environment='DEMO' AND ticker='ACK-TEXAS'"
+    )["id"]
+    db.execute(
+        """
+        INSERT INTO texas_holdem_attempts(
+            round_id,attempt_number,observed_at,side,executable_price,
+            requested_contracts,status,evidence_json
+        ) VALUES (?,1,?,'YES',.50,5,'ATTEMPTING','{}')
+        """,
+        (round_id, now),
+    )
+
+    async def acknowledged(**payload):
+        client.created.append(payload)
+        return {
+            "order_id": "ack-texas-order", "client_order_id": payload["client_order_id"],
+            "ticker": payload["ticker"], "fill_count": "5.00",
+            "remaining_count": "0.00", "average_fill_price": ".3700",
+        }
+
+    async def failed_fills(**_):
+        raise KalshiTradingError("Kalshi timeout while reading /portfolio/fills.")
+
+    client.create_order = acknowledged  # type: ignore[method-assign]
+    client.fills = failed_fills  # type: ignore[method-assign]
+    intent = OrderIntent(
+        "DEMO", "ACK-TEXAS", "YES", "BUY", 5, .50, "TEXAS_HOLDEM", "automatic",
+        time_in_force="immediate_or_cancel",
+        decision_snapshot={"strategy_metadata": {"attempt_number": 1}, "entry_price_cap": .50},
+        risk_snapshot={"spread": .01, "liquidity": 20, "data_quality": "High",
+                       "data_reliable": True, "market_open": True},
+    )
+    await coordinator._submit_and_attach_position(intent)
+    attempt = db.fetch_one(
+        "SELECT status,filled_contracts,blocker FROM texas_holdem_attempts WHERE round_id=? AND attempt_number=1",
+        (round_id,),
+    )
+    assert attempt["status"] == "FILLED"
+    assert attempt["filled_contracts"] == pytest.approx(5)
+    assert attempt["blocker"].startswith("Filled; account sync pending:")
+    assert db.fetch_one(
+        "SELECT status,filled_contracts FROM broker_orders WHERE mode='DEMO' AND exchange_order_id='ack-texas-order'"
+    ) == {"status": "FILLED", "filled_contracts": 5.0}
+    assert db.fetch_one(
+        "SELECT contracts,status FROM broker_positions WHERE mode='DEMO' AND ticker='ACK-TEXAS' AND side='YES'"
+    ) == {"contracts": 5.0, "status": "open"}

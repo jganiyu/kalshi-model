@@ -370,6 +370,12 @@ class KalshiTradingClient:
                 return order
         return None
 
+    async def order(self, order_id: str) -> dict[str, Any] | None:
+        """Read one order without paginating the account order history."""
+        payload = await self._request("GET", f"/portfolio/orders/{quote(order_id, safe='')}")
+        order = payload.get("order")
+        return order if isinstance(order, dict) else payload if isinstance(payload, dict) else None
+
     async def create_order(
         self,
         *,

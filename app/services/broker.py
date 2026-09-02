@@ -1376,6 +1376,13 @@ class KalshiBroker(Broker):
                 "source": intent.source,
             }
         )
+        # A create-order response with a non-zero fill count is already
+        # authenticated exchange evidence.  Do not make an open Texas
+        # position wait for the slower, account-wide fills history endpoint.
+        # Reconciliation will later replace this conservative local position
+        # with the authoritative account snapshot.
+        if intent.strategy == "TEXAS_HOLDEM" and intent.action == "BUY" and fill_count > 0:
+            self._adopt_texas_acknowledged_fill(intent, fill_count)
         self._audit("SUBMISSION_ACKNOWLEDGED", response, intent=intent, exchange_order_id=exchange_order_id)
         return self.db.fetch_one(
             "SELECT * FROM broker_order_intents WHERE mode=? AND client_order_id=?",
@@ -1421,6 +1428,77 @@ class KalshiBroker(Broker):
             result = await self._reconcile_once()
             self._reconcile_generation += 1
             return result
+
+    def adopt_private_event(self, event: dict[str, Any]) -> dict[str, str | None]:
+        """Durably apply a private-stream fact without requiring account-wide REST.
+
+        WebSocket messages are advisory only for account completeness, but an
+        order or fill they contain is exchange evidence.  Applying it here lets
+        the UI and protective logic advance during a slow `/portfolio/fills`
+        refresh.  The normal upserts make replay safe.
+        """
+        kind = str(event.get("type") or "").lower()
+        payload = event.get("msg") or event.get("data") or event
+        if not isinstance(payload, dict):
+            return {"kind": kind, "order_id": None, "ticker": None}
+        # Some Kalshi envelopes wrap the actual resource one level deeper.
+        if kind == "user_order" and isinstance(payload.get("order"), dict):
+            payload = payload["order"]
+        elif kind == "fill" and isinstance(payload.get("fill"), dict):
+            payload = payload["fill"]
+        elif kind == "market_position" and isinstance(payload.get("position"), dict):
+            payload = payload["position"]
+
+        exchange_id = str(payload.get("order_id") or payload.get("exchange_order_id") or "") or None
+        ticker = str(payload.get("ticker") or payload.get("market_ticker") or "") or None
+        if kind == "user_order":
+            self._upsert_order(payload)
+        elif kind == "fill":
+            self._upsert_fill(payload)
+        elif kind == "market_position":
+            self._upsert_position(payload)
+        else:
+            return {"kind": kind, "order_id": exchange_id, "ticker": ticker}
+        self._audit(
+            "PRIVATE_EVENT_ADOPTED",
+            {"kind": kind, "has_order_id": bool(exchange_id), "has_ticker": bool(ticker)},
+            exchange_order_id=exchange_id,
+            ticker=ticker,
+        )
+        return {"kind": kind, "order_id": exchange_id, "ticker": ticker}
+
+    async def recover_private_event(
+        self, *, order_id: str | None, ticker: str | None
+    ) -> None:
+        """Best-effort narrow confirmation after a private event.
+
+        This deliberately does not change reconciliation readiness or wait for
+        historical fills.  It is a small correctness upgrade if an event was
+        truncated/out of order; full reconciliation remains the account audit.
+        """
+        if self.client is None:
+            return
+        calls: list[tuple[str, Any]] = []
+        exact_order = getattr(self.client, "order", None)
+        if order_id and callable(exact_order):
+            calls.append(("order", exact_order(order_id)))
+        if ticker:
+            calls.append(("position", self.client.positions(ticker=ticker)))
+        if not calls:
+            return
+        results = await asyncio.gather(*(call for _, call in calls), return_exceptions=True)
+        for (name, _), result in zip(calls, results):
+            if isinstance(result, Exception):
+                self._audit("PRIVATE_EVENT_RECOVERY_FAILED", {
+                    "resource": name, "error": str(result),
+                }, exchange_order_id=order_id, ticker=ticker)
+                continue
+            if name == "order" and isinstance(result, dict):
+                self._upsert_order(result)
+            elif name == "position" and isinstance(result, dict):
+                for position in result.get("market_positions") or result.get("positions") or []:
+                    if isinstance(position, dict):
+                        self._upsert_position(position)
 
     async def _reconcile_once(self) -> dict[str, Any]:
         if self.client is None:
@@ -2005,6 +2083,17 @@ class KalshiBroker(Broker):
             max(0.0, requested - filled),
         )
         status = self._order_status(order) if str(order.get("status") or "").upper() not in OPEN_ORDER_STATES | FINAL_ORDER_STATES else str(order["status"]).upper()
+        # Private events and REST pages can arrive out of order.  A stale
+        # resting/canceled snapshot may not erase a previously confirmed fill.
+        previous_filled = _number((previous or {}).get("filled_contracts"))
+        if previous_filled > filled:
+            filled = previous_filled
+            requested = max(requested, _number((previous or {}).get("requested_contracts")))
+            remaining = max(0.0, requested - filled)
+        if (previous or {}).get("status") in {"FILLED", "SETTLED"}:
+            status = str(previous["status"])
+            filled = max(filled, previous_filled)
+            remaining = _number((previous or {}).get("remaining_contracts"))
         # Kalshi continues returning settled BUY orders as `executed`. Settlement
         # is a stronger local terminal state, so never regress it to FILLED.
         if status == "FILLED" and action == "BUY":
@@ -2062,6 +2151,64 @@ class KalshiBroker(Broker):
                 exchange_order_id=exchange_id,
                 ticker=str(order.get("ticker") or ""),
             )
+
+    def _adopt_texas_acknowledged_fill(
+        self, intent: OrderIntent, fill_count: float
+    ) -> None:
+        """Make a confirmed Texas entry protectable before full sync succeeds."""
+        rows = self.db.fetch_all(
+            """
+            SELECT filled_contracts,average_fill_price,limit_price FROM broker_orders
+            WHERE mode=? AND ticker=? AND side=? AND action='BUY'
+              AND strategy='TEXAS_HOLDEM' AND filled_contracts>0
+            """,
+            (self.mode, intent.ticker, intent.side),
+        )
+        confirmed = sum(_number(row.get("filled_contracts")) for row in rows)
+        # The just-upserted order is normally included above.  Keep this
+        # fallback for a malformed exchange acknowledgement with no order ID.
+        confirmed = max(confirmed, fill_count)
+        existing = self.db.fetch_one(
+            "SELECT * FROM broker_positions WHERE mode=? AND ticker=? AND side=?",
+            (self.mode, intent.ticker, intent.side),
+        ) or {}
+        if confirmed <= _number(existing.get("contracts")):
+            return
+        weighted_value = sum(
+            _number(row.get("filled_contracts"))
+            * _number(row.get("average_fill_price") or row.get("limit_price"))
+            for row in rows
+        )
+        average_price = weighted_value / confirmed if confirmed else None
+        now = iso_now()
+        self.db.execute(
+            """
+            INSERT INTO broker_positions(
+                mode,ticker,side,contracts,average_price,market_exposure,realized_pnl,
+                fees,strategy,source,opened_at,updated_at,status
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(mode,ticker,side) DO UPDATE SET
+                contracts=CASE WHEN excluded.contracts>broker_positions.contracts
+                    THEN excluded.contracts ELSE broker_positions.contracts END,
+                average_price=CASE WHEN excluded.contracts>broker_positions.contracts
+                    THEN excluded.average_price ELSE broker_positions.average_price END,
+                market_exposure=CASE WHEN excluded.contracts>broker_positions.contracts
+                    THEN excluded.market_exposure ELSE broker_positions.market_exposure END,
+                strategy=COALESCE(broker_positions.strategy,excluded.strategy),
+                source=COALESCE(broker_positions.source,excluded.source),
+                updated_at=excluded.updated_at,status='open'
+            """,
+            (
+                self.mode, intent.ticker, intent.side, confirmed, average_price,
+                confirmed * _number(average_price), 0, 0, intent.strategy,
+                intent.source, now, now, "open",
+            ),
+        )
+        self._audit(
+            "ACKNOWLEDGED_FILL_ADOPTED",
+            {"filled_contracts": confirmed, "average_fill_price": average_price},
+            intent=intent,
+        )
 
     def _upsert_fill(
         self, fill: dict[str, Any], *, available_cash_after: float | None = None
@@ -2201,6 +2348,57 @@ class KalshiBroker(Broker):
                 ticker=str(fill.get("ticker") or (order or {}).get("ticker") or ""),
             )
 
+    def _upsert_position(self, position: dict[str, Any]) -> None:
+        """Apply one position event without closing unrelated positions."""
+        signed = _number(position.get("position_fp") or position.get("position"))
+        ticker = str(position.get("ticker") or position.get("market_ticker") or "")
+        if not ticker:
+            return
+        if abs(signed) < 1e-9:
+            self.db.execute(
+                """
+                UPDATE broker_positions SET contracts=0,market_exposure=0,
+                    realized_pnl=?,fees=?,updated_at=?,status='closed'
+                WHERE mode=? AND ticker=? AND status='open'
+                """,
+                (
+                    _number(position.get("realized_pnl_dollars") or position.get("realized_pnl")),
+                    _number(position.get("fees_paid_dollars") or position.get("fees_paid")),
+                    str(position.get("last_updated_ts") or iso_now()), self.mode, ticker,
+                ),
+            )
+            return
+        side = "YES" if signed > 0 else "NO"
+        contracts = abs(signed)
+        existing = self.db.fetch_one(
+            "SELECT * FROM broker_positions WHERE mode=? AND ticker=? AND side=?",
+            (self.mode, ticker, side),
+        ) or {}
+        exposure = abs(_number(position.get("market_exposure_dollars") or position.get("market_exposure")))
+        average_price = exposure / contracts if contracts else None
+        self.db.execute(
+            """
+            INSERT INTO broker_positions(
+                mode,ticker,side,contracts,average_price,market_exposure,realized_pnl,
+                fees,strategy,source,stop_loss_price,target_exit_price,
+                fallback_exit_mode,fallback_exit_seconds,opened_at,updated_at,status
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(mode,ticker,side) DO UPDATE SET
+                contracts=excluded.contracts,average_price=excluded.average_price,
+                market_exposure=excluded.market_exposure,realized_pnl=excluded.realized_pnl,
+                fees=excluded.fees,updated_at=excluded.updated_at,status='open'
+            """,
+            (
+                self.mode, ticker, side, contracts, average_price, exposure,
+                _number(position.get("realized_pnl_dollars") or position.get("realized_pnl")),
+                _number(position.get("fees_paid_dollars") or position.get("fees_paid")),
+                existing.get("strategy"), existing.get("source"), existing.get("stop_loss_price"),
+                existing.get("target_exit_price"), existing.get("fallback_exit_mode"),
+                existing.get("fallback_exit_seconds"), existing.get("opened_at") or iso_now(),
+                str(position.get("last_updated_ts") or iso_now()), "open",
+            ),
+        )
+
     def _replace_positions(self, positions: list[dict[str, Any]]) -> None:
         active: set[tuple[str, str]] = set()
         for position in positions:
@@ -2240,38 +2438,8 @@ class KalshiBroker(Broker):
                     )
                 continue
             side = "YES" if signed > 0 else "NO"
-            contracts = abs(signed)
             active.add((ticker, side))
-            existing = self.db.fetch_one(
-                "SELECT * FROM broker_positions WHERE mode=? AND ticker=? AND side=?",
-                (self.mode, ticker, side),
-            ) or {}
-            exposure = abs(_number(
-                position.get("market_exposure_dollars") or position.get("market_exposure")
-            ))
-            average_price = exposure / contracts if contracts else None
-            self.db.execute(
-                """
-                INSERT INTO broker_positions(
-                    mode,ticker,side,contracts,average_price,market_exposure,realized_pnl,
-                    fees,strategy,source,stop_loss_price,target_exit_price,
-                    fallback_exit_mode,fallback_exit_seconds,opened_at,updated_at,status
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-                ON CONFLICT(mode,ticker,side) DO UPDATE SET
-                    contracts=excluded.contracts,average_price=excluded.average_price,
-                    market_exposure=excluded.market_exposure,realized_pnl=excluded.realized_pnl,
-                    fees=excluded.fees,updated_at=excluded.updated_at,status='open'
-                """,
-                (
-                    self.mode, ticker, side, contracts, average_price, exposure,
-                    _number(position.get("realized_pnl_dollars") or position.get("realized_pnl")),
-                    _number(position.get("fees_paid_dollars") or position.get("fees_paid")),
-                    existing.get("strategy"), existing.get("source"), existing.get("stop_loss_price"),
-                    existing.get("target_exit_price"), existing.get("fallback_exit_mode"),
-                    existing.get("fallback_exit_seconds"), existing.get("opened_at") or iso_now(),
-                    str(position.get("last_updated_ts") or iso_now()), "open",
-                ),
-            )
+            self._upsert_position(position)
         existing_rows = self.db.fetch_all(
             "SELECT ticker,side FROM broker_positions WHERE mode=? AND status='open'", (self.mode,)
         )

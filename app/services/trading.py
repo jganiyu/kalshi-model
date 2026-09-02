@@ -251,10 +251,21 @@ class TradingCoordinator:
             else self.config.kalshi_live_ws_url
         )
 
-        async def on_message(_: dict[str, Any]) -> None:
-            # Never stop consuming private fills/orders while a slow full
-            # account refresh is in flight. One owned recovery loop coalesces
-            # bursts and backfills authoritative exchange state.
+        async def on_message(message: dict[str, Any]) -> None:
+            # Apply exchange-confirmed activity immediately.  A slow full
+            # account refresh must not make a confirmed fill invisible.
+            recovered = broker.adopt_private_event(message)
+            # A targeted read is deliberately independent of full history. It
+            # verifies incomplete/out-of-order events without blocking socket
+            # consumption or claiming that the account is reconciled.
+            task = asyncio.create_task(
+                broker.recover_private_event(
+                    order_id=recovered.get("order_id"), ticker=recovered.get("ticker")
+                )
+            )
+            self._submission_tasks.add(task)
+            task.add_done_callback(self._submission_tasks.discard)
+            # Full reconciliation remains the eventual account-wide backfill.
             self._reconciliation_wake[mode].set()
 
         async def on_status(_: str, connected: bool, error: str | None) -> None:
@@ -1071,18 +1082,21 @@ class TradingCoordinator:
         submit_started_at = time.time()
         try:
             result = await broker.submit(intent)
-            await broker.reconcile()
             if intent.strategy == "TEXAS_HOLDEM" and intent.action == "BUY":
                 attempt_number = int(
                     (intent.decision_snapshot.get("strategy_metadata") or {}).get(
                         "attempt_number", 0
                     ) or 0
                 )
+                # The signed create-order acknowledgement is durable exchange
+                # evidence.  A later account-history timeout must not turn it
+                # into a zero-fill/rejected Texas attempt.
                 fill = self.db.fetch_one(
                     """
-                    SELECT COALESCE(SUM(contracts),0) amount
-                    FROM broker_fills
+                    SELECT filled_contracts AS amount,average_fill_price
+                    FROM broker_orders
                     WHERE mode=? AND client_order_id=? AND action='BUY'
+                    ORDER BY id DESC LIMIT 1
                     """,
                     (intent.mode, intent.client_order_id),
                 ) or {}
@@ -1239,6 +1253,37 @@ class TradingCoordinator:
                             filled, position.get("average_price"), position.get("fees") or 0,
                             round_status, datetime_now(), intent.mode, intent.ticker,
                         ),
+                    )
+            # Full reconciliation is an audit/backfill, never a prerequisite
+            # for retaining an acknowledged Texas fill.
+            try:
+                await broker.reconcile()
+            except (KalshiTradingError, ValueError) as exc:
+                if intent.strategy == "TEXAS_HOLDEM" and intent.action == "BUY":
+                    sync_message = f"Filled; account sync pending: {exc}"
+                    attempt_number = int(
+                        (intent.decision_snapshot.get("strategy_metadata") or {}).get(
+                            "attempt_number", 0
+                        ) or 0
+                    )
+                    if attempt_number:
+                        self.db.execute(
+                            """
+                            UPDATE texas_holdem_attempts SET blocker=?
+                            WHERE round_id=(SELECT id FROM texas_holdem_rounds
+                                            WHERE environment=? AND ticker=?)
+                              AND attempt_number=?
+                              AND status IN ('FILLED','PARTIALLY_FILLED')
+                            """,
+                            (sync_message, intent.mode, intent.ticker, attempt_number),
+                        )
+                    self.db.execute(
+                        """
+                        UPDATE texas_holdem_rounds SET fold_reason=?,updated_at=?
+                        WHERE environment=? AND ticker=?
+                          AND status IN ('ENTERED','PARTIALLY_FILLED')
+                        """,
+                        (sync_message, datetime_now(), intent.mode, intent.ticker),
                     )
         except (KalshiTradingError, ValueError) as exc:
             if intent.strategy == "TEXAS_HOLDEM" and intent.action == "BUY":
