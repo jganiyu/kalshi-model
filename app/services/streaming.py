@@ -351,11 +351,20 @@ class KalshiWebSocketFeed:
             book = KalshiOrderBook()
             last_sequence: int | None = None
             last_book_emit = 0.0
+            last_message_at = time.monotonic()
             while self.ticker() == ticker:
                 try:
                     raw = await asyncio.wait_for(websocket.recv(), timeout=2.0)
                 except TimeoutError:
+                    # TCP/WebSocket ping success is not proof that Kalshi is
+                    # still publishing this subscription.  A half-alive feed
+                    # previously left executable quotes frozen indefinitely.
+                    if time.monotonic() - last_message_at >= 10.0:
+                        raise RuntimeError(
+                            "Kalshi market stream produced no messages for 10 seconds"
+                        )
                     continue
+                last_message_at = time.monotonic()
                 message = json.loads(raw)
                 message_type = message.get("type")
                 if message_type in {"orderbook_snapshot", "orderbook_delta"}:

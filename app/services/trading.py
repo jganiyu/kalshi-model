@@ -139,6 +139,9 @@ class TradingCoordinator:
         self.http: httpx.AsyncClient | None = None
         self._private_streams: dict[str, asyncio.Task[None]] = {}
         self._reconciliation_tasks: dict[str, asyncio.Task[None]] = {}
+        self._reconciliation_wake: dict[str, asyncio.Event] = {
+            "DEMO": asyncio.Event(), "LIVE": asyncio.Event()
+        }
         self._confirmations: dict[str, tuple[float, OrderIntent]] = {}
         self._submission_tasks: set[asyncio.Task[Any]] = set()
         self._pending_automatic_keys: set[tuple[str, str]] = set()
@@ -242,22 +245,25 @@ class TradingCoordinator:
         )
 
         async def on_message(_: dict[str, Any]) -> None:
-            try:
-                await broker.reconcile()
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                # Reconciliation itself blocks trading. Keep the user's in-memory
-                # arm state so a later successful refresh can resume it.
-                pass
+            # Never stop consuming private fills/orders while a slow full
+            # account refresh is in flight. One owned recovery loop coalesces
+            # bursts and backfills authoritative exchange state.
+            self._reconciliation_wake[mode].set()
 
         async def on_status(_: str, connected: bool, error: str | None) -> None:
-            try:
-                await self._handle_private_stream_status(mode, connected, error)
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                broker._audit("PRIVATE_STREAM_STATUS_ERROR", {"error": str(exc)})
+            # Status recovery can require several REST endpoints. Run it out of
+            # band so the socket starts consuming fills/orders immediately.
+            async def recover() -> None:
+                try:
+                    await self._handle_private_stream_status(mode, connected, error)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    broker._audit("PRIVATE_STREAM_STATUS_ERROR", {"error": str(exc)})
+
+            task = asyncio.create_task(recover())
+            self._submission_tasks.add(task)
+            task.add_done_callback(self._submission_tasks.discard)
 
         feed = KalshiPrivateWebSocketFeed(
             ws_url,
@@ -292,14 +298,16 @@ class TradingCoordinator:
                 },
             )
             return
-        # A new socket is not proof of complete state. REST reconciliation keeps
-        # submissions blocked until the exchange account is authoritative again.
+        # A new socket is not proof of complete account state. This handler is
+        # scheduled out-of-band by the feed callback, so reconciliation cannot
+        # prevent the socket from consuming private events.
         try:
             await broker.reconcile()
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             broker._audit("RECONCILIATION_AFTER_RECONNECT_ERROR", {"error": str(exc)})
+            self._reconciliation_wake[mode].set()
             return
         if broker.session_armed:
             broker._audit(
@@ -312,9 +320,17 @@ class TradingCoordinator:
             return
 
         async def run() -> None:
-            delay = 1.0
+            # Startup already performs an authoritative refresh, and private
+            # events wake this loop immediately. Avoid a redundant third full
+            # account read during the first second of every launch.
+            delay = 30.0 if mode == "LIVE" else 90.0
             while True:
-                await asyncio.sleep(delay)
+                wake = self._reconciliation_wake[mode]
+                try:
+                    await asyncio.wait_for(wake.wait(), timeout=delay)
+                except TimeoutError:
+                    pass
+                wake.clear()
                 broker = self.brokers[mode]
                 assert isinstance(broker, KalshiBroker)
                 if not broker.client:
@@ -322,7 +338,9 @@ class TradingCoordinator:
                     continue
                 try:
                     await broker.reconcile()
-                    delay = 30.0
+                    # Live private events wake this immediately. Demo does not
+                    # need to consume production recovery bandwidth every 30s.
+                    delay = 30.0 if mode == "LIVE" else 90.0
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:

@@ -1415,14 +1415,30 @@ class KalshiBroker(Broker):
                 last_error="Credentials are not configured.",
             )
             return self.readiness()
+        requests = [
+            asyncio.create_task(call())
+            for call in (
+                self.client.balance, self.client.orders, self.client.fills,
+                self.client.positions, self.client.settlements,
+            )
+        ]
         try:
             balance, orders, fills, positions, settlements = await asyncio.gather(
-                self.client.balance(), self.client.orders(), self.client.fills(),
-                self.client.positions(), self.client.settlements(),
+                *requests
             )
         except asyncio.CancelledError:
+            for request in requests:
+                request.cancel()
+            await asyncio.gather(*requests, return_exceptions=True)
             raise
         except Exception as exc:
+            # asyncio.gather does not cancel sibling requests when one fails.
+            # Leaving those retries alive caused overlapping reconciliation
+            # storms that starved order and quote traffic during an outage.
+            for request in requests:
+                if not request.done():
+                    request.cancel()
+            await asyncio.gather(*requests, return_exceptions=True)
             exchange_error = _exchange_error_detail(exc)
             # An HTTP response (including rate limits and 5xx) confirms that
             # Kalshi is reachable.  Only a transport failure warrants a
