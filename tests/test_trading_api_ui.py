@@ -173,6 +173,8 @@ def test_trading_ui_contains_mode_safety_and_confirmation_controls() -> None:
     assert 'button.textContent = "Next round passed"' in script
     assert "preserveConfirmedArmingReadiness(dashboard)" in script
     assert "arming_generation" in script
+    assert "data.strategy?.texas_holdem" in script
+    assert '"Kalshi market data reconnecting"' in script
 
 
 def test_dashboard_theme_switch_reuses_persisted_theme_without_header_metadata() -> None:

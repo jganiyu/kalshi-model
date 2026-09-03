@@ -27,6 +27,23 @@ def make_db(tmp_path: Path) -> Database:
     return db
 
 
+def test_texas_dashboard_state_stays_visible_without_current_market(tmp_path: Path) -> None:
+    db = make_db(tmp_path)
+    db.update_settings({
+        "texas_holdem_enabled": True,
+        "texas_holdem_flop_target": .61,
+        "texas_holdem_additional_retries": 4,
+    })
+    engine = AnalysisEngine(AppConfig(database_path=db.path), db)
+
+    texas = engine.dashboard["strategy"]["texas_holdem"]
+    assert texas["enabled"] is True
+    assert texas["status"] == "WAITING_FOR_MARKET_DATA"
+    assert texas["blocker"] == "Waiting for Kalshi market data."
+    assert texas["targets"]["flop"] == pytest.approx(.61)
+    assert texas["maximum_attempts"] == 5
+
+
 def add_market(
     db: Database,
     ticker: str,

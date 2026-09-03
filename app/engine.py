@@ -99,6 +99,7 @@ class AnalysisEngine:
             "next": None,
             "btc": None,
             "notification": None,
+            "strategy": {"texas_holdem": self._texas_recovery_state()},
         }
         self._runner: asyncio.Task[None] | None = None
         self._bootstrap_task: asyncio.Task[None] | None = None
@@ -232,6 +233,7 @@ class AnalysisEngine:
             and current.get("decision", {}).get("reason_code") != "DATA_UNRELIABLE"
         )
         self.dashboard["system"] = self._system_state(reliable, iso_now())
+        self.dashboard["strategy"] = {"texas_holdem": self._texas_recovery_state()}
         self._schedule_publish()
 
     async def _run_loop(self) -> None:
@@ -372,6 +374,7 @@ class AnalysisEngine:
             "current": current_payload,
             "next": self._market_summary(next_market) if next_market else None,
             "notification": notification,
+            "strategy": {"texas_holdem": self._texas_recovery_state()},
             "paper": self._portfolio_summary(),
             "trading": self.trading.summary(current_payload),
             "calibration": self.calibration_summary(),
@@ -444,7 +447,38 @@ class AnalysisEngine:
     def refresh_trading_dashboard(self) -> None:
         """Publish current broker safety state without waiting for a market tick."""
         self.dashboard["trading"] = self.trading.summary(self.dashboard.get("current"))
+        self.dashboard["strategy"] = {"texas_holdem": self._texas_recovery_state()}
         self._schedule_publish()
+
+    def _texas_recovery_state(self) -> dict[str, Any]:
+        """Keep the Texas HUD visible while public market data reconnects."""
+        settings = self.db.settings()
+        targets = {
+            "flop": float(settings.get("texas_holdem_flop_target", .60)),
+            "flop_stop": float(settings.get("texas_holdem_flop_stop", .60)),
+            "turn": float(settings.get("texas_holdem_turn_target", .50)),
+            "turn_stop": float(settings.get("texas_holdem_turn_stop", .60)),
+            "river": float(settings.get("texas_holdem_river_target", .95)),
+            "river_stop": float(settings.get("texas_holdem_river_stop", .60)),
+        }
+        return {
+            "enabled": bool(settings.get("texas_holdem_enabled", False)),
+            "status": "WAITING_FOR_MARKET_DATA",
+            "phase": {"key": "FLOP", "label": "The Flop"},
+            "side": None,
+            "attempt_count": 0,
+            "maximum_attempts": 1 + int(settings.get("texas_holdem_additional_retries", 2)),
+            "filled_contracts": 0,
+            "target_contracts": None,
+            "executable_bid": None,
+            "entry_price_cap": float(settings.get("texas_holdem_max_entry_price", .50)),
+            "targets": targets,
+            "active_target": targets["flop"],
+            "blocker": "Waiting for Kalshi market data.",
+            "market_open_time": None,
+            "pass": {"passed": False, "scheduled": False, "next_open_time": None},
+            "threshold_breach_exempt": True,
+        }
 
     def _schedule_publish(self) -> None:
         if self._publish_task and not self._publish_task.done():
@@ -528,6 +562,7 @@ class AnalysisEngine:
             and current.get("decision", {}).get("reason_code") != "DATA_UNRELIABLE"
         )
         self.dashboard["system"] = self._system_state(reliable, iso_now())
+        self.dashboard["strategy"] = {"texas_holdem": self._texas_recovery_state()}
         self._schedule_publish()
 
     async def _handle_stream_quote(self, quote: ExchangeQuote) -> None:
@@ -794,6 +829,7 @@ class AnalysisEngine:
             "current": current,
             "next": self._market_summary(self._next_market) if self._next_market else None,
             "notification": notification,
+            "strategy": {"texas_holdem": self._texas_recovery_state()},
             "paper": self._portfolio_summary(),
             "trading": self.trading.summary(current),
         }

@@ -495,7 +495,8 @@ function animateTexasPhases() {
     return;
   }
   const texas = state.dashboard?.current?.texas_holdem
-    || state.dashboard?.current?.automatic_entry?.texas_holdem || {};
+    || state.dashboard?.current?.automatic_entry?.texas_holdem
+    || state.dashboard?.strategy?.texas_holdem || {};
   const timing = texasPhaseProgress(texas.market_open_time);
   const starts = { FLOP: 0, TURN: 300, RIVER: 600 };
   $$('[data-phase]').forEach((row) => {
@@ -692,9 +693,9 @@ function renderDashboard(data) {
   }
   const statusDot = $("#sidebar-status-dot");
   statusDot.className = `status-dot ${system.status || "degraded"}`;
-  $("#sidebar-status").textContent = state.liveConnected
-    ? "Streaming live"
-    : system.status === "live" ? "REST fallback" : "Data guarded";
+  $("#sidebar-status").textContent = streams.kalshi?.connected
+    ? "Kalshi market data live"
+    : "Kalshi market data reconnecting";
   const position = forecastPosition(forecast);
   const pill = $("#signal-pill");
   pill.dataset.position = position;
@@ -751,8 +752,9 @@ function renderDashboard(data) {
   );
   renderTexasHoldemHud(
     current?.texas_holdem
-      || current?.automatic_entry?.texas_holdem
-      || {},
+    || current?.automatic_entry?.texas_holdem
+    || data.strategy?.texas_holdem
+    || {},
   );
   syncArmButton(readiness, trading.mode);
   renderTradeAssessment();
