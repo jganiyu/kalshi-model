@@ -389,7 +389,7 @@ class KalshiBroker(Broker):
         if not state.get("authenticated"):
             reasons.append("Account authentication is not verified.")
         if not state.get("reconciled") or state.get("reconciliation_required"):
-            reasons.append("Reconciling Kalshi account activity.")
+            reasons.append(self._reconciliation_blocker_message())
         if state.get("kill_switch"):
             reasons.append("The kill switch is active.")
         if not self.session_armed:
@@ -441,6 +441,22 @@ class KalshiBroker(Broker):
             "last_reconciled_at": state.get("last_reconciled_at"),
             "last_error": state.get("last_error"),
         }
+
+    def _reconciliation_blocker_message(self) -> str:
+        """Give an actionable ETA only when an uncertain current market exists."""
+        pending = self.db.fetch_one(
+            """
+            SELECT i.ticker,m.status AS market_status
+            FROM broker_order_intents i
+            LEFT JOIN markets m ON m.ticker=i.ticker
+            WHERE i.mode=? AND i.status='RECONCILIATION_REQUIRED'
+            ORDER BY i.updated_at DESC LIMIT 1
+            """,
+            (self.mode,),
+        ) or {}
+        if str(pending.get("market_status") or "").lower() == "active":
+            return "Verifying timed-out order · entries resume next round."
+        return "Reconciling Kalshi account activity."
 
     def portfolio(self) -> dict[str, Any]:
         account = self._latest_account_snapshot()

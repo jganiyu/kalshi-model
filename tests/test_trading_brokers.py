@@ -362,6 +362,26 @@ async def test_reconcile_keeps_active_ambiguous_order_blocked(tmp_path: Path) ->
 
 
 @run_async
+async def test_active_timed_out_order_says_entries_resume_next_round(tmp_path: Path) -> None:
+    db, broker, client = await ready_broker(tmp_path)
+    client.timeout = True
+    intent = OrderIntent("DEMO", "CURRENT", "YES", "BUY", 1, .40, "MANUAL", "manual")
+    with pytest.raises(AmbiguousSubmissionError):
+        await broker.submit(intent)
+    now = iso_now()
+    db.execute(
+        """
+        INSERT INTO markets(ticker,status,raw_json,first_seen_at,updated_at)
+        VALUES (?, 'active', '{}', ?, ?)
+        """,
+        (intent.ticker, now, now),
+    )
+    assert broker.readiness()["blocker"] == (
+        "Verifying timed-out order · entries resume next round."
+    )
+
+
+@run_async
 async def test_reconcile_clears_unseen_ambiguous_order_when_market_closes(
     tmp_path: Path,
 ) -> None:
