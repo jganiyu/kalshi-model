@@ -399,8 +399,11 @@ class KalshiBroker(Broker):
             protective_reasons.append(
                 f"{self.mode.title()} trading credentials are not configured."
             )
-        if not state.get("authenticated"):
-            protective_reasons.append("Account authentication is not verified.")
+        # A reconciliation request can be delayed long enough for its
+        # signature to expire.  That stale 401 is not evidence that a new,
+        # priority-signed reduce-only request cannot authenticate.  Keep
+        # entries behind the account-auth gate above, but let confirmed
+        # exposure use the protective lane and judge its fresh request.
         if state.get("kill_switch"):
             protective_reasons.append("The kill switch is active.")
         if not self.session_armed:
@@ -440,7 +443,38 @@ class KalshiBroker(Broker):
             "warnings": reasons,
             "last_reconciled_at": state.get("last_reconciled_at"),
             "last_error": state.get("last_error"),
+            "connection_diagnostic": self._connection_diagnostic(state),
         }
+
+    def _connection_diagnostic(self, state: dict[str, Any]) -> str | None:
+        """Return the current, sanitized REST failure class for the Trading UI."""
+        if not state.get("reconciliation_required") or not state.get("last_error"):
+            return None
+        row = self.db.fetch_one(
+            """
+            SELECT detail_json FROM broker_audit_events
+            WHERE mode=? AND event_type='RECONCILIATION_REQUEST_FAILED'
+            ORDER BY id DESC LIMIT 1
+            """,
+            (self.mode,),
+        )
+        try:
+            detail = json.loads((row or {}).get("detail_json") or "{}")
+            exchange = detail.get("exchange_error") or {}
+            details = exchange.get("details") or {}
+            failure = str(details.get("failure_kind") or "")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            failure = ""
+        labels = {
+            "connect_timeout": "Kalshi connection timed out",
+            "connect_error": "Kalshi connection failed",
+            "read_timeout": "Kalshi response timed out",
+            "read_error": "Kalshi response failed",
+            "write_timeout": "Kalshi request timed out",
+            "write_error": "Kalshi request failed",
+            "pool_timeout": "Kalshi request queue timed out",
+        }
+        return labels.get(failure)
 
     def _reconciliation_blocker_message(self) -> str:
         """Give an actionable ETA only when an uncertain current market exists."""
@@ -1442,6 +1476,13 @@ class KalshiBroker(Broker):
         # with the authoritative account snapshot.
         if intent.strategy == "TEXAS_HOLDEM" and intent.action == "BUY" and fill_count > 0:
             self._adopt_texas_acknowledged_fill(intent, fill_count)
+        if self._is_protective_exit(intent):
+            # A successful, just-in-time signed exit is stronger auth evidence
+            # than an older background reconciliation failure.  Do not claim
+            # full reconciliation here; new entries remain blocked until it
+            # actually succeeds.
+            self._update_mode_state(authenticated=True, connected=True)
+            self._audit("PROTECTIVE_EXIT_FRESH_AUTH_CONFIRMED", {}, intent=intent)
         self._audit("SUBMISSION_ACKNOWLEDGED", response, intent=intent, exchange_order_id=exchange_order_id)
         return self.db.fetch_one(
             "SELECT * FROM broker_order_intents WHERE mode=? AND client_order_id=?",
@@ -1818,7 +1859,21 @@ class KalshiBroker(Broker):
                     else None
                 ),
             )
-        self._replace_positions(remote_positions)
+        # A settlement is terminal market evidence, not evidence that an
+        # earlier protective order filled.  Keep that distinction when an
+        # account snapshot no longer lists the position.
+        settlement_tickers = {
+            str(item.get("ticker") or item.get("market_ticker") or "")
+            for item in remote_settlements
+        }
+        # A restart may have persisted the settlement on an earlier account
+        # snapshot while Kalshi's next response no longer includes it.
+        settlement_tickers.update(
+            str(row.get("ticker") or "") for row in self.db.fetch_all(
+                "SELECT ticker FROM broker_settlements WHERE mode=?", (self.mode,)
+            )
+        )
+        self._replace_positions(remote_positions, settlement_tickers)
         for settlement in remote_settlements:
             ticker = str(
                 settlement.get("ticker") or settlement.get("market_ticker") or ""
@@ -2604,7 +2659,13 @@ class KalshiBroker(Broker):
         )
 
     def _resolve_closed_protective_exit(self, ticker: str) -> None:
-        """Clear uncertain exit reservations after a private/targeted flat fact."""
+        """Project an exchange-confirmed flat position as the final exit state.
+
+        This runs for explicit private/targeted position evidence, not for a
+        market settlement.  A manual close can otherwise leave an old failed
+        or blocked protective-exit message attached to a position that Kalshi
+        has already confirmed is flat.
+        """
         unresolved = self.db.fetch_all(
             """
             SELECT client_order_id FROM broker_order_intents
@@ -2618,12 +2679,25 @@ class KalshiBroker(Broker):
                 str(intent["client_order_id"]), "RESOLVED_EXTERNALLY",
                 error="Position confirmed closed by exchange evidence; uncertain exit no longer reserves exposure.",
             )
-        if not unresolved:
-            return
         self.db.execute(
             """
-            UPDATE broker_positions SET texas_exit_status='Exited',
-                texas_exit_reason=COALESCE(texas_exit_reason,'Position confirmed closed by Kalshi.'),
+            UPDATE broker_positions SET
+                texas_exit_status=CASE WHEN strategy='TEXAS_HOLDEM' OR EXISTS (
+                    SELECT 1 FROM texas_holdem_rounds r
+                    WHERE r.environment=broker_positions.mode
+                      AND r.ticker=broker_positions.ticker
+                ) THEN 'Exited' ELSE texas_exit_status END,
+                texas_exit_reason=CASE WHEN strategy='TEXAS_HOLDEM' OR EXISTS (
+                    SELECT 1 FROM texas_holdem_rounds r
+                    WHERE r.environment=broker_positions.mode
+                      AND r.ticker=broker_positions.ticker
+                ) THEN 'Position confirmed closed by Kalshi.' ELSE texas_exit_reason END,
+                threshold_exit_status=CASE
+                    WHEN threshold_exit_status IN ('Exit pending','Exit failed','Blocked')
+                    THEN 'Closed externally' ELSE threshold_exit_status END,
+                threshold_exit_block_reason=CASE
+                    WHEN threshold_exit_status IN ('Exit pending','Exit failed','Blocked')
+                    THEN NULL ELSE threshold_exit_block_reason END,
                 updated_at=?
             WHERE mode=? AND ticker=? AND status='closed'
             """,
@@ -2631,14 +2705,22 @@ class KalshiBroker(Broker):
         )
         self.db.execute(
             """
-            UPDATE texas_holdem_rounds SET status='EXITED',fold_reason=NULL,
+            UPDATE texas_holdem_rounds SET status='EXITED',
+                fold_reason='Position confirmed closed by Kalshi.',
                 exited_at=COALESCE(exited_at,?),updated_at=?
-            WHERE environment=? AND ticker=? AND status IN ('EXIT_PENDING','EXIT_FAILED')
+            WHERE environment=? AND ticker=? AND status IN (
+                'ENTERED','PARTIALLY_FILLED','EXIT_PENDING','EXIT_FAILED','EXIT_BLOCKED'
+            )
             """,
             (iso_now(), iso_now(), self.mode, ticker),
         )
 
-    def _replace_positions(self, positions: list[dict[str, Any]]) -> None:
+    def _replace_positions(
+        self,
+        positions: list[dict[str, Any]],
+        settlement_tickers: set[str] | None = None,
+    ) -> None:
+        settlement_tickers = settlement_tickers or set()
         active: set[tuple[str, str]] = set()
         for position in positions:
             signed = _number(position.get("position_fp") or position.get("position"))
@@ -2698,6 +2780,8 @@ class KalshiBroker(Broker):
                         WHERE mode=? AND ticker=? AND side=?""",
                     (iso_now(), self.mode, *key),
                 )
+                if key[0] not in settlement_tickers:
+                    self._resolve_closed_protective_exit(key[0])
 
     def _upsert_settlement(
         self,

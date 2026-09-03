@@ -2436,6 +2436,8 @@ async function loadPaper() {
   $("#position-section").hidden = mode === "PAPER";
   $("#trading-command-status").textContent = mode === "PAPER"
     ? "Paper is ready. No exchange order is placed."
+    : readiness.connection_diagnostic
+      ? `${readiness.connection_diagnostic} · retrying safely.`
     : protectiveExit.degraded && protectiveExit.ready
       ? "Entries paused for reconciliation; confirmed reduce-only protective exits remain active."
       : readiness.blocker || `${modeLabel(mode)} is reconciled and ${readiness.session_armed ? "armed" : "disarmed"}.`;

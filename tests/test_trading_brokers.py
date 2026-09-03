@@ -1364,6 +1364,81 @@ async def test_degraded_reconciliation_blocks_entries_but_uses_targeted_protecti
 
 
 @run_async
+async def test_stale_background_auth_failure_does_not_preempt_fresh_protective_exit(
+    tmp_path: Path,
+) -> None:
+    db, broker, client = await ready_broker(tmp_path)
+    client.remote_positions = [{"ticker": "STALE-AUTH-EXIT", "position_fp": "2.00"}]
+    # Model the old reconciliation request receiving header_timestamp_expired.
+    # New exposure remains blocked, but a newly signed, priority exit may run.
+    broker._update_mode_state(
+        authenticated=False, reconciled=False, reconciliation_required=True,
+        last_error="The request clock is out of sync with Kalshi.",
+    )
+    entry = OrderIntent(
+        "DEMO", "STALE-AUTH-ENTRY", "YES", "BUY", 1, .40,
+        "STANDARD_EDGE", "automatic", risk_snapshot={"data_reliable": True, "market_open": True},
+    )
+    assert broker.risk_check(entry)["passed"] is False
+
+    exit_intent = OrderIntent(
+        "DEMO", "STALE-AUTH-EXIT", "YES", "SELL", 2, .01,
+        "TEXAS_HOLDEM", "texas_flop_target", time_in_force="immediate_or_cancel",
+        decision_snapshot={"protective_exit": True},
+    )
+    await broker.submit(exit_intent)
+    assert client.created[-1]["action"] == "SELL"
+    assert client.created[-1]["reduce_only"] is True
+    assert client.created[-1]["time_in_force"] == "immediate_or_cancel"
+    assert bool(broker.mode_state()["authenticated"]) is True
+    assert bool(broker.mode_state()["reconciled"]) is False
+
+
+@run_async
+async def test_fresh_protective_exit_auth_failure_is_rejected_without_opposite_exposure(
+    tmp_path: Path,
+) -> None:
+    db = make_db(tmp_path)
+    coordinator = TradingCoordinator(
+        AppConfig(database_path=db.path), db, PaperTradingService(db)
+    )
+    broker = coordinator.broker("DEMO")
+    assert isinstance(broker, KalshiBroker)
+    client = FakeTradingClient()
+    client.remote_positions = [{"ticker": "FRESH-AUTH-EXIT", "position_fp": "2.00"}]
+    broker.set_client(client)  # type: ignore[arg-type]
+    await broker.reconcile()
+    broker.arm(confirmation="ARM DEMO TRADING", automatic=True)
+    broker._update_mode_state(
+        authenticated=False, reconciled=False, reconciliation_required=True,
+    )
+    client.reject_sells = True
+    client.reject_error = KalshiTradingError(
+        "Kalshi rejected these API credentials.", status_code=401, code="invalid_signature",
+    )
+    exit_intent = OrderIntent(
+        "DEMO", "FRESH-AUTH-EXIT", "YES", "SELL", 2, .01,
+        "TEXAS_HOLDEM", "texas_flop_target", time_in_force="immediate_or_cancel",
+        decision_snapshot={"protective_exit": True},
+    )
+    # The fresh request, rather than the stale background state, is what
+    # determines that this Texas exit is auth-blocked.
+    await coordinator._submit_and_attach_position(exit_intent)
+    assert len(client.created) == 1
+    assert client.created[0]["action"] == "SELL"
+    assert client.created[0]["reduce_only"] is True
+    assert client.created[0]["contracts"] == 2
+    assert db.fetch_one(
+        "SELECT status FROM broker_order_intents WHERE client_order_id=?",
+        (exit_intent.client_order_id,),
+    ) == {"status": "REJECTED"}
+    assert db.fetch_one(
+        "SELECT texas_exit_status FROM broker_positions WHERE mode='DEMO' AND ticker=? AND side='YES'",
+        (exit_intent.ticker,),
+    ) == {"texas_exit_status": "Exit blocked"}
+
+
+@run_async
 async def test_protective_exit_never_retries_while_prior_client_id_is_uncertain(
     tmp_path: Path,
 ) -> None:
@@ -1544,6 +1619,101 @@ async def test_private_flat_position_resolves_stale_texas_exit_intent(
     }})
     assert db.fetch_one("SELECT status FROM broker_order_intents WHERE client_order_id='stale-exit'") == {"status": "RESOLVED_EXTERNALLY"}
     assert db.fetch_one("SELECT status FROM broker_positions WHERE mode='DEMO' AND ticker='EXIT-PRIVATE'") == {"status": "closed"}
+
+
+@run_async
+async def test_exchange_confirmed_manual_close_clears_stale_exit_presentation(
+    tmp_path: Path,
+) -> None:
+    db, broker, _ = await ready_broker(tmp_path)
+    now = iso_now()
+    broker._upsert_position({"ticker": "MANUAL-CLOSE", "position_fp": "2.00"})
+    db.execute(
+        """
+        UPDATE broker_positions SET strategy='TEXAS_HOLDEM',
+            texas_exit_status='Exit failed',texas_exit_reason='old timeout',
+            threshold_exit_status='Blocked',threshold_exit_block_reason='old blocker'
+        WHERE mode='DEMO' AND ticker='MANUAL-CLOSE' AND side='YES'
+        """
+    )
+    db.execute(
+        """
+        INSERT INTO texas_holdem_rounds(
+            environment,ticker,side,status,entry_price_cap,target_contracts,
+            flop_target,turn_target,river_target,river_stop,created_at,updated_at
+        ) VALUES ('DEMO','MANUAL-CLOSE','YES','EXIT_FAILED',.50,2,.60,.50,.95,.60,?,?)
+        """,
+        (now, now),
+    )
+    # Same ticker in another environment is deliberately untouched.
+    db.execute(
+        """
+        INSERT INTO broker_positions(
+            mode,ticker,side,contracts,market_exposure,updated_at,status,
+            texas_exit_status,threshold_exit_status,threshold_exit_block_reason
+        ) VALUES ('LIVE','MANUAL-CLOSE','YES',2,1,?,'open','Exit failed','Blocked','live blocker')
+        """,
+        (now,),
+    )
+
+    broker.adopt_private_event({"type": "market_position", "msg": {
+        "ticker": "MANUAL-CLOSE", "position_fp": "0.00", "last_updated_ts": now,
+    }})
+    assert db.fetch_one(
+        """SELECT status,texas_exit_status,texas_exit_reason,threshold_exit_status,
+                  threshold_exit_block_reason FROM broker_positions
+           WHERE mode='DEMO' AND ticker='MANUAL-CLOSE' AND side='YES'"""
+    ) == {
+        "status": "closed",
+        "texas_exit_status": "Exited",
+        "texas_exit_reason": "Position confirmed closed by Kalshi.",
+        "threshold_exit_status": "Closed externally",
+        "threshold_exit_block_reason": None,
+    }
+    assert db.fetch_one(
+        "SELECT status,fold_reason FROM texas_holdem_rounds WHERE environment='DEMO' AND ticker='MANUAL-CLOSE'"
+    ) == {"status": "EXITED", "fold_reason": "Position confirmed closed by Kalshi."}
+    assert db.fetch_one(
+        "SELECT status,texas_exit_status,threshold_exit_block_reason FROM broker_positions "
+        "WHERE mode='LIVE' AND ticker='MANUAL-CLOSE'"
+    ) == {"status": "open", "texas_exit_status": "Exit failed", "threshold_exit_block_reason": "live blocker"}
+
+
+@run_async
+async def test_reconciliation_flat_position_clears_texas_exit_failure(
+    tmp_path: Path,
+) -> None:
+    db, broker, client = await ready_broker(tmp_path)
+    now = iso_now()
+    broker._upsert_position({"ticker": "RECONCILED-CLOSE", "position_fp": "2.00"})
+    db.execute(
+        """UPDATE broker_positions SET strategy='TEXAS_HOLDEM',
+              texas_exit_status='Exit blocked',texas_exit_reason='stale auth failure'
+           WHERE mode='DEMO' AND ticker='RECONCILED-CLOSE'"""
+    )
+    db.execute(
+        """
+        INSERT INTO texas_holdem_rounds(
+            environment,ticker,side,status,entry_price_cap,target_contracts,
+            flop_target,turn_target,river_target,river_stop,created_at,updated_at
+        ) VALUES ('DEMO','RECONCILED-CLOSE','YES','EXIT_BLOCKED',.50,2,.60,.50,.95,.60,?,?)
+        """,
+        (now, now),
+    )
+    client.remote_positions = []
+    client.remote_settlements = []
+    await broker.reconcile()
+    assert db.fetch_one(
+        "SELECT status,texas_exit_status,texas_exit_reason FROM broker_positions "
+        "WHERE mode='DEMO' AND ticker='RECONCILED-CLOSE'"
+    ) == {
+        "status": "closed",
+        "texas_exit_status": "Exited",
+        "texas_exit_reason": "Position confirmed closed by Kalshi.",
+    }
+    assert db.fetch_one(
+        "SELECT status FROM texas_holdem_rounds WHERE environment='DEMO' AND ticker='RECONCILED-CLOSE'"
+    ) == {"status": "EXITED"}
 
 
 @run_async
@@ -2660,14 +2830,21 @@ async def test_transport_failures_preserve_safe_request_diagnostics(tmp_path: Pa
 
     assert error.value.transport is True
     assert error.value.details == {
-        "failure_kind": "timeout",
+        "failure_kind": "read_timeout",
         "transport_error_type": "ReadTimeout",
         "method": "GET",
         "path": "/portfolio/balance",
         "attempts": 1,
+        "queue_wait_ms": error.value.details["queue_wait_ms"],
+        "signing_ms": error.value.details["signing_ms"],
+        "wire_elapsed_ms": error.value.details["wire_elapsed_ms"],
+        "connection_reuse": "not_exposed",
         "elapsed_ms": error.value.details["elapsed_ms"],
     }
-    assert isinstance(error.value.details["elapsed_ms"], int)
+    assert all(
+        isinstance(error.value.details[key], int)
+        for key in ("queue_wait_ms", "signing_ms", "wire_elapsed_ms", "elapsed_ms")
+    )
 
 
 @run_async
@@ -2832,6 +3009,64 @@ async def test_failed_private_stream_task_wakes_its_recovery_loop(
     assert coordinator._reconciliation_wake["DEMO"].is_set()
     assert any(
         item["event_type"] == "PRIVATE_STREAM_TASK_RESTART"
+        for item in broker.audit_history(10)
+    )
+
+
+@run_async
+async def test_private_stream_status_recovery_is_coalesced(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db = make_db(tmp_path)
+    coordinator = TradingCoordinator(
+        AppConfig(database_path=db.path), db, PaperTradingService(db)
+    )
+    broker = coordinator.broker("DEMO")
+    assert isinstance(broker, KalshiBroker)
+    broker.set_client(FakeTradingClient())  # type: ignore[arg-type]
+    started = asyncio.Event()
+    release = asyncio.Event()
+    calls = 0
+
+    async def recover(_mode: str, _connected: bool, _error: str | None) -> None:
+        nonlocal calls
+        calls += 1
+        started.set()
+        await release.wait()
+
+    monkeypatch.setattr(coordinator, "_handle_private_stream_status", recover)
+    coordinator._schedule_private_stream_status("DEMO", True, None)
+    await started.wait()
+    coordinator._schedule_private_stream_status("DEMO", True, None)
+    coordinator._schedule_private_stream_status("DEMO", True, None)
+    assert calls == 1
+    task = coordinator._private_status_recovery_tasks["DEMO"]
+    release.set()
+    await task
+    await asyncio.sleep(0)
+    assert "DEMO" not in coordinator._private_status_recovery_tasks
+
+
+@run_async
+async def test_private_event_recovery_failure_is_audited_not_left_as_task_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db = make_db(tmp_path)
+    coordinator = TradingCoordinator(
+        AppConfig(database_path=db.path), db, PaperTradingService(db)
+    )
+    broker = coordinator.broker("DEMO")
+    assert isinstance(broker, KalshiBroker)
+    broker.set_client(FakeTradingClient())  # type: ignore[arg-type]
+
+    async def fail(**_: object) -> None:
+        raise RuntimeError("targeted recovery failed")
+
+    monkeypatch.setattr(broker, "recover_private_event", fail)
+    coordinator._schedule_private_event_recovery("DEMO", order_id="o1", ticker="T")
+    await asyncio.sleep(0.1)
+    assert any(
+        item["event_type"] == "PRIVATE_EVENT_RECOVERY_ERROR"
         for item in broker.audit_history(10)
     )
 

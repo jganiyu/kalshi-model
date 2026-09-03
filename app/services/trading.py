@@ -140,6 +140,10 @@ class TradingCoordinator:
         self.http: httpx.AsyncClient | None = None
         self._private_streams: dict[str, asyncio.Task[None]] = {}
         self._reconciliation_tasks: dict[str, asyncio.Task[None]] = {}
+        # Feed libraries can emit several status callbacks during a reconnect.
+        # Keep at most one account recovery per mode; a private websocket must
+        # never turn into a REST reconciliation surge.
+        self._private_status_recovery_tasks: dict[str, asyncio.Task[None]] = {}
         self._reconciliation_wake: dict[str, asyncio.Event] = {
             "DEMO": asyncio.Event(), "LIVE": asyncio.Event()
         }
@@ -184,15 +188,19 @@ class TradingCoordinator:
             task.cancel()
         for task in self._private_event_recovery_tasks.values():
             task.cancel()
+        for task in self._private_status_recovery_tasks.values():
+            task.cancel()
         await asyncio.gather(
             *self._private_streams.values(), *self._reconciliation_tasks.values(),
             *self._submission_tasks, *self._private_event_recovery_tasks.values(),
+            *self._private_status_recovery_tasks.values(),
             return_exceptions=True,
         )
         self._private_streams.clear()
         self._reconciliation_tasks.clear()
         self._submission_tasks.clear()
         self._private_event_recovery_tasks.clear()
+        self._private_status_recovery_tasks.clear()
 
     def _configure_broker(self, mode: str) -> None:
         broker = self.brokers[mode]
@@ -228,6 +236,10 @@ class TradingCoordinator:
         if task:
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
+        status_task = self._private_status_recovery_tasks.pop(normalized, None)
+        if status_task:
+            status_task.cancel()
+            await asyncio.gather(status_task, return_exceptions=True)
         self._configure_broker(normalized)
         broker = self.brokers[normalized]
         assert isinstance(broker, KalshiBroker)
@@ -275,19 +287,7 @@ class TradingCoordinator:
             self._reconciliation_wake[mode].set()
 
         async def on_status(_: str, connected: bool, error: str | None) -> None:
-            # Status recovery can require several REST endpoints. Run it out of
-            # band so the socket starts consuming fills/orders immediately.
-            async def recover() -> None:
-                try:
-                    await self._handle_private_stream_status(mode, connected, error)
-                except asyncio.CancelledError:
-                    raise
-                except Exception as exc:
-                    broker._audit("PRIVATE_STREAM_STATUS_ERROR", {"error": str(exc)})
-
-            task = asyncio.create_task(recover())
-            self._submission_tasks.add(task)
-            task.add_done_callback(self._submission_tasks.discard)
+            self._schedule_private_stream_status(mode, connected, error)
 
         feed = KalshiPrivateWebSocketFeed(
             ws_url,
@@ -340,7 +340,16 @@ class TradingCoordinator:
             # envelope, without delaying protective logic (the event was
             # already applied locally above).
             await asyncio.sleep(0.05)
-            await broker.recover_private_event(order_id=order_id, ticker=ticker)
+            try:
+                await broker.recover_private_event(order_id=order_id, ticker=ticker)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                # A narrow backfill is helpful, never allowed to become an
+                # unobserved task exception or bring down later recoveries.
+                broker._audit("PRIVATE_EVENT_RECOVERY_ERROR", {
+                    "error": str(exc), "order_id": order_id, "ticker": ticker,
+                })
 
         task = asyncio.create_task(recover())
         self._private_event_recovery_tasks[key] = task
@@ -348,6 +357,51 @@ class TradingCoordinator:
         def done(completed: asyncio.Task[None]) -> None:
             if self._private_event_recovery_tasks.get(key) is completed:
                 self._private_event_recovery_tasks.pop(key, None)
+
+        task.add_done_callback(done)
+
+    def _schedule_private_stream_status(
+        self, mode: str, connected: bool, error: str | None,
+    ) -> None:
+        """Coalesce status callbacks into one cancellable recovery per mode."""
+        broker = self.brokers[mode]
+        assert isinstance(broker, KalshiBroker)
+        if not connected:
+            # A completed reconnect recovery must never overwrite a newer
+            # disconnect and falsely restore readiness.
+            existing = self._private_status_recovery_tasks.pop(mode, None)
+            if existing and not existing.done():
+                existing.cancel()
+            # This update is intentionally immediate; do not wait behind a
+            # reconnect reconciliation before showing the stream as down.
+            broker.set_private_stream_connected(False)
+            broker._update_mode_state(
+                connected=False, reconciliation_required=True,
+                reconciled=False, last_error=error,
+            )
+            broker._audit("PRIVATE_STREAM_PAUSED", {
+                "reason": error or "Private trading stream disconnected.",
+                "automatic_will_resume": broker.automatic_armed,
+            })
+            return
+        existing = self._private_status_recovery_tasks.get(mode)
+        if existing and not existing.done():
+            return
+
+        async def recover() -> None:
+            try:
+                await self._handle_private_stream_status(mode, True, error)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                broker._audit("PRIVATE_STREAM_STATUS_ERROR", {"error": str(exc)})
+
+        task = asyncio.create_task(recover())
+        self._private_status_recovery_tasks[mode] = task
+
+        def done(completed: asyncio.Task[None]) -> None:
+            if self._private_status_recovery_tasks.get(mode) is completed:
+                self._private_status_recovery_tasks.pop(mode, None)
 
         task.add_done_callback(done)
 
@@ -432,7 +486,29 @@ class TradingCoordinator:
                     delay = min(30.0, delay * 2.0)
                     delay = max(0.25, delay + random.uniform(-0.2 * delay, 0.2 * delay))
 
-        self._reconciliation_tasks[mode] = asyncio.create_task(run())
+        task = asyncio.create_task(run())
+        self._reconciliation_tasks[mode] = task
+
+        def restart_if_unexpectedly_stopped(completed: asyncio.Task[None]) -> None:
+            if self._reconciliation_tasks.get(mode) is completed:
+                self._reconciliation_tasks.pop(mode, None)
+            if completed.cancelled():
+                return
+            try:
+                error = completed.exception()
+            except asyncio.CancelledError:
+                return
+            if error is None:
+                error = RuntimeError("reconciliation loop stopped unexpectedly")
+            broker = self.brokers[mode]
+            assert isinstance(broker, KalshiBroker)
+            broker._audit("RECONCILIATION_LOOP_RESTART", {"error": str(error)})
+            self._reconciliation_wake[mode].set()
+            # Yield once to avoid recursive task callbacks. The restarted
+            # loop retains its normal backoff and single-flight behavior.
+            asyncio.get_running_loop().call_soon(self._start_reconciliation_loop, mode)
+
+        task.add_done_callback(restart_if_unexpectedly_stopped)
 
     def summary(self, current: dict[str, Any] | None = None) -> dict[str, Any]:
         modes = {
@@ -1445,7 +1521,14 @@ class TradingCoordinator:
                         (exit_reason, datetime_now(), intent.mode, intent.ticker),
                     )
                 elif intent.source.startswith("texas_"):
-                    blocked_by_auth = "authentication is not verified" in str(exc).lower()
+                    # This path is reached only after the fresh, priority
+                    # reduce-only submission.  A stale reconciliation 401 no
+                    # longer preempts it; mark it auth-blocked only when this
+                    # actual exit request received a fresh auth response.
+                    blocked_by_auth = (
+                        getattr(exc, "status_code", None) in {401, 403}
+                        or "authentication is not verified" in str(exc).lower()
+                    )
                     exit_status = "Exit blocked" if blocked_by_auth else "Exit failed"
                     self.db.execute(
                         """

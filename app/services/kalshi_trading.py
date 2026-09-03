@@ -5,6 +5,8 @@ import base64
 import logging
 import os
 import random
+import socket
+import ssl
 import time
 from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
 from pathlib import Path
@@ -118,6 +120,36 @@ class KalshiTradingError(RuntimeError):
 
 class AmbiguousSubmissionError(KalshiTradingError):
     """The request may have reached Kalshi and must be reconciled before retrying."""
+
+
+def _transport_failure_kind(exc: Exception) -> str:
+    """Classify only the phase httpx/the underlying transport exposes."""
+    causes: list[BaseException] = []
+    current: BaseException | None = exc
+    while current is not None and len(causes) < 4:
+        causes.append(current)
+        current = current.__cause__ or current.__context__
+    if any(isinstance(cause, socket.gaierror) for cause in causes):
+        return "dns_error"
+    if any(isinstance(cause, ssl.SSLError) for cause in causes):
+        return "tls_error"
+    if isinstance(exc, httpx.ConnectTimeout):
+        return "connect_timeout"
+    if isinstance(exc, httpx.ReadTimeout):
+        return "read_timeout"
+    if isinstance(exc, httpx.WriteTimeout):
+        return "write_timeout"
+    if isinstance(exc, httpx.PoolTimeout):
+        return "pool_timeout"
+    if isinstance(exc, httpx.TimeoutException):
+        return "timeout"
+    if isinstance(exc, httpx.ConnectError):
+        return "connect_error"
+    if isinstance(exc, httpx.ReadError):
+        return "read_error"
+    if isinstance(exc, httpx.WriteError):
+        return "write_error"
+    return "network_error"
 
 
 def normalize_order_price(
@@ -262,6 +294,11 @@ class KalshiTradingClient:
     ) -> dict[str, Any]:
         signing_path = f"{self.api_prefix}{path}"
         started_at = time.monotonic()
+        # httpx deliberately does not expose whether a pooled HTTP connection
+        # was reused.  Record that limitation explicitly instead of guessing;
+        # the remaining timings still distinguish queueing from an on-wire
+        # connection/read failure.
+        connection_reuse = "not_exposed"
         request_priority = (
             self._requests.EXECUTION
             if submission
@@ -269,6 +306,8 @@ class KalshiTradingClient:
         )
         for attempt in range(retries + 1):
             try:
+                slot_acquired_at: float | None = None
+                dispatched_at: float | None = None
                 request_args: dict[str, Any] = {
                     "params": params,
                     "json": json,
@@ -280,9 +319,12 @@ class KalshiTradingClient:
                     # Kalshi rejects stale signatures. Sign only after this
                     # request has won a controller slot, never while it is
                     # still waiting behind recovery/background work.
+                    nonlocal slot_acquired_at, dispatched_at
+                    slot_acquired_at = time.monotonic()
                     request_args["headers"] = signed_headers(
                         self.key_id, self.private_key_path, method, signing_path
                     )
+                    dispatched_at = time.monotonic()
                     return await self.client.request(
                         method,
                         f"{self.base_url}{path}",
@@ -291,15 +333,23 @@ class KalshiTradingClient:
 
                 response = await self._requests.run(request_priority, send)
             except (httpx.TimeoutException, httpx.NetworkError) as exc:
-                failure_kind = (
-                    "timeout" if isinstance(exc, httpx.TimeoutException) else "network"
-                )
+                failure_kind = _transport_failure_kind(exc)
                 request_detail = {
                     "failure_kind": failure_kind,
                     "transport_error_type": type(exc).__name__,
                     "method": method,
                     "path": path,
                     "attempts": attempt + 1,
+                    "queue_wait_ms": round(((slot_acquired_at or time.monotonic()) - started_at) * 1000),
+                    "signing_ms": (
+                        round((dispatched_at - slot_acquired_at) * 1000)
+                        if dispatched_at is not None and slot_acquired_at is not None else None
+                    ),
+                    "wire_elapsed_ms": (
+                        round((time.monotonic() - dispatched_at) * 1000)
+                        if dispatched_at is not None else None
+                    ),
+                    "connection_reuse": connection_reuse,
                     "elapsed_ms": round((time.monotonic() - started_at) * 1000),
                 }
                 if submission:

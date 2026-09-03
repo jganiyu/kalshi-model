@@ -5,6 +5,7 @@ from pathlib import Path
 
 import httpx
 
+from app.engine import KALSHI_HTTP_LIMITS
 from app.services.kalshi_trading import (
     AuthenticatedRequestController,
     KalshiTradingClient,
@@ -142,5 +143,55 @@ def test_request_is_signed_only_after_it_leaves_the_queue(
         await asyncio.gather(holding, queued)
         await http.aclose()
         assert signed == ["signed"]
+
+    asyncio.run(scenario())
+
+
+def test_kalshi_rest_reuses_and_closes_its_warm_connection(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    async def scenario() -> None:
+        accepted = 0
+        connection_closed = asyncio.Event()
+
+        async def handler(
+            reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
+        ) -> None:
+            nonlocal accepted
+            accepted += 1
+            try:
+                while True:
+                    await reader.readuntil(b"\r\n\r\n")
+                    writer.write(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n"
+                        b"Content-Type: application/json\r\nConnection: keep-alive\r\n\r\n{}"
+                    )
+                    await writer.drain()
+            except (asyncio.IncompleteReadError, ConnectionError):
+                connection_closed.set()
+            finally:
+                writer.close()
+                await writer.wait_closed()
+
+        server = await asyncio.start_server(handler, "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+        monkeypatch.setattr(
+            "app.services.kalshi_trading.signed_headers",
+            lambda *_: {"KALSHI-ACCESS-TIMESTAMP": "fresh"},
+        )
+        http = httpx.AsyncClient(limits=KALSHI_HTTP_LIMITS)
+        client = KalshiTradingClient(
+            http, f"http://127.0.0.1:{port}/trade-api/v2", "key", tmp_path / "key.pem",
+            environment="DEMO",
+        )
+        try:
+            await client.balance()
+            await client.balance()
+            assert accepted == 1
+        finally:
+            await http.aclose()
+            await asyncio.wait_for(connection_closed.wait(), timeout=1)
+            server.close()
+            await server.wait_closed()
 
     asyncio.run(scenario())

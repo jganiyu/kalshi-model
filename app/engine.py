@@ -58,6 +58,18 @@ from app.services.volume_signals import VolumeSignalService
 
 logger = logging.getLogger(__name__)
 
+# Kalshi REST is used for both ordinary account reads and time-critical
+# reduce-only exits.  Keep authenticated connections around across the quiet
+# gaps between 15-minute markets instead of falling back to a new TCP/TLS
+# handshake for the next protective request.  The cap still leaves headroom
+# for public market-data reads without allowing a reconciliation burst to
+# create an unbounded connection pool.
+KALSHI_HTTP_LIMITS = httpx.Limits(
+    max_connections=12,
+    max_keepalive_connections=8,
+    keepalive_expiry=120.0,
+)
+
 
 class AnalysisEngine:
     def __init__(self, config: AppConfig, db: Database):
@@ -129,6 +141,7 @@ class AnalysisEngine:
         self.http = httpx.AsyncClient(
             timeout=httpx.Timeout(8.0, connect=5.0),
             headers={"User-Agent": "kalshi-model/0.1 local-analysis-only"},
+            limits=KALSHI_HTTP_LIMITS,
         )
         self.bitcoin = BitcoinCompositeFeed(self.http)
         self.kalshi = KalshiPublicClient(
@@ -455,6 +468,15 @@ class AnalysisEngine:
             if self._stream_status[name].get("connected")
         ]
         kalshi_status = self._stream_status["Kalshi"]
+        # Streaming market data and authenticated order REST are independent
+        # paths. A live websocket must not be presented as proof that orders
+        # can currently be submitted.
+        selected_broker = self.trading.broker()
+        execution_readiness = (
+            selected_broker.readiness()
+            if hasattr(selected_broker, "readiness")
+            else None
+        )
         streaming = bool(bitcoin_sources or kalshi_status.get("connected"))
         return {
             "status": "live" if reliable else "degraded",
@@ -478,6 +500,15 @@ class AnalysisEngine:
                     "connected": bool(kalshi_status.get("connected")),
                     "configured": bool(kalshi_status.get("configured")),
                     "error": kalshi_status.get("error"),
+                },
+                "kalshi_execution": {
+                    "last_rest_available": bool(
+                        execution_readiness
+                        and execution_readiness.get("connected")
+                        and execution_readiness.get("authenticated")
+                    ),
+                    "reconciled": bool(execution_readiness and execution_readiness.get("reconciled")),
+                    "error": execution_readiness.get("last_error") if execution_readiness else None,
                 },
             },
         }
