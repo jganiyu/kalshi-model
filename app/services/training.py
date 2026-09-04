@@ -203,6 +203,27 @@ class ModelManager:
         row["validation"] = json.loads(row["validation_json"])
         return row
 
+    def latest_calibration_summary(self) -> dict[str, Any]:
+        """Load the last durable calibration evidence without rescanning trades.
+
+        Retraining is intentionally explicit/low-priority.  Startup needs the
+        last evaluated metrics for truthful UI and decision diagnostics, not a
+        second history scan on the quote path.
+        """
+        row = self.db.fetch_one(
+            "SELECT report_json FROM calibration_reports ORDER BY id DESC LIMIT 1"
+        )
+        if not row:
+            return calibration_metrics(())
+        try:
+            report = json.loads(str(row["report_json"]))
+            current = report.get("current") if isinstance(report, dict) else None
+            if isinstance(current, dict):
+                return dict(current)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            pass
+        return calibration_metrics(())
+
     def predict(self, features: dict[str, Any], baseline_probability: float) -> tuple[float, str]:
         model = self.active()
         if model.get("model_type") == "regularized-logistic":

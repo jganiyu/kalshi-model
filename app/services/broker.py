@@ -106,7 +106,7 @@ class Broker(abc.ABC):
     mode: str
 
     @abc.abstractmethod
-    def portfolio(self) -> dict[str, Any]: ...
+    def portfolio(self, *, include_ledger: bool = True) -> dict[str, Any]: ...
 
     @abc.abstractmethod
     async def submit(self, intent: OrderIntent) -> dict[str, Any]: ...
@@ -115,7 +115,7 @@ class Broker(abc.ABC):
     async def cancel(self, order_id: str | int) -> dict[str, Any]: ...
 
     @abc.abstractmethod
-    async def reconcile(self) -> dict[str, Any]: ...
+    async def reconcile(self, *, full_audit: bool | None = None) -> dict[str, Any]: ...
 
 
 class PaperBroker(Broker):
@@ -135,7 +135,7 @@ class PaperBroker(Broker):
             raise ValueError("That paper order is no longer open.")
         return {"canceled": int(order_id)}
 
-    async def reconcile(self) -> dict[str, Any]:
+    async def reconcile(self, *, full_audit: bool | None = None) -> dict[str, Any]:
         return {"mode": self.mode, "reconciled": True}
 
 
@@ -628,6 +628,20 @@ class KalshiBroker(Broker):
                 ),
             },
         }
+
+    def open_positions(self, ticker: str | None = None) -> list[dict[str, Any]]:
+        """Small durable projection used by the protective-exit loop.
+
+        Do not call ``portfolio`` from a quote tick: that UI method also
+        builds account totals, activity, and optionally the complete ledger.
+        """
+        sql = "SELECT * FROM broker_positions WHERE mode=? AND status='open'"
+        params: list[Any] = [self.mode]
+        if ticker:
+            sql += " AND ticker=?"
+            params.append(ticker)
+        sql += " ORDER BY updated_at DESC"
+        return self.db.fetch_all(sql, tuple(params))
 
     def trade_ledger(self) -> list[dict[str, Any]]:
         fills = self.db.fetch_all(
@@ -1519,13 +1533,13 @@ class KalshiBroker(Broker):
         await self.reconcile()
         return response
 
-    async def reconcile(self) -> dict[str, Any]:
+    async def reconcile(self, *, full_audit: bool | None = None) -> dict[str, Any]:
         """Coalesce overlapping account refreshes into one authoritative result."""
         requested_generation = self._reconcile_generation
         async with self._reconcile_lock:
             if requested_generation != self._reconcile_generation:
                 return self.portfolio()
-            result = await self._reconcile_once()
+            result = await self._reconcile_once(full_audit=full_audit)
             self._reconcile_generation += 1
             return result
 
@@ -1744,7 +1758,7 @@ class KalshiBroker(Broker):
         )
         return {"state": status}
 
-    async def _reconcile_once(self) -> dict[str, Any]:
+    async def _reconcile_once(self, *, full_audit: bool | None = None) -> dict[str, Any]:
         if self.client is None:
             self._update_mode_state(
                 connected=False, authenticated=False, reconciled=False,
@@ -1752,11 +1766,33 @@ class KalshiBroker(Broker):
                 last_error="Credentials are not configured.",
             )
             return self.readiness()
+        watermark = self.db.fetch_one(
+            "SELECT last_full_at FROM broker_reconciliation_watermarks WHERE mode=?",
+            (self.mode,),
+        ) or {}
+        last_full_at = parse_time(str(watermark.get("last_full_at") or ""))
+        # A restart begins with one full audit. Thereafter, current positions,
+        # resting orders and the newest activity page provide low-latency
+        # recovery; a 15-minute audit is the exact-once archival safety net.
+        if full_audit is None:
+            full_audit = (
+                last_full_at is None
+                or (datetime.now(UTC) - last_full_at).total_seconds() >= 900
+            )
+        orders_call = self.client.orders if full_audit else lambda: self.client.orders(status="resting")
+        fills_call = (
+            self.client.fills if full_audit
+            else getattr(self.client, "recent_fills", self.client.fills)
+        )
+        settlements_call = (
+            self.client.settlements if full_audit
+            else getattr(self.client, "recent_settlements", self.client.settlements)
+        )
         requests = [
             asyncio.create_task(call())
             for call in (
-                self.client.balance, self.client.orders, self.client.fills,
-                self.client.positions, self.client.settlements,
+                self.client.balance, orders_call, fills_call,
+                self.client.positions, settlements_call,
             )
         ]
         try:
@@ -1811,6 +1847,17 @@ class KalshiBroker(Broker):
             self._reconciliation_paused = True
             raise
         observed_at = iso_now()
+        self.db.execute(
+            """
+            INSERT INTO broker_reconciliation_watermarks(mode,last_full_at,last_activity_at,updated_at)
+            VALUES (?,?,?,?)
+            ON CONFLICT(mode) DO UPDATE SET
+                last_full_at=CASE WHEN excluded.last_full_at IS NULL
+                    THEN broker_reconciliation_watermarks.last_full_at ELSE excluded.last_full_at END,
+                last_activity_at=excluded.last_activity_at, updated_at=excluded.updated_at
+            """,
+            (self.mode, observed_at if full_audit else None, observed_at, observed_at),
+        )
         available = _dollars(balance, "balance_dollars", "balance")
         portfolio_value = _number(balance.get("portfolio_value")) / 100.0
         self.db.execute(
@@ -1987,6 +2034,7 @@ class KalshiBroker(Broker):
                 "fills": len(remote_fills),
                 "positions": len(remote_positions),
                 "settlements": len(remote_settlements),
+                "full_audit": bool(full_audit),
                 "unresolved_submissions": int(unresolved.get("count") or 0),
             },
         )

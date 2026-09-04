@@ -155,6 +155,10 @@ class TradingCoordinator:
         self._private_event_recovery_tasks: dict[tuple[str, str, str], asyncio.Task[None]] = {}
         self._pending_automatic_keys: set[tuple[str, str]] = set()
         self._pending_exit_keys: set[tuple[str, str, str]] = set()
+        # Quote updates can arrive faster than authenticated exit work. Keep
+        # one processor and retain the newest snapshot for its next pass.
+        self._latest_process_current: dict[str, Any] | None = None
+        self._process_task: asyncio.Task[None] | None = None
 
     @property
     def selected_mode(self) -> str:
@@ -1664,11 +1668,34 @@ class TradingCoordinator:
     def schedule_process(self, current: dict[str, Any] | None) -> None:
         if not current:
             return
-        self._track_task(asyncio.create_task(self.process(current)))
+        self._latest_process_current = current
+        if self._process_task and not self._process_task.done():
+            return
+
+        async def coalesced_process() -> None:
+            while self._latest_process_current is not None:
+                # Clear before awaiting so any arriving tick is retained.
+                snapshot = self._latest_process_current
+                self._latest_process_current = None
+                try:
+                    await self.process(snapshot)
+                except Exception:
+                    # One failed background pass must not kill later updates.
+                    continue
+
+        task = asyncio.create_task(coalesced_process())
+        self._process_task = task
+        task.add_done_callback(
+            lambda done: setattr(self, "_process_task", None)
+            if self._process_task is done else None
+        )
+        self._track_task(task)
 
     async def _process_exits(self, broker: KalshiBroker, current: dict[str, Any]) -> None:
         ticker = str(current.get("ticker") or "")
-        observed = parse_time(current.get("observed_at"))
+        # BTC ticks may refresh the dashboard while Kalshi's executable book is
+        # frozen.  Protective orders must never be based on that older quote.
+        observed = parse_time(current.get("executable_quote_at"))
         quote_fresh = bool(
             observed
             and (time.time() - observed.timestamp())
@@ -1684,9 +1711,7 @@ class TradingCoordinator:
         threshold = current.get("strike")
         quality = current.get("data_quality") or {}
         data_reliable = bool(quality.get("reliable"))
-        for position in broker.portfolio().get("positions", []):
-            if position.get("ticker") != ticker:
-                continue
+        for position in broker.open_positions(ticker):
             side = str(position.get("side"))
             texas_position = self._is_persisted_texas_position(broker.mode, position)
             threshold_exit = threshold_breach_exit_state(
@@ -1778,8 +1803,9 @@ class TradingCoordinator:
                     break
                 consecutive_unfilled += 1
             if consecutive_unfilled:
-                # Repeating an unfilled protective order at an unchanged price
-                # cannot improve execution and can churn a thin market.
+                # An IOC rejection/cancel can be a transient exchange race.
+                # Back off, but never suppress safety exits indefinitely at an
+                # unchanged quote. Unknown/active orders remain hard holds.
                 latest_rejected = rejected_exits[0]
                 latest_snapshot = _json_object(
                     latest_rejected.get("decision_snapshot_json")
@@ -1798,7 +1824,10 @@ class TradingCoordinator:
                     ) < 1e-9
                 )
                 if unchanged_market or unchanged_limit:
-                    continue
+                    last_attempt = parse_time(latest_rejected.get("updated_at"))
+                    delay = min(8.0, float(2 ** min(consecutive_unfilled - 1, 3)))
+                    if last_attempt and time.time() - last_attempt.timestamp() < delay:
+                        continue
             pending_key = (broker.mode, ticker, side)
             if pending_key in self._pending_exit_keys:
                 if reason == "THRESHOLD_BREACH_EXIT":

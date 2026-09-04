@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import asyncio
 import inspect
+from datetime import UTC, datetime, timedelta
 
 import httpx
 import pytest
@@ -185,6 +186,21 @@ def test_live_composite_is_not_pinned_by_rest_only_quote() -> None:
     assert len(composite.quotes) == 3
 
 
+def test_live_composite_discards_a_stale_venue_quote() -> None:
+    now = datetime(2026, 9, 3, tzinfo=UTC)
+    quotes = [
+        ExchangeQuote("Coinbase", 100.0, None, None, None, 0.0, now.isoformat()),
+        ExchangeQuote("Kraken", 200.0, None, None, None, 0.0, (now - timedelta(seconds=21)).isoformat()),
+    ]
+
+    composite = live_composite_quote(
+        quotes, {"Coinbase", "Kraken"}, now=now, maximum_age_seconds=20,
+    )
+
+    assert composite.price == 100.0
+    assert [quote.exchange for quote in composite.quotes] == ["Coinbase"]
+
+
 @pytest.mark.parametrize(
     ("market", "market_state"),
     [
@@ -205,7 +221,10 @@ def test_live_refresh_ignores_incomplete_or_mismatched_market_transition(
 
 def test_benchmark_band_and_sparse_settlement_window_block_automatic_trade() -> None:
     btc = {"exchange_count": 3, "dispersion_pct": 0.01}
-    market = {"yes_bid": 0.54, "yes_ask": 0.55, "no_bid": 0.45, "no_ask": 0.46}
+    market = {
+        "yes_bid": 0.54, "yes_ask": 0.55, "no_bid": 0.45, "no_ask": 0.46,
+        "executable_quote_at": datetime.now(UTC).isoformat(),
+    }
     settings = {"max_exchange_dispersion_pct": 0.4}
 
     inside_band = AnalysisEngine._data_quality(
@@ -233,3 +252,26 @@ def test_benchmark_band_and_sparse_settlement_window_block_automatic_trade() -> 
     assert inside_band["trade_allowed"] is False
     assert inside_band["reason_code"] == "BENCHMARK_UNCERTAINTY"
     assert sparse_window["reason_code"] == "SETTLEMENT_WINDOW_INCOMPLETE"
+
+
+def test_data_quality_requires_current_kalshi_executable_quote() -> None:
+    market = {"yes_bid": .54, "yes_ask": .55, "no_bid": .45, "no_ask": .46}
+    result = AnalysisEngine._data_quality(
+        {"exchange_count": 3, "dispersion_pct": .01}, market, 30.0,
+        {"max_exchange_dispersion_pct": .4, "max_data_age_seconds": 20},
+        reference_price=101.0, strike=100.0, benchmark_uncertainty_pct=.0001,
+        settlement_window={"elapsed_seconds": 0.0, "coverage": 1.0},
+    )
+    assert result == {
+        "reliable": False,
+        "reason": "the Kalshi executable quote timestamp is unavailable",
+    }
+
+    market["executable_quote_at"] = (datetime.now(UTC) - timedelta(seconds=21)).isoformat()
+    stale = AnalysisEngine._data_quality(
+        {"exchange_count": 3, "dispersion_pct": .01}, market, 30.0,
+        {"max_exchange_dispersion_pct": .4, "max_data_age_seconds": 20},
+        reference_price=101.0, strike=100.0, benchmark_uncertainty_pct=.0001,
+        settlement_window={"elapsed_seconds": 0.0, "coverage": 1.0},
+    )
+    assert stale["reason"] == "the Kalshi executable quote is stale"

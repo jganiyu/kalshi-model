@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from datetime import UTC, datetime
 from dataclasses import asdict, dataclass
 from typing import Any
 
@@ -18,6 +19,10 @@ class ExchangeQuote:
     ask: float | None
     volume: float | None
     latency_ms: float
+    # This is when the application received the quote, rather than the time a
+    # composite happened to be rebuilt.  A frozen WebSocket value must not be
+    # silently kept alive by ticks from another venue.
+    observed_at: str | None = None
 
 
 @dataclass(frozen=True)
@@ -49,8 +54,26 @@ class CompositeQuote:
 
 
 def live_composite_quote(
-    quotes: list[ExchangeQuote], preferred_exchanges: set[str]
+    quotes: list[ExchangeQuote], preferred_exchanges: set[str], *,
+    now: datetime | None = None, maximum_age_seconds: float = 20.0,
 ) -> CompositeQuote:
+    now = now or datetime.now(UTC)
+    fresh: list[ExchangeQuote] = []
+    for quote in quotes:
+        if quote.observed_at is None:
+            # Compatibility with callers that supply an already-current
+            # sample (not persisted or retained stream state).
+            fresh.append(quote)
+            continue
+        try:
+            observed = datetime.fromisoformat(quote.observed_at.replace("Z", "+00:00"))
+            if observed.tzinfo is None:
+                observed = observed.replace(tzinfo=UTC)
+            if (now - observed).total_seconds() <= maximum_age_seconds:
+                fresh.append(quote)
+        except ValueError:
+            continue
+    quotes = fresh
     full_price, dispersion = robust_composite([quote.price for quote in quotes])
     preferred = [
         quote.price for quote in quotes if quote.exchange in preferred_exchanges
@@ -107,7 +130,10 @@ class BitcoinCompositeFeed:
             bid = float(payload["bid"])
             ask = float(payload["ask"])
             volume = float(payload["volume"])
-        return ExchangeQuote(name, price, bid, ask, volume, latency)
+        return ExchangeQuote(
+            name, price, bid, ask, volume, latency,
+            datetime.now(UTC).isoformat(),
+        )
 
     async def coinbase_candles(
         self, start_iso: str, end_iso: str, granularity: int = 60

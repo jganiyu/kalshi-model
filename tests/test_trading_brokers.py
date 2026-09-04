@@ -571,7 +571,7 @@ def test_additive_migration_preserves_existing_paper_history(tmp_path: Path) -> 
         )
     db.initialize()
     assert db.fetch_one("SELECT side FROM paper_trades WHERE ticker='OLD'")["side"] == "NO"
-    assert db.fetch_one("SELECT MAX(version) version FROM schema_migrations")["version"] == 21
+    assert db.fetch_one("SELECT MAX(version) version FROM schema_migrations")["version"] == 22
     assert db.fetch_one("SELECT COUNT(*) count FROM broker_order_intents")["count"] == 0
 
 
@@ -855,6 +855,37 @@ async def test_paginated_reconciliation_reads_every_page(tmp_path: Path) -> None
     assert [row["order_id"] for row in payload["orders"]] == ["one", "two"]
     assert calls == ["", "next"]
     await http.aclose()
+
+
+@run_async
+async def test_reconciliation_uses_small_recent_activity_after_initial_full_audit(
+    tmp_path: Path,
+) -> None:
+    db, broker, client = await ready_broker(tmp_path)
+    await broker.reconcile()
+    recent_fills = 0
+    recent_settlements = 0
+
+    async def only_recent_fills() -> dict[str, list[dict[str, object]]]:
+        nonlocal recent_fills
+        recent_fills += 1
+        return {"fills": []}
+
+    async def only_recent_settlements() -> dict[str, list[dict[str, object]]]:
+        nonlocal recent_settlements
+        recent_settlements += 1
+        return {"settlements": []}
+
+    client.recent_fills = only_recent_fills  # type: ignore[attr-defined]
+    client.recent_settlements = only_recent_settlements  # type: ignore[attr-defined]
+    await broker.reconcile()
+
+    assert recent_fills == 1
+    assert recent_settlements == 1
+    watermark = db.fetch_one(
+        "SELECT last_full_at,last_activity_at FROM broker_reconciliation_watermarks WHERE mode='DEMO'"
+    )
+    assert watermark and watermark["last_full_at"] and watermark["last_activity_at"]
 
 
 @run_async
@@ -2198,6 +2229,7 @@ async def test_rejected_protective_exit_reconciles_and_backs_off(
     client.reject_sells = True
     current = {
         "ticker": "EXIT-RETRY", "status": "active", "observed_at": iso_now(),
+        "executable_quote_at": iso_now(),
         "time_remaining_seconds": 300, "yes_bid": 0.99, "no_bid": 0.01,
         "exchange_index": 2,
         "price_ranges": [
@@ -2222,6 +2254,46 @@ async def test_rejected_protective_exit_reconciles_and_backs_off(
         "SELECT COUNT(*) count FROM broker_order_intents "
         "WHERE mode='DEMO' AND ticker='EXIT-RETRY' AND action='SELL'"
     )["count"] == 1
+
+    # A transient rejection at an unchanged quote is not a permanent lockout.
+    # Age the persisted attempt past the bounded retry delay and verify a new,
+    # separately idempotent IOC is allowed.
+    db.execute(
+        "UPDATE broker_order_intents SET updated_at='2000-01-01T00:00:00Z' "
+        "WHERE mode='DEMO' AND ticker='EXIT-RETRY' AND action='SELL'"
+    )
+    await coordinator.process(current)
+    await asyncio.gather(*list(coordinator._submission_tasks))
+    assert len(client.created) == 2
+
+
+@run_async
+async def test_scheduled_exit_processing_is_single_flight_and_keeps_latest_tick(
+    tmp_path: Path,
+) -> None:
+    db = make_db(tmp_path)
+    coordinator = TradingCoordinator(
+        AppConfig(database_path=db.path), db, PaperTradingService(db)
+    )
+    started = asyncio.Event()
+    release = asyncio.Event()
+    seen: list[str] = []
+
+    async def slow_process(current: dict[str, Any]) -> None:
+        seen.append(str(current["ticker"]))
+        started.set()
+        await release.wait()
+
+    coordinator.process = slow_process  # type: ignore[method-assign]
+    coordinator.schedule_process({"ticker": "first"})
+    await started.wait()
+    coordinator.schedule_process({"ticker": "stale"})
+    coordinator.schedule_process({"ticker": "latest"})
+    release.set()
+    task = coordinator._process_task
+    assert task is not None
+    await task
+    assert seen == ["first", "latest"]
 
 
 @run_async
@@ -2570,6 +2642,7 @@ async def test_unfilled_ioc_threshold_exit_is_blocked_and_retries_only_on_new_qu
     current = {
         "ticker": "UNFILLED-EXIT", "status": "active",
         "observed_at": iso_now(), "time_remaining_seconds": 300,
+        "executable_quote_at": iso_now(),
         "yes_bid": .45, "no_bid": .55, "btc_proxy": 99.0,
         "strike": 100.0, "data_quality": {"reliable": True},
     }
@@ -2631,6 +2704,7 @@ async def test_rejected_threshold_exit_records_blocked_reason(tmp_path: Path) ->
         {
             "ticker": "BLOCKED-EXIT", "status": "active",
             "observed_at": iso_now(), "time_remaining_seconds": 300,
+            "executable_quote_at": iso_now(),
             "yes_bid": .45, "no_bid": .55, "btc_proxy": 99.0,
             "strike": 100.0, "data_quality": {"reliable": True},
         },

@@ -1010,6 +1010,21 @@ MIGRATIONS: list[tuple[int, str]] = [
             ON texas_holdem_passes(environment, target_open_epoch);
         """,
     ),
+    (
+        22,
+        """
+        -- Reconciliation cursors are deliberately per exchange environment.
+        -- They make the frequent path a small current-state refresh while a
+        -- periodic full audit still catches anything a short activity page
+        -- could have aged out of.
+        CREATE TABLE IF NOT EXISTS broker_reconciliation_watermarks (
+            mode TEXT PRIMARY KEY CHECK(mode IN ('DEMO','LIVE')),
+            last_full_at TEXT,
+            last_activity_at TEXT,
+            updated_at TEXT NOT NULL
+        );
+        """,
+    ),
 ]
 
 

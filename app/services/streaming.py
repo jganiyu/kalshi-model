@@ -7,6 +7,7 @@ import logging
 import random
 import ssl
 import time
+from datetime import UTC, datetime
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
@@ -187,6 +188,7 @@ class BitcoinWebSocketFeeds:
                             ask=self._optional_float(message.get("best_ask")),
                             volume=self._optional_float(message.get("volume_24h")),
                             latency_ms=0.0,
+                            observed_at=datetime.now(UTC).isoformat(),
                         )
                     )
                 elif message.get("type") == "match":
@@ -255,6 +257,7 @@ class BitcoinWebSocketFeeds:
                             ask=self._optional_float(payload.get("ask")),
                             volume=self._optional_float(payload.get("volume")),
                             latency_ms=0.0,
+                            observed_at=datetime.now(UTC).isoformat(),
                         )
                     )
                 elif message.get("channel") == "trade":

@@ -86,7 +86,6 @@ PUBLIC_MARKET_HTTP_TIMEOUT = httpx.Timeout(
     pool=1.0,
 )
 
-
 class AnalysisEngine:
     def __init__(self, config: AppConfig, db: Database):
         self.config = config
@@ -109,6 +108,9 @@ class AnalysisEngine:
             "residual_sigma_pct": None,
             "uncertainty_pct": DEFAULT_BENCHMARK_UNCERTAINTY_PCT,
         }
+        # Startup must show the last evaluated calibration, not an empty
+        # placeholder or a synchronous historical retraining scan.
+        self._calibration_summary: dict[str, Any] = self.models.latest_calibration_summary()
         self._recent_btc_samples: list[tuple[float, float]] = []
         self._recent_btc_volume_points: list[tuple[float, float]] = []
         self._btc_samples_loaded = False
@@ -192,12 +194,12 @@ class AnalysisEngine:
             ]
         )
         self._start_kalshi_stream()
-        existing = self.db.fetch_one(
-            "SELECT 1 AS present FROM signal_snapshots "
-            "WHERE material_reason='historical bootstrap' LIMIT 1"
-        )
-        if not existing:
-            self._bootstrap_task = asyncio.create_task(self._bootstrap())
+        # Historical bootstrap can read a large local archive.  It is manual
+        # work, never a startup prerequisite for live connectivity.
+        self.dashboard["bootstrap"] = {
+            "status": "not_started",
+            "message": "Historical bootstrap is available on demand in Settings.",
+        }
 
     async def stop(self) -> None:
         self._stopping.set()
@@ -296,6 +298,7 @@ class AnalysisEngine:
             ).run()
             self._benchmark_calibration = self.models.benchmark_calibration()
             report = self.models.evaluate_and_retrain("automatic historical bootstrap")
+            self._calibration_summary = dict(report["current"])
             self.dashboard["bootstrap"] = {"status": "complete", **result, "report": report["tldr"]}
         except asyncio.CancelledError:
             raise
@@ -312,6 +315,7 @@ class AnalysisEngine:
         result = await HistoricalBootstrapService(self.db, self.kalshi, self.bitcoin).run()
         self._benchmark_calibration = self.models.benchmark_calibration()
         report = self.models.evaluate_and_retrain("manual historical bootstrap")
+        self._calibration_summary = dict(report["current"])
         self.dashboard["bootstrap"] = {"status": "complete", **result, "report": report["tldr"]}
         return self.dashboard["bootstrap"]
 
@@ -585,6 +589,10 @@ class AnalysisEngine:
                 "bitcoin": {
                     "connected": bool(bitcoin_sources),
                     "sources": bitcoin_sources,
+                    "status": {
+                        name: dict(self._stream_status.get(name, {}))
+                        for name in ("Coinbase", "Kraken", "Bitstamp")
+                    },
                 },
                 "kalshi": {
                     "connected": bool(kalshi_status.get("connected")),
@@ -608,6 +616,7 @@ class AnalysisEngine:
     ) -> None:
         status = self._stream_status.setdefault(source, {})
         status["connected"] = connected
+        status["updated_at"] = iso_now()
         if error:
             status["error"] = error
         else:
@@ -646,7 +655,10 @@ class AnalysisEngine:
                 for name in ("Coinbase", "Kraken")
                 if self._stream_status[name].get("connected")
             }
-            composite = live_composite_quote(quotes, preferred)
+            composite = live_composite_quote(
+                quotes, preferred,
+                maximum_age_seconds=float(self.db.settings().get("max_data_age_seconds", 20)),
+            )
             if composite.price is not None:
                 now = time.monotonic()
                 persist = now - self._last_btc_persist >= 1.0
@@ -802,6 +814,7 @@ class AnalysisEngine:
             {
                 "ticker": market["ticker"],
                 "observed_at": iso_now(),
+                "executable_quote_at": iso_now(),
                 "yes_bid": yes_bid,
                 "yes_ask": yes_ask,
                 "no_bid": 1.0 - float(yes_ask) if yes_ask is not None else None,
@@ -1246,6 +1259,10 @@ class AnalysisEngine:
         state = {
             "ticker": market["ticker"],
             "observed_at": observed_at,
+            # Separate executable-book freshness from BTC proxy freshness.
+            # Exit and entry paths may use only this timestamp for Kalshi
+            # price validity.
+            "executable_quote_at": observed_at,
             "yes_bid": yes_bid,
             "yes_ask": yes_ask,
             "no_bid": no_bid,
@@ -1689,13 +1706,21 @@ class AnalysisEngine:
             return {"reliable": False, "reason": "fewer than two exchange feeds responded"}
         now = datetime.now(UTC)
         maximum_age = float(settings.get("max_data_age_seconds", 20))
-        for label, timestamp in (
-            ("BTC", btc.get("observed_at")),
-            ("Kalshi", market.get("observed_at")),
-        ):
+        for label, timestamp in (("BTC", btc.get("observed_at")),):
             parsed = parse_time(timestamp)
             if parsed is not None and (now - parsed).total_seconds() > maximum_age:
                 return {"reliable": False, "reason": f"the {label} feed is stale"}
+        executable_quote_at = parse_time(market.get("executable_quote_at"))
+        if executable_quote_at is None:
+            return {
+                "reliable": False,
+                "reason": "the Kalshi executable quote timestamp is unavailable",
+            }
+        if (now - executable_quote_at).total_seconds() > maximum_age:
+            return {
+                "reliable": False,
+                "reason": "the Kalshi executable quote is stale",
+            }
         if float(btc.get("dispersion_pct") or 0) > float(settings["max_exchange_dispersion_pct"]):
             return {"reliable": False, "reason": "cross-exchange prices disagree beyond the configured limit"}
         if seconds_remaining <= float(settings.get("closing_guard_seconds", 10)):
@@ -1812,20 +1837,6 @@ class AnalysisEngine:
             self._pending_settlements.discard(ticker)
             if inserted:
                 self._benchmark_calibration = self.models.benchmark_calibration()
-                count = self.db.fetch_one("SELECT COUNT(*) AS count FROM settlements")["count"]
-                settings = self.db.settings()
-                latest = self.db.fetch_one(
-                    "SELECT created_at FROM calibration_reports ORDER BY created_at DESC LIMIT 1"
-                )
-                latest_time = parse_time(latest["created_at"]) if latest else None
-                cadence_hours = float(settings.get("retraining_cadence_hours", 24))
-                cadence_due = (
-                    latest_time is None
-                    or (datetime.now(UTC) - latest_time).total_seconds()
-                    >= cadence_hours * 3600
-                )
-                if count <= int(settings.get("initial_retrain_settlements", 20)) or cadence_due:
-                    self.models.evaluate_and_retrain(f"settlement: {ticker}")
 
     def _unreliable_current(self, market: dict[str, Any], reason: str) -> dict[str, Any]:
         summary = self._market_summary(market)
@@ -2007,10 +2018,7 @@ class AnalysisEngine:
             return {"reset": reset, "portfolio": portfolio}
 
     def calibration_summary(self) -> dict[str, Any]:
-        observations = self.models.observations()
-        return calibration_metrics(
-            (row["model_probability"], row["result"]) for row in observations
-        )
+        return dict(self._calibration_summary)
 
     def chart(self, minutes: int) -> dict[str, Any]:
         minutes = max(5, min(360, int(minutes)))

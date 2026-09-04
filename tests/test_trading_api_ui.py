@@ -127,6 +127,7 @@ def test_trading_ui_contains_mode_safety_and_confirmation_controls() -> None:
     root = Path(__file__).resolve().parents[1]
     template = (root / "app/templates/index.html").read_text()
     script = (root / "app/static/app.js").read_text()
+    styles = (root / "app/static/styles.css").read_text()
 
     for mode in ("PAPER", "DEMO", "LIVE"):
         assert f'data-trading-mode="{mode}"' in template
@@ -175,6 +176,13 @@ def test_trading_ui_contains_mode_safety_and_confirmation_controls() -> None:
     assert "arming_generation" in script
     assert "data.strategy?.texas_holdem" in script
     assert '"Kalshi market data reconnecting"' in script
+    assert 'id="connection-coinbase"' in template
+    assert 'id="connection-kraken"' in template
+    assert 'id="connection-bitstamp"' in template
+    assert 'id="connection-kalshi-market"' in template
+    assert 'id="connection-kalshi-account"' in template
+    assert "function renderConnectionHud(streams, btc, current)" in script
+    assert 'data-state="reconnecting"' in styles
 
 
 def test_dashboard_theme_switch_reuses_persisted_theme_without_header_metadata() -> None:

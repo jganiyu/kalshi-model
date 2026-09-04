@@ -8,7 +8,9 @@ from pathlib import Path
 import pytest
 
 from app.db import Database
+from app.config import AppConfig
 from app.domain import iso_now
+from app.engine import AnalysisEngine
 from app.services.decision import Decision
 from app.services.paper import PaperTradingService
 from app.services.training import ModelManager
@@ -40,7 +42,7 @@ def test_database_migrations_and_settings_persist(tmp_path: Path) -> None:
     reopened.initialize()
     assert reopened.settings()["starting_bankroll"] == 2_500.0
     assert "unknown" not in reopened.settings()
-    assert reopened.fetch_one("SELECT MAX(version) version FROM schema_migrations")["version"] == 21
+    assert reopened.fetch_one("SELECT MAX(version) version FROM schema_migrations")["version"] == 22
     assert ModelManager(reopened).active()["version"] == "baseline-1.1"
 
 
@@ -191,6 +193,46 @@ def test_model_promotion_requires_forward_validation_and_minimum_sample(tmp_path
     assert report["candidate"]["sample_size"] < 120
     assert report["promoted"] is True
     assert manager.active()["model_type"] == "regularized-logistic"
+
+
+def test_calibration_summary_never_scans_history_from_live_path(
+    tmp_path: Path,
+) -> None:
+    db = make_db(tmp_path)
+    engine = AnalysisEngine(AppConfig(database_path=db.path), db)
+    calls = 0
+
+    def observations() -> list[dict[str, float | int]]:
+        nonlocal calls
+        calls += 1
+        raise AssertionError("live calibration summary must use cached evidence")
+
+    engine.models.observations = observations  # type: ignore[method-assign]
+
+    assert engine.calibration_summary()["sample_size"] == 0
+    assert calls == 0
+
+
+def test_engine_restart_loads_persisted_calibration_summary_without_retraining(
+    tmp_path: Path,
+) -> None:
+    db = make_db(tmp_path)
+    persisted = {"sample_size": 42, "calibration_error": 0.12, "brier_score": 0.2}
+    db.execute(
+        """
+        INSERT INTO calibration_reports(
+            created_at,trigger,tldr,settled_contracts,active_model_version,
+            candidate_model_version,promoted,brier_before,brier_after,
+            calibration_error,report_json
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?)
+        """,
+        (iso_now(), "test", "saved", 42, "baseline-1.1", None, 0,
+         None, 0.2, 0.12, json.dumps({"current": persisted})),
+    )
+    engine = AnalysisEngine(AppConfig(database_path=db.path), db)
+    engine.models.observations = lambda: (_ for _ in ()).throw(AssertionError("no scan"))  # type: ignore[method-assign]
+
+    assert engine.calibration_summary() == persisted
 
 
 def test_benchmark_calibration_learns_from_final_minute_proxy_ticks(tmp_path: Path) -> None:

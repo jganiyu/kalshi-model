@@ -490,6 +490,10 @@ class KalshiTradingClient:
             params["cursor"] = cursor
         return await self._all_pages("/portfolio/fills", "fills", params=params)
 
+    async def recent_fills(self) -> dict[str, Any]:
+        """Newest activity page only; the full audit remains available via fills()."""
+        return await self._request("GET", "/portfolio/fills", params={"limit": 1000})
+
     async def settlements(self, *, cursor: str | None = None) -> dict[str, Any]:
         params: dict[str, Any] = {}
         if cursor:
@@ -497,6 +501,10 @@ class KalshiTradingClient:
         return await self._all_pages(
             "/portfolio/settlements", "settlements", params=params
         )
+
+    async def recent_settlements(self) -> dict[str, Any]:
+        """Newest settlement page only; avoids rereading the account archive."""
+        return await self._request("GET", "/portfolio/settlements", params={"limit": 1000})
 
     async def market(self, ticker: str) -> dict[str, Any]:
         """Return the authoritative market state used to resolve timed-out orders."""

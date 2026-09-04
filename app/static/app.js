@@ -731,6 +731,7 @@ function renderDashboard(data) {
     ? `${btc.exchange_count} feeds · ${Number(btc.dispersion_pct || 0).toFixed(3)}% dispersion`
     : "No composite available";
   $("#composite-source").textContent = btc.quotes?.map((quote) => quote.exchange).join(" · ") || "Multi-exchange median";
+  renderConnectionHud(streams, btc, current);
 
   state.closeTime = current?.close_time ? new Date(current.close_time) : null;
   updateCountdown();
@@ -770,6 +771,49 @@ function renderDashboard(data) {
     state.lastNotification = data.notification.signal_id;
     showToast(formatMarketLanguage(data.notification.title), formatMarketLanguage(data.notification.detail));
   }
+}
+
+function renderConnectionHud(streams, btc, current) {
+  const sources = new Set(streams.bitcoin?.sources || []);
+  const quotes = new Map((btc.quotes || []).map((quote) => [quote.exchange, quote]));
+  const age = (timestamp) => timestamp ? Math.max(0, Date.now() - new Date(timestamp).getTime()) / 1000 : Infinity;
+  const stale = (timestamp) => !Number.isFinite(age(timestamp)) || age(timestamp) > 20;
+  const ageLabel = (timestamp) => Number.isFinite(age(timestamp)) ? `${Math.round(age(timestamp))}s ago` : "No quote";
+  const marketStale = stale(current?.executable_quote_at);
+  const set = (id, state, label) => {
+    const item = $(id);
+    if (!item) return;
+    item.dataset.state = state;
+    item.querySelector("em").textContent = label;
+  };
+  for (const source of ["Coinbase", "Kraken"]) {
+    const quote = quotes.get(source);
+    const quoteStale = stale(quote?.observed_at);
+    const live = sources.has(source) && !quoteStale;
+    const fallback = !!quote && !quoteStale;
+    set(
+      `#connection-${source.toLowerCase()}`,
+      live ? "live" : fallback ? "fallback" : quote ? "stale" : "offline",
+      live ? `WS · ${ageLabel(quote.observed_at)}` : fallback ? `REST · ${ageLabel(quote.observed_at)}` : quote ? `Stale · ${ageLabel(quote.observed_at)}` : "Unavailable",
+    );
+  }
+  set(
+    "#connection-bitstamp",
+    quotes.has("Bitstamp") && !stale(quotes.get("Bitstamp")?.observed_at) ? "live" : quotes.has("Bitstamp") ? "stale" : "offline",
+    quotes.has("Bitstamp") && !stale(quotes.get("Bitstamp")?.observed_at) ? `REST · ${ageLabel(quotes.get("Bitstamp").observed_at)}` : quotes.has("Bitstamp") ? `Stale · ${ageLabel(quotes.get("Bitstamp").observed_at)}` : "Unavailable",
+  );
+  const kalshi = streams.kalshi || {};
+  set(
+    "#connection-kalshi-market",
+    kalshi.connected && !marketStale ? "live" : !marketStale ? "fallback" : kalshi.configured ? "reconnecting" : "offline",
+    kalshi.connected && !marketStale ? `WS · ${ageLabel(current?.executable_quote_at)}` : !marketStale ? `REST · ${ageLabel(current?.executable_quote_at)}` : kalshi.configured ? "Reconnecting · quote stale" : "Unavailable",
+  );
+  const execution = streams.kalshi_execution || {};
+  set(
+    "#connection-kalshi-account",
+    execution.last_rest_available && execution.reconciled ? "live" : execution.last_rest_available ? "reconnecting" : execution.error ? "offline" : "reconnecting",
+    execution.last_rest_available && execution.reconciled ? "REST ready" : execution.last_rest_available ? "Reconciling" : execution.error ? "Unavailable" : "Checking",
+  );
 }
 
 function paperQuote(side = state.paperOrder.side, action = state.paperOrder.action) {
@@ -1252,6 +1296,13 @@ function updateCountdown() {
     ? countdown((state.closeTime.getTime() - Date.now()) / 1000)
     : "--:--";
   $("#chart-countdown").textContent = value;
+  // Quote ages continue to change even while an upstream connection is quiet.
+  // Keep the dots truthful between dashboard snapshots.
+  renderConnectionHud(
+    state.dashboard?.system?.streams || {},
+    state.dashboard?.btc || {},
+    state.dashboard?.current,
+  );
 }
 
 function resetChartAxis() {
