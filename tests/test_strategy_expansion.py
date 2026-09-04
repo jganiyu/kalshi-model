@@ -1060,6 +1060,28 @@ def test_dashboard_markup_has_two_fixed_books_and_paper_trade_history() -> None:
     assert trading_page.index("Trade ledger") < trading_page.index("Positions and orders")
 
 
+def test_next_threshold_forecast_is_isolated_beneath_current_threshold() -> None:
+    root = Path(__file__).resolve().parents[1]
+    markup = (root / "app/templates/index.html").read_text()
+    script = (root / "app/static/app.js").read_text()
+    styles = (root / "app/static/styles.css").read_text()
+
+    threshold_stat = markup[
+        markup.index('<div class="chart-price-stat">'):
+        markup.index('<div class="chart-price-stat">', markup.index('<div class="chart-price-stat">') + 1)
+    ]
+    assert threshold_stat.index('id="chart-to-beat"') < threshold_stat.index('id="next-threshold-forecast"')
+    assert 'aria-live="polite" hidden' in threshold_stat
+    assert 'id="next-threshold-estimate"' in threshold_stat
+    assert 'id="next-threshold-progress"' in threshold_stat
+    assert 'Proxy estimate · not official' in threshold_stat
+    assert 'function renderNextThresholdForecast(data)' in script
+    assert 'container.hidden = true;' in script
+    assert 'renderNextThresholdForecast(data);' in script
+    assert 'renderNextThresholdForecast(dashboard);' in script
+    assert '.next-threshold-forecast {' in styles
+
+
 def test_dashboard_open_trades_and_collapsible_manual_ticket_markup() -> None:
     root = Path(__file__).resolve().parents[1]
     markup = (root / "app/templates/index.html").read_text()

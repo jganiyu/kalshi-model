@@ -80,6 +80,48 @@ function signedMoney(value, digits = 2) {
   return `${number > 0 ? "+" : number < 0 ? "−" : ""}${money(Math.abs(number), digits)}`;
 }
 
+function renderNextThresholdForecast(data) {
+  const forecast = data?.next_threshold_forecast || data?.current?.next_threshold_forecast;
+  const container = $("#next-threshold-forecast");
+  if (!container) return;
+  const status = String(forecast?.status || "").toLowerCase();
+  const visibleStatuses = new Set([
+    "active", "collecting", "frozen", "comparing", "awaiting_official", "complete", "completed",
+  ]);
+  if (!forecast || !visibleStatuses.has(status)) {
+    container.hidden = true;
+    container.removeAttribute("data-status");
+    return;
+  }
+
+  const estimate = numberOrNull(
+    forecast.estimate ?? forecast.estimate_price ?? forecast.estimated_threshold ?? forecast.running_average,
+  );
+  const samples = Number(forecast.samples_collected ?? forecast.sample_count ?? forecast.samples ?? 0);
+  const target = Number(forecast.sample_target ?? forecast.target_samples ?? 60);
+  const safeTarget = Number.isFinite(target) && target > 0 ? Math.round(target) : 60;
+  const safeSamples = Number.isFinite(samples)
+    ? Math.min(Math.max(0, Math.round(samples)), safeTarget) : 0;
+  const official = numberOrNull(forecast.official_threshold ?? forecast.comparison?.official_threshold);
+  const error = numberOrNull(forecast.error_dollars ?? forecast.comparison?.error_dollars);
+  const phase = status === "frozen" || status === "awaiting_official"
+    ? "Frozen · awaiting Kalshi"
+    : status === "comparing" ? "Comparing with Kalshi"
+    : status === "complete" || status === "completed" ? "Final proxy estimate"
+    : `${safeSamples}/${safeTarget} one-second samples`;
+
+  $("#next-threshold-estimate").textContent = money(estimate);
+  $("#next-threshold-progress").textContent = status === "active" || status === "collecting"
+    ? `${safeSamples}/${safeTarget}` : `${safeSamples}/${safeTarget} · frozen`;
+  const comparison = status === "comparing" && official !== null
+    ? `Kalshi ${money(official)}${error === null ? "" : ` · error ${signedMoney(error)}`}`
+    : null;
+  const qualifier = forecast.qualifier || "Proxy estimate, not official";
+  $("#next-threshold-detail").textContent = [phase, comparison, qualifier].filter(Boolean).join(" · ");
+  container.dataset.status = status;
+  container.hidden = false;
+}
+
 function numberOrNull(value) {
   if (value === null || value === undefined || value === "") return null;
   const number = Number(value);
@@ -761,6 +803,7 @@ function renderDashboard(data) {
   const threshold = numberOrNull(current?.strike);
   const distance = referencePrice !== null && threshold !== null ? referencePrice - threshold : null;
   $("#chart-to-beat").textContent = money(threshold);
+  renderNextThresholdForecast(data);
   $("#btc-price").textContent = money(referencePrice);
   syncPriceMovement();
   $("#chart-now-distance").textContent = threshold === null
@@ -1835,6 +1878,7 @@ function renderLiveMarketUpdate(data) {
   const distance = referencePrice !== null && threshold !== null ? referencePrice - threshold : null;
   $("#btc-price").textContent = money(referencePrice);
   $("#chart-to-beat").textContent = money(threshold);
+  renderNextThresholdForecast(dashboard);
   $("#chart-now-distance").textContent = threshold === null
     ? "Waiting for threshold"
     : distance === null ? "Waiting for proxy price"

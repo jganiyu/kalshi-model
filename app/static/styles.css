@@ -271,6 +271,14 @@ nav { display: grid; gap: 2px; }
 #btc-price.price-up { color: var(--green); }
 #btc-price.price-down { color: var(--red); }
 .chart-price-stat small { display: block; min-height: 15px; margin-top: 6px; overflow: hidden; color: var(--muted); font-family: var(--number-font); font-size: 10px; font-variant-numeric: tabular-nums; text-overflow: ellipsis; white-space: nowrap; }
+.next-threshold-forecast { margin-top: 11px; padding: 8px 9px; border-left: 2px solid var(--chart-line); border-radius: 0 4px 4px 0; background: color-mix(in srgb, var(--chart-line) 6%, transparent); }
+.next-threshold-forecast > span { margin: 0 0 4px; color: var(--chart-line); font-size: 8px; }
+.next-threshold-forecast > div { display: flex; min-width: 0; align-items: baseline; gap: 7px; }
+.next-threshold-forecast > div strong { min-width: 0; color: var(--ink); font-size: 16px; line-height: 1.15; }
+.next-threshold-forecast > div small { min-height: 0; margin: 0; color: var(--chart-line); font-size: 9px; font-weight: 650; }
+.next-threshold-forecast > small { min-height: 0; margin-top: 3px; color: var(--faint); font-size: 8px; }
+.next-threshold-forecast[data-status="frozen"], .next-threshold-forecast[data-status="comparing"], .next-threshold-forecast[data-status="awaiting_official"] { border-left-color: var(--amber); background: color-mix(in srgb, var(--amber) 6%, transparent); }
+.next-threshold-forecast[data-status="frozen"] > span, .next-threshold-forecast[data-status="comparing"] > span, .next-threshold-forecast[data-status="awaiting_official"] > span { color: var(--amber); }
 .chart-market-timer { display: flex; flex: 0 0 auto; align-items: center; gap: 5px; margin-top: 25px; color: var(--chart-line); font-family: var(--number-font); font-variant-numeric: tabular-nums; font-feature-settings: "case" 1, "ss04" 1, "tnum" 1, "lnum" 1; }
 .chart-market-timer strong { font-size: 16px; font-weight: 550; line-height: 1; }
 .chart-timer-icon { width: 15px; height: 15px; flex: 0 0 15px; overflow: visible; transform: translateY(-1px); fill: none; stroke: currentColor; stroke-linecap: round; stroke-linejoin: round; stroke-width: 1.25; }

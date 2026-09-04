@@ -1025,6 +1025,32 @@ MIGRATIONS: list[tuple[int, str]] = [
         );
         """,
     ),
+    (
+        23,
+        """
+        -- Read-only next-threshold proxy evidence.  It is intentionally
+        -- separate from signal/order/position tables: estimates never drive
+        -- trading decisions and contain no account information.
+        CREATE TABLE next_threshold_forecasts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ticker TEXT NOT NULL,
+            target_open_time TEXT NOT NULL,
+            status TEXT NOT NULL,
+            estimate REAL,
+            samples_collected INTEGER NOT NULL,
+            coverage REAL NOT NULL,
+            sample_dispersion_dollars REAL,
+            official_threshold REAL,
+            error_dollars REAL,
+            evidence_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(ticker, target_open_time)
+        );
+        CREATE INDEX idx_next_threshold_forecasts_open
+            ON next_threshold_forecasts(target_open_time DESC);
+        """,
+    ),
 ]
 
 

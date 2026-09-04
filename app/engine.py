@@ -17,6 +17,7 @@ from app.config import AppConfig
 from app.db import Database
 from app.domain import (
     DEFAULT_BENCHMARK_UNCERTAINTY_PCT,
+    NextThresholdForecast,
     SETTLEMENT_WINDOW_SECONDS,
     calibration_metrics,
     clamp,
@@ -115,10 +116,12 @@ class AnalysisEngine:
         self._recent_btc_samples: list[tuple[float, float]] = []
         self._recent_btc_volume_points: list[tuple[float, float]] = []
         self._btc_samples_loaded = False
+        self._next_threshold_forecast = NextThresholdForecast()
         self.dashboard: dict[str, Any] = {
             "system": {"status": "starting", "message": "Connecting to public data feeds."},
             "current": None,
             "next": None,
+            "next_threshold_forecast": None,
             "btc": None,
             "notification": None,
             "strategy": {"texas_holdem": self._texas_recovery_state()},
@@ -345,6 +348,7 @@ class AnalysisEngine:
         self._latest_btc = btc_state
         self._current_market = current_market
         self._next_market = next_market
+        self._update_next_threshold_forecast(observed_at)
         settings = self.db.settings()
         current_payload = None
         notification = None
@@ -432,6 +436,7 @@ class AnalysisEngine:
             "btc": btc_state,
             "current": current_payload,
             "next": self._market_summary(next_market) if next_market else None,
+            "next_threshold_forecast": self._next_threshold_forecast_state(),
             "notification": notification,
             "strategy": {"texas_holdem": self._texas_recovery_state()},
             "paper": self._portfolio_summary(),
@@ -706,6 +711,7 @@ class AnalysisEngine:
                 )
                 if persist:
                     self._last_btc_persist = now
+            self._update_next_threshold_forecast(observed_at)
             self._refresh_cached_dashboard(observed_at)
             self._last_live_update = time.monotonic()
 
@@ -955,6 +961,7 @@ class AnalysisEngine:
             )
             if self._next_market is market:
                 self.dashboard["next"] = self._market_summary(market)
+            self._update_next_threshold_forecast(observed_at)
         self._schedule_live_refresh()
 
     @staticmethod
@@ -2044,6 +2051,61 @@ class AnalysisEngine:
             "rules_primary": market.get("rules_primary"),
             "rules_secondary": market.get("rules_secondary"),
         }
+
+    def _persist_next_threshold_forecast(self, evidence: dict[str, Any]) -> None:
+        """Persist only terminal forecast evidence, never on the quote hot path."""
+        ticker = str(evidence.get("ticker") or "")
+        open_time = str(evidence.get("target_open_time") or "")
+        if not ticker or not open_time:
+            return
+        comparison = evidence.get("comparison") or {}
+        self.db.execute(
+            """
+            INSERT INTO next_threshold_forecasts(
+                ticker,target_open_time,status,estimate,samples_collected,coverage,
+                sample_dispersion_dollars,official_threshold,error_dollars,
+                evidence_json,created_at,updated_at
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(ticker,target_open_time) DO UPDATE SET
+                status=excluded.status,estimate=excluded.estimate,
+                samples_collected=excluded.samples_collected,coverage=excluded.coverage,
+                sample_dispersion_dollars=excluded.sample_dispersion_dollars,
+                official_threshold=excluded.official_threshold,
+                error_dollars=excluded.error_dollars,evidence_json=excluded.evidence_json,
+                updated_at=excluded.updated_at
+            """,
+            (
+                ticker, open_time, str(evidence.get("final_state") or evidence.get("status") or "FROZEN"),
+                evidence.get("estimate"), int(evidence.get("samples_collected") or 0),
+                float(evidence.get("coverage") or 0.0), evidence.get("sample_dispersion_dollars"),
+                evidence.get("official_threshold"), comparison.get("error_dollars"),
+                json.dumps(evidence), str(evidence.get("frozen_at") or iso_now()), iso_now(),
+            ),
+        )
+
+    def _next_threshold_forecast_state(self) -> dict[str, Any] | None:
+        value = self.dashboard.get("next_threshold_forecast")
+        return dict(value) if isinstance(value, dict) else None
+
+    def _update_next_threshold_forecast(self, observed_at: str) -> None:
+        """Maintain the display-only final-minute threshold estimate.
+
+        It consumes the already-available BTC composite and market lifecycle
+        snapshots.  It does not schedule requests, analysis, trading, or gates.
+        """
+        frozen, frozen_evidence = self._next_threshold_forecast.freeze_if_due(observed_at)
+        if frozen_evidence:
+            self._persist_next_threshold_forecast(frozen_evidence)
+        state, comparison_evidence = self._next_threshold_forecast.observe(
+            next_market=self._next_market,
+            known_markets=(self._current_market, self._next_market),
+            proxy_price=(self._latest_btc or {}).get("price"),
+            observed_at=observed_at,
+            official_threshold=market_strike,
+        )
+        if comparison_evidence:
+            self._persist_next_threshold_forecast(comparison_evidence)
+        self.dashboard["next_threshold_forecast"] = state or frozen
 
     def _portfolio_summary(self) -> dict[str, Any]:
         portfolio = self.paper.portfolio()

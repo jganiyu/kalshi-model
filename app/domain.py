@@ -5,13 +5,165 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal, ROUND_CEILING
 from statistics import median
-from typing import Iterable, Sequence
+from typing import Any, Callable, Iterable, Sequence
 
 
 SECONDS_PER_YEAR = 365.25 * 24 * 60 * 60
 SETTLEMENT_WINDOW_SECONDS = 60.0
 DEFAULT_BENCHMARK_UNCERTAINTY_PCT = 0.00015
 MIN_BENCHMARK_CALIBRATION_SAMPLES = 20
+NEXT_THRESHOLD_WINDOW_SECONDS = 60
+NEXT_THRESHOLD_COMPARISON_SECONDS = 12
+
+
+class NextThresholdForecast:
+    """Read-only, per-second proxy estimate for a forthcoming market threshold.
+
+    This deliberately knows nothing about decisions, orders, or positions.  The
+    contract uses CF Benchmarks' BRTI prints, which the app does not receive, so
+    this is always labelled as a proxy estimate rather than an official value.
+    """
+
+    def __init__(self) -> None:
+        self._target_ticker: str | None = None
+        self._target_open_time: str | None = None
+        self._target_open_epoch: float | None = None
+        self._samples: dict[int, float] = {}
+        self._frozen: dict[str, Any] | None = None
+        self._comparison_until: float | None = None
+        self._last_persisted_key: tuple[str, str] | None = None
+
+    @staticmethod
+    def _market_identity(market: dict[str, Any] | None) -> tuple[str, str, float] | None:
+        if not market:
+            return None
+        ticker = str(market.get("ticker") or "")
+        open_time = str(market.get("open_time") or "")
+        parsed = parse_time(open_time)
+        if not ticker or not parsed:
+            return None
+        return ticker, open_time, parsed.timestamp()
+
+    def _payload(self, status: str, observed: datetime) -> dict[str, Any]:
+        values = list(self._samples.values())
+        estimate = sum(values) / len(values) if values else None
+        dispersion = (
+            math.sqrt(sum((value - estimate) ** 2 for value in values) / len(values))
+            if estimate is not None and values
+            else None
+        )
+        open_epoch = self._target_open_epoch
+        elapsed = (
+            clamp(observed.timestamp() - (open_epoch - NEXT_THRESHOLD_WINDOW_SECONDS), 0.0,
+                  float(NEXT_THRESHOLD_WINDOW_SECONDS))
+            if open_epoch is not None
+            else 0.0
+        )
+        expected = max(1, min(NEXT_THRESHOLD_WINDOW_SECONDS, math.ceil(elapsed)))
+        return {
+            "status": status,
+            "ticker": self._target_ticker,
+            "target_open_time": self._target_open_time,
+            "estimate": estimate,
+            "estimate_price": estimate,
+            "samples_collected": len(values),
+            "sample_target": NEXT_THRESHOLD_WINDOW_SECONDS,
+            "coverage": min(1.0, len(values) / expected),
+            "sample_dispersion_dollars": dispersion,
+            "uncertainty_dollars": dispersion,
+            "qualifier": "Proxy estimate · not official CF Benchmarks BRTI",
+            "observed_at": observed.isoformat(),
+        }
+
+    def observe(
+        self,
+        *,
+        next_market: dict[str, Any] | None,
+        known_markets: Sequence[dict[str, Any] | None],
+        proxy_price: float | None,
+        observed_at: str,
+        official_threshold: Callable[[dict[str, Any]], float | None] | None = None,
+    ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+        """Return (display_state, evidence_to_persist) for this clock tick."""
+        observed = parse_time(observed_at) or utc_now()
+        now = observed.timestamp()
+        evidence: dict[str, Any] | None = None
+
+        if self._frozen is not None:
+            target = str(self._frozen.get("ticker") or "")
+            official_market = next(
+                (market for market in known_markets if market and str(market.get("ticker") or "") == target),
+                None,
+            )
+            threshold = official_threshold(official_market) if official_market and official_threshold else None
+            if (
+                self._frozen.get("status") != "comparing"
+                and threshold is not None
+                and self._target_open_epoch is not None
+                and now >= self._target_open_epoch
+            ):
+                comparison = dict(self._frozen)
+                comparison.update({
+                    "status": "comparing",
+                    "official_threshold": float(threshold),
+                    "comparison": {
+                        "official_threshold": float(threshold),
+                        "error_dollars": float(comparison["estimate"]) - float(threshold)
+                        if comparison.get("estimate") is not None else None,
+                    },
+                    "official_observed_at": observed.isoformat(),
+                })
+                self._frozen = comparison
+                self._comparison_until = now + NEXT_THRESHOLD_COMPARISON_SECONDS
+                key = (target, "compared")
+                if self._last_persisted_key != key:
+                    evidence = dict(comparison)
+                    evidence["final_state"] = "COMPARED"
+                    self._last_persisted_key = key
+            if self._frozen.get("status") == "comparing" and self._comparison_until and now >= self._comparison_until:
+                self._frozen = None
+                self._comparison_until = None
+                self._target_ticker = None
+                self._target_open_time = None
+                self._target_open_epoch = None
+                self._samples = {}
+            elif self._frozen is not None:
+                return dict(self._frozen), evidence
+
+        identity = self._market_identity(next_market)
+        if identity is None:
+            return None, evidence
+        ticker, open_time, open_epoch = identity
+        if not (open_epoch - NEXT_THRESHOLD_WINDOW_SECONDS <= now < open_epoch):
+            return None, evidence
+        if ticker != self._target_ticker or open_time != self._target_open_time:
+            self._target_ticker = ticker
+            self._target_open_time = open_time
+            self._target_open_epoch = open_epoch
+            self._samples = {}
+            self._last_persisted_key = None
+        if proxy_price is not None and math.isfinite(float(proxy_price)) and float(proxy_price) > 0:
+            # One equally weighted proxy print per UTC second.  The first fresh
+            # price received in that second wins, avoiding update-rate weighting.
+            self._samples.setdefault(int(now), float(proxy_price))
+        return self._payload("active", observed), evidence
+
+    def freeze_if_due(self, observed_at: str) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+        """Freeze a completed collection after the target market opens."""
+        observed = parse_time(observed_at) or utc_now()
+        if self._target_open_epoch is None or observed.timestamp() < self._target_open_epoch:
+            return None, None
+        if self._frozen is None:
+            self._frozen = self._payload("frozen", observed)
+            self._frozen["frozen_at"] = observed.isoformat()
+            key = (str(self._target_ticker or ""), "frozen")
+            evidence = None
+            if self._last_persisted_key != key:
+                evidence = dict(self._frozen)
+                evidence["final_state"] = "FROZEN"
+                self._last_persisted_key = key
+            return dict(self._frozen), evidence
+        return dict(self._frozen), None
 
 
 def utc_now() -> datetime:
