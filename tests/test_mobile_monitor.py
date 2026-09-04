@@ -92,8 +92,8 @@ def dashboard(mode: str = "PAPER") -> dict:
                 "strategy": "STANDARD_EDGE",
             }],
         },
-        "DEMO": {"mode": "DEMO", "available_cash": 500.0, "positions": [], "ledger": [demo_trade]},
-        "LIVE": {"mode": "LIVE", "available_cash": 300.0, "positions": [], "ledger": [live_trade]},
+        "DEMO": {"mode": "DEMO", "available_cash": 500.0, "positions": [], "ledger": [demo_trade], "recent_trades": [demo_trade]},
+        "LIVE": {"mode": "LIVE", "available_cash": 300.0, "positions": [], "ledger": [live_trade], "recent_trades": [live_trade]},
     }
     return {
         "system": {"status": "live", "updated_at": "2026-08-28T12:00:00+00:00"},

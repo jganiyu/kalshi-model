@@ -53,7 +53,10 @@ def mobile_snapshot(dashboard: dict[str, Any]) -> dict[str, Any]:
     if mode == "PAPER":
         trades = (dashboard.get("paper") or {}).get("recent_paper_trades") or []
     else:
-        trades = selected.get("ledger") or []
+        # The live dashboard intentionally omits the full ledger from its hot
+        # update path. Use its bounded, enriched feed; retain ledger only for
+        # older snapshots during an upgrade.
+        trades = selected.get("recent_trades") or selected.get("ledger") or []
     allowed_trade_fields = {
         "activity_at",
         "opened_at",
