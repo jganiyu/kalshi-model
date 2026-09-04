@@ -1075,7 +1075,8 @@ def test_next_threshold_forecast_is_isolated_beneath_current_threshold() -> None
     assert 'aria-live="polite" hidden' in threshold_stat
     assert 'id="next-threshold-estimate"' in threshold_stat
     assert 'id="next-threshold-progress"' in threshold_stat
-    assert 'Proxy estimate · not official' in threshold_stat
+    assert 'Waiting for final minute' not in threshold_stat
+    assert 'Proxy estimate · not official' not in threshold_stat
     assert 'function renderNextThresholdForecast(data)' in script
     assert 'container.hidden = true;' in script
     assert 'renderNextThresholdForecast(data);' in script

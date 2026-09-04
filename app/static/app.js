@@ -102,26 +102,11 @@ function renderNextThresholdForecast(data) {
   const safeTarget = Number.isFinite(target) && target > 0 ? Math.round(target) : 60;
   const safeSamples = Number.isFinite(samples)
     ? Math.min(Math.max(0, Math.round(samples)), safeTarget) : 0;
-  const official = numberOrNull(forecast.official_threshold ?? forecast.comparison?.official_threshold);
-  const error = numberOrNull(forecast.error_dollars ?? forecast.comparison?.error_dollars);
-  const phase = status === "inactive"
-    ? "Waiting for final minute"
-    : status === "frozen" || status === "awaiting_official"
-    ? "Frozen · awaiting Kalshi"
-    : status === "comparing" ? "Comparing with Kalshi"
-    : status === "complete" || status === "completed" ? "Final proxy estimate"
-    : `${safeSamples}/${safeTarget} one-second samples`;
-
   $("#next-threshold-estimate").textContent = money(estimate);
   $("#next-threshold-progress").textContent = status === "inactive"
-    ? "Standby"
+    ? "0/60"
     : status === "active" || status === "collecting"
-      ? `${safeSamples}/${safeTarget}` : `${safeSamples}/${safeTarget} · frozen`;
-  const comparison = status === "comparing" && official !== null
-    ? `Kalshi ${money(official)}${error === null ? "" : ` · error ${signedMoney(error)}`}`
-    : null;
-  const qualifier = forecast.qualifier || "Proxy estimate, not official";
-  $("#next-threshold-detail").textContent = [phase, comparison, qualifier].filter(Boolean).join(" · ");
+      ? `${safeSamples}/${safeTarget}` : `${safeSamples}/${safeTarget}`;
   container.dataset.status = status;
   container.hidden = false;
 }
