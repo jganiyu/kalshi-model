@@ -575,6 +575,21 @@ def test_additive_migration_preserves_existing_paper_history(tmp_path: Path) -> 
     assert db.fetch_one("SELECT COUNT(*) count FROM broker_order_intents")["count"] == 0
 
 
+def test_initialize_repairs_missing_reconciliation_watermark_table(tmp_path: Path) -> None:
+    """A recorded migration must not leave startup reconciliation in a loop."""
+    db = Database(tmp_path / "watermark-repair.db")
+    db.initialize()
+    with db.transaction() as connection:
+        connection.execute("DROP TABLE broker_reconciliation_watermarks")
+
+    db.initialize()
+
+    assert db.fetch_one(
+        "SELECT name FROM sqlite_master WHERE type='table' "
+        "AND name='broker_reconciliation_watermarks'"
+    ) == {"name": "broker_reconciliation_watermarks"}
+
+
 def test_storage_cleanup_removes_only_redundant_reconciliation_data(
     tmp_path: Path,
 ) -> None:

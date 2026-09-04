@@ -1081,6 +1081,21 @@ class Database:
                         "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
                         (version, iso_now()),
                     )
+            # Migration records are normally sufficient, but the
+            # reconciliation loop must never spin forever if an older
+            # interrupted schema update left this additive cursor table absent.
+            # Reassert its idempotent schema on every startup; it stores only
+            # recovery watermarks.
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS broker_reconciliation_watermarks (
+                    mode TEXT PRIMARY KEY CHECK(mode IN ('DEMO','LIVE')),
+                    last_full_at TEXT,
+                    last_activity_at TEXT,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
             for key, value in DEFAULT_SETTINGS.items():
                 connection.execute(
                     "INSERT OR IGNORE INTO settings(key, value_json, updated_at) VALUES (?, ?, ?)",
