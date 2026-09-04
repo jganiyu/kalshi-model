@@ -50,6 +50,63 @@ def test_public_kalshi_requests_have_a_short_independent_timeout() -> None:
     asyncio.run(scenario())
 
 
+def test_kalshi_fallback_book_has_a_tighter_bounded_timeout() -> None:
+    async def scenario() -> None:
+        observed_timeout: dict[str, float] = {}
+
+        def responder(request: httpx.Request) -> httpx.Response:
+            observed_timeout.update(request.extensions["timeout"])
+            return httpx.Response(200, json={"orderbook_fp": {}})
+
+        http = httpx.AsyncClient(transport=httpx.MockTransport(responder))
+        try:
+            client = KalshiPublicClient(http, "https://example.test", "KXBTC15M")
+            await client.fallback_orderbook("TEST")
+        finally:
+            await http.aclose()
+
+        assert observed_timeout == {
+            "connect": 0.75, "read": 1.0, "write": 1.0, "pool": 0.25,
+        }
+
+    asyncio.run(scenario())
+
+
+def test_rest_book_fallback_applies_only_to_its_cached_active_ticker() -> None:
+    async def scenario() -> None:
+        engine = AnalysisEngine.__new__(AnalysisEngine)
+        engine._update_lock = asyncio.Lock()
+        engine._current_market = {
+            "ticker": "ACTIVE", "yes_bid_dollars": "0.40", "yes_ask_dollars": "0.60",
+        }
+        engine._last_kalshi_ws_book = 0.0
+        engine._stream_status = {"Kalshi": {"connected": False}}
+        engine.config = type("Config", (), {"kalshi_book_stale_seconds": 2.0})()
+        engine.dashboard = {"current": {"ticker": "ACTIVE", "orderbook": {}}}
+        engine._schedule_publish = lambda: None
+
+        payload = {"orderbook_fp": {
+            "yes_dollars": [["0.45", "2"]], "no_dollars": [["0.50", "3"]],
+        }}
+        await engine._apply_kalshi_fallback_book(
+            "ACTIVE", payload, datetime.now(UTC).isoformat(), 12.0
+        )
+
+        current = engine.dashboard["current"]
+        assert current["yes_bid"] == .45
+        assert current["yes_ask"] == .50
+        assert current["quote_source"] == "REST_FALLBACK"
+        assert engine._stream_status["Kalshi"]["fallback"]["receive_ms"] == 12.0
+
+        before = dict(current)
+        await engine._apply_kalshi_fallback_book(
+            "OLD", payload, datetime.now(UTC).isoformat(), 12.0
+        )
+        assert engine.dashboard["current"] == before
+
+    asyncio.run(scenario())
+
+
 def test_kalshi_websocket_headers_sign_expected_message(tmp_path) -> None:
     private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     key_path = tmp_path / "kalshi.pem"

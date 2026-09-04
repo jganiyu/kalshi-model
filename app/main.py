@@ -147,7 +147,22 @@ async def live(websocket: WebSocket) -> None:
         await websocket.send_json({"type": "dashboard", "data": engine.dashboard})
         while True:
             await queue.get()
-            await websocket.send_json({"type": "dashboard", "data": engine.dashboard})
+            # Market updates are deliberately small.  The browser applies these to
+            # the quote, chart, and books without rebuilding the entire dashboard;
+            # the periodic dashboard request remains the authoritative full sync.
+            dashboard = engine.dashboard
+            await websocket.send_json({
+                "type": "market",
+                "data": {
+                    "btc": dashboard.get("btc") or {},
+                    "current": dashboard.get("current") or {},
+                    "system": {
+                        "status": (dashboard.get("system") or {}).get("status"),
+                        "message": (dashboard.get("system") or {}).get("message"),
+                        "streams": (dashboard.get("system") or {}).get("streams") or {},
+                    },
+                },
+            })
     except WebSocketDisconnect:
         pass
     finally:

@@ -11,6 +11,8 @@ const state = {
   liveSocket: null,
   liveConnected: false,
   liveRetryMs: 1000,
+  pendingLiveMarket: null,
+  liveMarketFrame: null,
   chartAxis: { low: null, high: null, updatedAt: null },
   chartLastFrame: 0,
   chartTicker: null,
@@ -1750,6 +1752,65 @@ function appendLiveChartPoint(data) {
   }
 }
 
+function mergeLiveMarket(data) {
+  if (!state.dashboard) return;
+  state.dashboard = {
+    ...state.dashboard,
+    ...data,
+    btc: { ...(state.dashboard.btc || {}), ...(data.btc || {}) },
+    current: { ...(state.dashboard.current || {}), ...(data.current || {}) },
+    system: { ...(state.dashboard.system || {}), ...(data.system || {}) },
+  };
+}
+
+function renderLiveMarketUpdate(data) {
+  mergeLiveMarket(data);
+  const dashboard = state.dashboard;
+  const btc = dashboard?.btc || {};
+  const current = dashboard?.current || {};
+  const system = dashboard?.system || {};
+  const referencePrice = numberOrNull(btc.price);
+  const threshold = numberOrNull(current.strike);
+  const distance = referencePrice !== null && threshold !== null ? referencePrice - threshold : null;
+  $("#btc-price").textContent = money(referencePrice);
+  $("#chart-to-beat").textContent = money(threshold);
+  $("#chart-now-distance").textContent = threshold === null
+    ? "Waiting for threshold"
+    : distance === null ? "Waiting for proxy price"
+    : `${distance > 0 ? "+" : ""}${money(distance)} (${percent(distance / threshold, 3, true)})`;
+  $("#btc-dispersion").textContent = btc.price
+    ? `${btc.exchange_count} feeds · ${Number(btc.dispersion_pct || 0).toFixed(3)}% dispersion`
+    : "No composite available";
+  $("#composite-source").textContent = btc.quotes?.map((quote) => quote.exchange).join(" · ") || "Multi-exchange median";
+  renderConnectionHud(system.streams || {}, btc, current);
+  const kalshiConnection = $("#kalshi-connection");
+  const btcConnection = $("#btc-connection");
+  if (kalshiConnection) kalshiConnection.textContent = system.streams?.kalshi?.connected
+    ? "WebSocket live" : system.streams?.kalshi?.configured ? "Reconnecting" : "Key ID required";
+  if (btcConnection) {
+    const sources = system.streams?.bitcoin?.sources || [];
+    btcConnection.textContent = sources.length ? `${sources.join(" + ")} live` : "REST fallback";
+  }
+  renderOrderBook("YES", current.orderbook || {}, current.execution_market_mode || "LIVE");
+  renderOrderBook("NO", current.orderbook || {}, current.execution_market_mode || "LIVE");
+  syncPriceMovement();
+  drawChart();
+}
+
+function queueLiveMarketUpdate(data) {
+  // Retain only the newest network frame while a browser frame is pending.
+  state.pendingLiveMarket = data;
+  if (state.liveMarketFrame !== null) return;
+  state.liveMarketFrame = window.requestAnimationFrame(() => {
+    state.liveMarketFrame = null;
+    const latest = state.pendingLiveMarket;
+    state.pendingLiveMarket = null;
+    if (!latest) return;
+    appendLiveChartPoint(latest);
+    renderLiveMarketUpdate(latest);
+  });
+}
+
 function connectLive() {
   if (state.liveSocket && state.liveSocket.readyState < WebSocket.CLOSING) return;
   const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
@@ -1762,9 +1823,13 @@ function connectLive() {
   socket.addEventListener("message", (event) => {
     try {
       const message = JSON.parse(event.data);
-      if (message.type !== "dashboard" || !message.data) return;
-      appendLiveChartPoint(message.data);
-      renderDashboard(message.data);
+      if (!message.data) return;
+      if (message.type === "dashboard") {
+        appendLiveChartPoint(message.data);
+        renderDashboard(message.data);
+      } else if (message.type === "market") {
+        queueLiveMarketUpdate(message.data);
+      }
     } catch (_) { /* Ignore malformed stream frames and wait for the next snapshot. */ }
   });
   socket.addEventListener("close", () => {

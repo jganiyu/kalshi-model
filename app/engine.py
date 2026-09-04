@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import math
+import random
 import time
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -127,6 +128,7 @@ class AnalysisEngine:
         self._bootstrap_task: asyncio.Task[None] | None = None
         self._stream_tasks: list[asyncio.Task[None]] = []
         self._kalshi_stream_task: asyncio.Task[None] | None = None
+        self._kalshi_book_fallback_task: asyncio.Task[None] | None = None
         self._subscribers: set[asyncio.Queue[None]] = set()
         self._publish_task: asyncio.Task[None] | None = None
         self._trade_review_task: asyncio.Task[None] | None = None
@@ -134,6 +136,8 @@ class AnalysisEngine:
         self._last_trade_review_key: tuple[str, int, str] | None = None
         self._live_refresh_task: asyncio.Task[None] | None = None
         self._trading_summary_task: asyncio.Task[None] | None = None
+        self._volume_history_task: asyncio.Task[None] | None = None
+        self._volume_flush_task: asyncio.Task[None] | None = None
         self._trading_summary: dict[str, Any] = {
             "selected_mode": "PAPER", "selected": {}, "modes": {}
         }
@@ -145,6 +149,7 @@ class AnalysisEngine:
         self._last_live_update = 0.0
         self._last_btc_persist = 0.0
         self._last_kalshi_persist = 0.0
+        self._last_kalshi_ws_book = 0.0
         self._latest_quotes: dict[str, ExchangeQuote] = {}
         self._latest_btc: dict[str, Any] | None = None
         self._current_market: dict[str, Any] | None = None
@@ -183,6 +188,9 @@ class AnalysisEngine:
         await self.trading.start(self.trading_http)
         self._runner = asyncio.create_task(self._run_loop())
         self._initial_collect_task = asyncio.create_task(self._collect_initial())
+        # A large trading archive is cold state.  Feature hydration is bounded
+        # and off-loop; quote handling starts immediately without it.
+        self._volume_history_task = asyncio.create_task(self._load_volume_history())
         bitcoin_streams = BitcoinWebSocketFeeds(
             self._handle_stream_quote, self._handle_stream_status,
             self._handle_stream_trade,
@@ -194,6 +202,9 @@ class AnalysisEngine:
             ]
         )
         self._start_kalshi_stream()
+        self._kalshi_book_fallback_task = asyncio.create_task(
+            self._run_kalshi_book_fallback()
+        )
         # Historical bootstrap can read a large local archive.  It is manual
         # work, never a startup prerequisite for live connectivity.
         self.dashboard["bootstrap"] = {
@@ -211,7 +222,10 @@ class AnalysisEngine:
             self._trade_review_task,
             self._live_refresh_task,
             self._trading_summary_task,
+            self._volume_history_task,
+            self._volume_flush_task,
             self._kalshi_stream_task,
+            self._kalshi_book_fallback_task,
             *self._stream_tasks,
         ) if task]
         for task in tasks:
@@ -598,6 +612,7 @@ class AnalysisEngine:
                     "connected": bool(kalshi_status.get("connected")),
                     "configured": bool(kalshi_status.get("configured")),
                     "error": kalshi_status.get("error"),
+                    "fallback": dict(kalshi_status.get("fallback") or {}),
                 },
                 "kalshi_execution": {
                     "last_rest_available": bool(
@@ -636,6 +651,30 @@ class AnalysisEngine:
 
     async def _handle_stream_trade(self, trade: Any) -> None:
         self.volume_signals.add_trade(trade)
+        self._schedule_volume_flush()
+
+    async def _load_volume_history(self) -> None:
+        try:
+            await asyncio.to_thread(self.volume_signals.load_rolling_history)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # Trade-flow features stay unavailable rather than blocking prices.
+            logger.warning("Could not hydrate rolling volume history", exc_info=True)
+
+    def _schedule_volume_flush(self) -> None:
+        if self._volume_flush_task and not self._volume_flush_task.done():
+            return
+        self._volume_flush_task = asyncio.create_task(self._flush_volume_after())
+
+    async def _flush_volume_after(self) -> None:
+        await asyncio.sleep(0.5)
+        try:
+            await asyncio.to_thread(self.volume_signals.flush)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.warning("Could not persist BTC trade-flow batch", exc_info=True)
 
     def _schedule_live_refresh(self) -> None:
         if self._live_refresh_task and not self._live_refresh_task.done():
@@ -694,6 +733,7 @@ class AnalysisEngine:
                 if payload.get(key) is not None:
                     self._current_market[key] = payload[key]
             if book_metrics is not None:
+                self._last_kalshi_ws_book = time.monotonic()
                 now = time.monotonic()
                 persist = now - self._last_kalshi_persist >= 1.0
                 book_payload = {
@@ -715,6 +755,106 @@ class AnalysisEngine:
                     self._current_market, self._market_state
                 )
         self._schedule_live_refresh()
+
+    def _kalshi_book_needs_fallback(self) -> bool:
+        """A connected socket is not proof that its book is still moving."""
+        status = self._stream_status["Kalshi"]
+        return (
+            not status.get("connected")
+            or self._last_kalshi_ws_book <= 0
+            or time.monotonic() - self._last_kalshi_ws_book
+            > self.config.kalshi_book_stale_seconds
+        )
+
+    async def _run_kalshi_book_fallback(self) -> None:
+        """Fetch only the cached active book while the market socket is stale.
+
+        No BTC, account, analysis, trade-history, reconciliation, or database
+        path is awaited here.  A fresh websocket book wins immediately.
+        """
+        delay = self.config.kalshi_book_fallback_seconds
+        while not self._stopping.is_set():
+            try:
+                if not self.kalshi or not self._kalshi_book_needs_fallback():
+                    delay = self.config.kalshi_book_fallback_seconds
+                    await asyncio.sleep(delay)
+                    continue
+                market = self._current_market
+                ticker = str(market.get("ticker") or "") if market else ""
+                if not ticker:
+                    await asyncio.sleep(delay)
+                    continue
+                started = time.monotonic()
+                payload = await self.kalshi.fallback_orderbook(ticker)
+                received_at = iso_now()
+                receive_ms = round((time.monotonic() - started) * 1000, 1)
+                await self._apply_kalshi_fallback_book(
+                    ticker, payload, received_at, receive_ms
+                )
+                delay = self.config.kalshi_book_fallback_seconds
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                # Keep diagnostics actionable without leaking request content.
+                fallback = self._stream_status["Kalshi"].setdefault("fallback", {})
+                fallback.update({
+                    "active": True,
+                    "error": type(exc).__name__,
+                    "last_error_at": iso_now(),
+                })
+                delay = min(
+                    8.0,
+                    max(delay * 2, self.config.kalshi_book_fallback_seconds),
+                )
+            await asyncio.sleep(delay + random.uniform(0.0, min(0.2, delay * 0.2)))
+
+    async def _apply_kalshi_fallback_book(
+        self,
+        ticker: str,
+        payload: dict[str, Any],
+        received_at: str,
+        receive_ms: float,
+    ) -> None:
+        """Apply a REST book only when it still belongs to the active ticker."""
+        applied_started = time.monotonic()
+        async with self._update_lock:
+            market = self._current_market
+            if not market or str(market.get("ticker") or "") != ticker:
+                return
+            # Do not overwrite a newer websocket book received in flight.
+            if not self._kalshi_book_needs_fallback():
+                return
+            state = self._save_kalshi_snapshot(market, payload, received_at, persist=False)
+            state.update({
+                "quote_source": "REST_FALLBACK",
+                "received_at": received_at,
+                "fallback_receive_ms": receive_ms,
+            })
+            self._market_state = state
+            # The order-book UI gets the new executable levels immediately,
+            # without synchronously rebuilding analysis or touching SQLite.
+            current = self.dashboard.get("current")
+            if current and str(current.get("ticker") or "") == ticker:
+                updated = dict(current)
+                updated.update({
+                    key: state[key] for key in (
+                        "observed_at", "executable_quote_at", "yes_bid", "yes_ask",
+                        "no_bid", "no_ask", "spread", "yes_bid_size", "yes_ask_size",
+                        "no_bid_size", "no_ask_size", "imbalance", "orderbook",
+                        "quote_source", "received_at", "fallback_receive_ms",
+                    )
+                })
+                self.dashboard["current"] = updated
+            fallback = self._stream_status["Kalshi"].setdefault("fallback", {})
+            fallback.update({
+                "active": True,
+                "last_received_at": received_at,
+                "receive_ms": receive_ms,
+                "apply_ms": round((time.monotonic() - applied_started) * 1000, 1),
+            })
+            fallback.pop("error", None)
+        fallback["published_at"] = iso_now()
+        self._schedule_publish()
 
     async def _handle_market_lifecycle(self, message: dict[str, Any]) -> None:
         payload = message.get("msg") or {}
@@ -1357,6 +1497,10 @@ class AnalysisEngine:
             threshold_margin=float(btc["price"]) - float(strike),
             annualized_volatility=baseline.annualized_volatility,
             settlement_window_fraction=settlement_fraction,
+            # The fast quote/protection lane reads its in-memory rolling window.
+            # SQL persistence and cold history loading run independently.
+            persist=False,
+            use_rolling_cache=True,
         )
         market_mid = (
             (market_state["yes_bid"] + market_state["yes_ask"]) / 2

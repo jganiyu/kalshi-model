@@ -159,6 +159,34 @@ def test_missing_or_stale_source_does_not_become_zero_volume(tmp_path: Path) -> 
     assert snapshot["features"]["btc_volume_missing"] == 1
 
 
+def test_rolling_snapshot_matches_durable_window_without_sql_on_quote(tmp_path: Path) -> None:
+    db = make_db(tmp_path)
+    service = VolumeSignalService(db)
+    now = datetime(2026, 8, 30, 4, tzinfo=UTC)
+    seed_trade_history(service, now)
+    service.record_kalshi_trades(
+        "TEST", [{
+            "trade_id": "k-cache", "created_time": (now - timedelta(seconds=10)).isoformat(),
+            "count_fp": "10", "yes_price_dollars": "0.60", "taker_outcome_side": "yes",
+        }],
+    )
+    args = dict(
+        observed_at=now.isoformat(), ticker="TEST", btc_price=101.5,
+        momentum_1m=.001, momentum_5m=.003, open_interest=1000,
+        seconds_remaining=300, threshold_margin=25, annualized_volatility=.5,
+        settlement_window_fraction=0, persist=False,
+    )
+    durable = service.snapshot(**args)
+    original_fetch_all = db.fetch_all
+    db.fetch_all = lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("SQL on live tick"))  # type: ignore[method-assign]
+    try:
+        cached = service.snapshot(**args, use_rolling_cache=True)
+    finally:
+        db.fetch_all = original_fetch_all  # type: ignore[method-assign]
+    for key in ("btc_rvol_1m", "btc_rvol_5m", "btc_flow_imbalance_1m", "kalshi_flow_imbalance_1m"):
+        assert cached["metrics"][key] == pytest.approx(durable["metrics"][key])
+
+
 def test_active_model_uses_its_stored_feature_schema(tmp_path: Path) -> None:
     db = make_db(tmp_path)
     db.execute("UPDATE model_versions SET status='retired' WHERE status='active'")

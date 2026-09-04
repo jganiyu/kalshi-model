@@ -67,13 +67,16 @@ class KalshiPublicClient:
         self.base_url = base_url.rstrip("/")
         self.series = series
 
-    async def _get(self, path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+    async def _get(
+        self, path: str, params: dict[str, Any] | None = None, *,
+        timeout: httpx.Timeout | None = None,
+    ) -> dict[str, Any]:
         # The engine gives this client a small, dedicated public-data pool.
         # Repeating the timeout here also keeps direct callers bounded: stale
         # market data is unsafe, but it must not stall the next refresh.
         response = await self.client.get(
             f"{self.base_url}{path}", params=params,
-            timeout=httpx.Timeout(connect=2.5, read=3.5, write=3.5, pool=1.0),
+            timeout=timeout or httpx.Timeout(connect=2.5, read=3.5, write=3.5, pool=1.0),
         )
         response.raise_for_status()
         return response.json()
@@ -108,6 +111,13 @@ class KalshiPublicClient:
 
     async def orderbook(self, ticker: str) -> dict[str, Any]:
         return await self._get(f"/markets/{ticker}/orderbook", {"depth": 20})
+
+    async def fallback_orderbook(self, ticker: str) -> dict[str, Any]:
+        """Short public read for a stale/disconnected market websocket."""
+        return await self._get(
+            f"/markets/{ticker}/orderbook", {"depth": 20},
+            timeout=httpx.Timeout(connect=0.75, read=1.0, write=1.0, pool=0.25),
+        )
 
     async def market(self, ticker: str) -> dict[str, Any]:
         payload = await self._get(f"/markets/{ticker}")

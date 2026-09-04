@@ -70,6 +70,14 @@ class AppConfig:
     live_update_seconds: float = max(
         0.1, float(os.getenv("KALSHI_MODEL_LIVE_UPDATE_SECONDS", "0.1"))
     )
+    # Public order-book safety net used only while the market websocket is
+    # disconnected or no longer publishing.  The websocket remains primary.
+    kalshi_book_fallback_seconds: float = max(
+        0.5, float(os.getenv("KALSHI_MODEL_BOOK_FALLBACK_SECONDS", "0.75"))
+    )
+    kalshi_book_stale_seconds: float = max(
+        1.0, float(os.getenv("KALSHI_MODEL_BOOK_STALE_SECONDS", "2"))
+    )
     open_browser: bool = os.getenv(
         "KALSHI_MODEL_OPEN_BROWSER", "1" if FROZEN else "0"
     ) == "1"

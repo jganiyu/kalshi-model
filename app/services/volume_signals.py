@@ -57,6 +57,11 @@ class VolumeSignalService:
         self.db = db
         self._pending: list[ExchangeTrade] = []
         self._lock = threading.RLock()
+        # The decision loop reads this bounded rolling window.  SQLite remains
+        # the durable audit store, but must never be consulted for every quote.
+        self._btc_rows: list[dict[str, Any]] = []
+        self._kalshi_rows: dict[str, list[dict[str, Any]]] = {}
+        self._rolling_loaded = False
         self._last_audit_bucket: int | None = None
         self._last_snapshot_bucket: tuple[str | None, int] | None = None
         self._latest: dict[str, Any] = self._empty("Collecting actual trade flow.")
@@ -81,6 +86,63 @@ class VolumeSignalService:
             return
         with self._lock:
             self._pending.append(trade)
+            self._btc_rows.append({
+                "observed_at": trade.observed_at,
+                "exchange": trade.exchange,
+                "price": float(trade.price),
+                "size": float(trade.size),
+                "taker_side": side,
+                "signed_size": float(trade.size) if side == "BUY" else -float(trade.size),
+            })
+            self._trim_rolling_locked(parse_time(trade.observed_at) or datetime.now(UTC))
+
+    def load_rolling_history(self) -> None:
+        """Cold-load the small feature window; call this off the event loop."""
+        now = datetime.now(UTC)
+        btc_rows = self.db.fetch_all(
+            """
+            SELECT observed_at,exchange,price,size,taker_side,signed_size
+            FROM btc_trade_ticks
+            WHERE observed_at >= ? AND observed_at <= ?
+            ORDER BY observed_at,id
+            """,
+            ((now - timedelta(minutes=65)).isoformat(), now.isoformat()),
+        )
+        kalshi_rows = self.db.fetch_all(
+            """
+            SELECT observed_at,ticker,contracts,taker_side FROM kalshi_trade_ticks
+            WHERE observed_at >= ? AND observed_at <= ?
+            ORDER BY observed_at,id
+            """,
+            ((now - timedelta(minutes=10)).isoformat(), now.isoformat()),
+        )
+        with self._lock:
+            # Trades arriving while this cold read was in flight are retained.
+            pending_btc = list(self._btc_rows)
+            self._btc_rows = [dict(row) for row in btc_rows] + pending_btc
+            grouped: dict[str, list[dict[str, Any]]] = {}
+            for row in kalshi_rows:
+                grouped.setdefault(str(row["ticker"]), []).append(dict(row))
+            for ticker, rows in self._kalshi_rows.items():
+                grouped.setdefault(ticker, []).extend(rows)
+            self._kalshi_rows = grouped
+            self._trim_rolling_locked(now)
+            self._rolling_loaded = True
+
+    def _trim_rolling_locked(self, now: datetime) -> None:
+        btc_cutoff = now - timedelta(minutes=65)
+        self._btc_rows = [
+            row for row in self._btc_rows
+            if (parsed := parse_time(row.get("observed_at"))) is not None and parsed >= btc_cutoff
+        ]
+        kalshi_cutoff = now - timedelta(minutes=10)
+        self._kalshi_rows = {
+            ticker: [
+                row for row in rows
+                if (parsed := parse_time(row.get("observed_at"))) is not None and parsed >= kalshi_cutoff
+            ]
+            for ticker, rows in self._kalshi_rows.items()
+        }
 
     def flush(self) -> None:
         with self._lock:
@@ -173,6 +235,7 @@ class VolumeSignalService:
 
     def record_kalshi_trades(self, ticker: str, trades: list[dict[str, Any]]) -> None:
         rows = []
+        rolling_rows = []
         for trade in trades:
             trade_id = str(trade.get("trade_id") or "")
             observed_at = trade.get("created_time")
@@ -194,6 +257,18 @@ class VolumeSignalService:
                     "{}",
                 )
             )
+            rolling_rows.append({
+                "observed_at": str(observed_at), "ticker": ticker,
+                "contracts": contracts, "taker_side": side,
+            })
+        if rolling_rows:
+            with self._lock:
+                self._kalshi_rows.setdefault(ticker, []).extend(rolling_rows)
+                newest = max(
+                    (parse_time(row["observed_at"]) for row in rolling_rows),
+                    default=None,
+                )
+                self._trim_rolling_locked(newest or datetime.now(UTC))
         self.db.executemany(
             """
             INSERT OR IGNORE INTO kalshi_trade_ticks(
@@ -265,20 +340,30 @@ class VolumeSignalService:
         annualized_volatility: float,
         settlement_window_fraction: float,
         persist: bool = True,
+        use_rolling_cache: bool = False,
     ) -> dict[str, Any]:
-        self.flush()
         now = parse_time(observed_at) or datetime.now(UTC)
-        since = (now - timedelta(minutes=65)).isoformat()
-        btc_rows = self.db.fetch_all(
-            """
-            SELECT observed_at,exchange,price,size,taker_side,signed_size
-            FROM btc_trade_ticks
-            WHERE julianday(observed_at)>=julianday(?)
-              AND julianday(observed_at)<=julianday(?)
-            ORDER BY julianday(observed_at),id
-            """,
-            (since, now.isoformat()),
-        )
+        if use_rolling_cache:
+            # New trades are placed in the cache by add_trade immediately;
+            # flushing them to SQLite happens independently after this pass.
+            with self._lock:
+                self._trim_rolling_locked(now)
+                btc_rows = list(self._btc_rows)
+                kalshi_rows = list(self._kalshi_rows.get(str(ticker), [])) if ticker else []
+        else:
+            self.flush()
+            since = (now - timedelta(minutes=65)).isoformat()
+            btc_rows = self.db.fetch_all(
+                """
+                SELECT observed_at,exchange,price,size,taker_side,signed_size
+                FROM btc_trade_ticks
+                WHERE julianday(observed_at)>=julianday(?)
+                  AND julianday(observed_at)<=julianday(?)
+                ORDER BY julianday(observed_at),id
+                """,
+                (since, now.isoformat()),
+            )
+            kalshi_rows = []
         one = self._trade_stats(self._window(btc_rows, now, 60), 60)
         five = self._trade_stats(self._window(btc_rows, now, 300), 300)
         rvol_1m = relative_volume(
@@ -331,8 +416,7 @@ class VolumeSignalService:
             else 0.0 if len(source_signs) >= 2 else None
         )
 
-        kalshi_rows: list[dict[str, Any]] = []
-        if ticker:
+        if ticker and not use_rolling_cache:
             kalshi_rows = self.db.fetch_all(
                 """
                 SELECT observed_at,contracts,taker_side FROM kalshi_trade_ticks
