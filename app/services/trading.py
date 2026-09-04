@@ -190,6 +190,12 @@ class TradingCoordinator:
             self._reconciliation_wake[mode].set()
 
     async def stop(self) -> None:
+        await asyncio.gather(
+            *(broker.stop_protective_exit_recovery()
+              for broker in self.brokers.values()
+              if isinstance(broker, KalshiBroker)),
+            return_exceptions=True,
+        )
         for task in self._private_streams.values():
             task.cancel()
         for task in self._reconciliation_tasks.values():
@@ -1746,7 +1752,16 @@ class TradingCoordinator:
         ticker = str(current.get("ticker") or "")
         # BTC ticks may refresh the dashboard while Kalshi's executable book is
         # frozen.  Protective orders must never be based on that older quote.
-        observed = parse_time(current.get("executable_quote_at"))
+        # Older/current market frames carry the executable bid plus
+        # ``observed_at`` but not the newer explicit quote timestamp.  That is
+        # still a fresh executable snapshot; do not silently disable exits for
+        # it. Never use an arbitrary BTC timestamp without a bid.
+        quote_timestamp = current.get("executable_quote_at")
+        if quote_timestamp is None and (
+            current.get("yes_bid") is not None or current.get("no_bid") is not None
+        ):
+            quote_timestamp = current.get("observed_at")
+        observed = parse_time(quote_timestamp)
         quote_fresh = bool(
             observed
             and (time.time() - observed.timestamp())

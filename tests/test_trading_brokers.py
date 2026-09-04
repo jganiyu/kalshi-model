@@ -275,6 +275,84 @@ async def test_ambiguous_entry_absent_from_targeted_lookup_remains_reserved(tmp_
 
 
 @run_async
+async def test_ambiguous_protective_exit_replays_same_id_reduce_only_without_blocking(
+    tmp_path: Path,
+) -> None:
+    db, broker, client = await ready_broker(tmp_path)
+    client.remote_positions = [{"ticker": "EXIT-REPLAY", "position_fp": "2.00"}]
+    intent = OrderIntent(
+        "DEMO", "EXIT-REPLAY", "YES", "SELL", 2, .01, "TEXAS_HOLDEM",
+        "texas_flop_target", time_in_force="immediate_or_cancel",
+        cancel_order_on_pause=False, decision_snapshot={"protective_exit": True},
+        risk_snapshot={"exchange_index": 7},
+    )
+    client.timeout = True
+    with pytest.raises(AmbiguousSubmissionError):
+        await broker.submit(intent)
+    # The trigger returned immediately; recovery uses the exact durable id.
+    client.timeout = False
+    await asyncio.sleep(.25)
+    assert len(client.created) == 1
+    replay = client.created[0]
+    assert replay["client_order_id"] == intent.client_order_id
+    assert replay["reduce_only"] is True
+    assert replay["time_in_force"] == "immediate_or_cancel"
+    assert replay["exchange_index"] == 7
+    broker.disarm("test cleanup")
+
+
+@run_async
+async def test_ambiguous_protective_exit_adopts_active_order_without_second_post(
+    tmp_path: Path,
+) -> None:
+    db, broker, client = await ready_broker(tmp_path)
+    intent = OrderIntent(
+        "DEMO", "EXIT-ACTIVE", "YES", "SELL", 2, .01, "TEXAS_HOLDEM",
+        "texas_flop_target", time_in_force="immediate_or_cancel",
+        cancel_order_on_pause=False, decision_snapshot={"protective_exit": True},
+    )
+    client.remote_positions = [{"ticker": intent.ticker, "position_fp": "2.00"}]
+    client.remote_orders = [{
+        "order_id": "known-exit", "client_order_id": intent.client_order_id,
+        "ticker": intent.ticker, "side": "ask", "price": ".01", "count": "2",
+        "fill_count": "0", "remaining_count": "2", "status": "resting",
+    }]
+    client.timeout = True
+    with pytest.raises(AmbiguousSubmissionError):
+        await broker.submit(intent)
+    await asyncio.sleep(.05)
+    assert client.created == []
+    assert db.fetch_one(
+        "SELECT status FROM broker_order_intents WHERE client_order_id=?",
+        (intent.client_order_id,),
+    ) == {"status": "RESTING"}
+    broker.disarm("test cleanup")
+
+
+@run_async
+async def test_rehydration_never_replays_an_ambiguous_non_protective_sell(
+    tmp_path: Path,
+) -> None:
+    db, broker, client = await ready_broker(tmp_path)
+    client_id = "ordinary-sell-must-not-replay"
+    now = iso_now()
+    db.execute(
+        """
+        INSERT INTO broker_order_intents(
+            mode,client_order_id,ticker,side,action,requested_contracts,limit_price,
+            status,strategy,source,created_at,updated_at,decision_snapshot_json,risk_snapshot_json
+        ) VALUES ('DEMO',?,'ORDINARY','YES','SELL',1,.40,'RECONCILIATION_REQUIRED',
+                  'MANUAL','manual',?,?, '{}','{}')
+        """,
+        (client_id, now, now),
+    )
+    broker.resume_protective_exit_recovery()
+    await asyncio.sleep(.05)
+    assert client.created == []
+    assert client_id not in broker._protective_recovery_tasks
+
+
+@run_async
 async def test_ambiguous_texas_entry_adopts_exact_targeted_fill(tmp_path: Path) -> None:
     db, broker, client = await ready_broker(tmp_path)
     intent = OrderIntent(
@@ -1539,6 +1617,7 @@ async def test_timed_out_protective_exit_adopts_targeted_filled_order(
     client.positions = position_then_flat  # type: ignore[method-assign]
     with pytest.raises(AmbiguousSubmissionError):
         await broker.submit(intent)
+    await asyncio.sleep(.05)  # asynchronous targeted recovery, never trigger-blocking
     row = db.fetch_one("SELECT status FROM broker_order_intents WHERE client_order_id=?", (intent.client_order_id,))
     assert row == {"status": "FILLED"}
     position = db.fetch_one("SELECT status,contracts FROM broker_positions WHERE mode='DEMO' AND ticker='EXIT-FILLED'")
@@ -1564,6 +1643,7 @@ async def test_timed_out_protective_exit_reserves_active_or_unknown_quantity(
     client.remote_positions = [{"ticker": intent.ticker, "position_fp": "4.00"}]
     with pytest.raises(AmbiguousSubmissionError):
         await broker.submit(intent)
+    await asyncio.sleep(.05)
     assert db.fetch_one("SELECT status FROM broker_order_intents WHERE client_order_id=?", (intent.client_order_id,)) == {"status": "RESTING"}
     client.remote_orders = []
 
@@ -1635,6 +1715,7 @@ async def test_timed_out_canceled_protective_exit_allows_safe_remaining_retry(
     client.remote_positions = [{"ticker": first.ticker, "position_fp": "3.00"}]
     with pytest.raises(AmbiguousSubmissionError):
         await broker.submit(first)
+    await asyncio.sleep(.05)
     assert db.fetch_one("SELECT status FROM broker_order_intents WHERE client_order_id=?", (first.client_order_id,)) == {"status": "CANCELED"}
     client.timeout = False
     retry = OrderIntent(

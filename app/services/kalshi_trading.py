@@ -291,6 +291,7 @@ class KalshiTradingClient:
         retries: int = 2,
         submission: bool = False,
         priority: int | None = None,
+        timeout: httpx.Timeout | None = None,
     ) -> dict[str, Any]:
         signing_path = f"{self.api_prefix}{path}"
         started_at = time.monotonic()
@@ -313,7 +314,7 @@ class KalshiTradingClient:
                     "json": json,
                 }
                 if not submission:
-                    request_args["timeout"] = ACCOUNT_READ_TIMEOUT
+                    request_args["timeout"] = timeout or ACCOUNT_READ_TIMEOUT
 
                 async def send() -> httpx.Response:
                     # Kalshi rejects stale signatures. Sign only after this
@@ -512,14 +513,37 @@ class KalshiTradingClient:
         market = payload.get("market")
         return market if isinstance(market, dict) else payload
 
-    async def order_by_client_id(self, client_order_id: str) -> dict[str, Any] | None:
-        payload = await self._all_pages(
-            "/portfolio/orders", "orders", priority=self._requests.RECOVERY
-        )
+    async def order_by_client_id(
+        self, client_order_id: str, *, ticker: str | None = None,
+        fast: bool = False,
+    ) -> dict[str, Any] | None:
+        """Find an order without turning an exit recovery into an archive scan."""
+        if ticker:
+            payload = await self._request(
+                "GET", "/portfolio/orders",
+                params={"ticker": ticker, "limit": 1000},
+                priority=self._requests.RECOVERY,
+                retries=0 if fast else 2,
+                timeout=(httpx.Timeout(1.25, connect=0.5, write=0.75, pool=0.5)
+                         if fast else None),
+            )
+        else:
+            payload = await self._all_pages(
+                "/portfolio/orders", "orders", priority=self._requests.RECOVERY
+            )
         for order in payload.get("orders", []):
             if str(order.get("client_order_id") or "") == client_order_id:
                 return order
         return None
+
+    async def position_for_ticker(self, ticker: str, *, fast: bool = False) -> dict[str, Any]:
+        """One ticker-scoped position page for protective recovery."""
+        return await self._request(
+            "GET", "/portfolio/positions", params={"ticker": ticker, "limit": 1000},
+            priority=self._requests.RECOVERY, retries=0 if fast else 2,
+            timeout=(httpx.Timeout(1.25, connect=0.5, write=0.75, pool=0.5)
+                     if fast else None),
+        )
 
     async def order(self, order_id: str) -> dict[str, Any] | None:
         """Read one order without paginating the account order history."""

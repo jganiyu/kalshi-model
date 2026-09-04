@@ -4,6 +4,7 @@ import abc
 import asyncio
 import json
 import math
+import random
 import time
 import uuid
 from collections import defaultdict, deque
@@ -254,6 +255,9 @@ class KalshiBroker(Broker):
         # Kalshi connection is alive. A single slow REST reconciliation
         # endpoint must not falsely label that healthy stream "unreachable".
         self._private_stream_connected = False
+        # One durable, same-client-ID recovery lane per uncertain safety exit.
+        # It is deliberately independent of account-wide reconciliation.
+        self._protective_recovery_tasks: dict[str, asyncio.Task[None]] = {}
 
     def set_client(self, client: KalshiTradingClient | None) -> None:
         self.client = client
@@ -339,6 +343,7 @@ class KalshiBroker(Broker):
         self.automatic_armed = bool(automatic)
         self._arming_generation += 1
         self._audit("ARMED", {"automatic": self.automatic_armed})
+        self.resume_protective_exit_recovery()
         return self.readiness()
 
     def set_automatic_armed(self, enabled: bool) -> dict[str, Any]:
@@ -1057,6 +1062,51 @@ class KalshiBroker(Broker):
             and intent.decision_snapshot.get("protective_exit")
         )
 
+    def _remember_protective_payload(self, intent: OrderIntent) -> OrderIntent:
+        """Persist replay-critical values before risk evidence overwrites its input."""
+        if not self._is_protective_exit(intent):
+            return intent
+        snapshot = {
+            **intent.decision_snapshot,
+            "protective_exit_replay": {
+                "exchange_index": intent.risk_snapshot.get("exchange_index"),
+                "time_in_force": intent.time_in_force,
+                "cancel_order_on_pause": intent.cancel_order_on_pause,
+                "post_only": intent.post_only,
+                "submitted_at": iso_now(),
+                "submit_attempts": 0,
+                "recovery_state": "SUBMITTING",
+            },
+        }
+        return replace(intent, decision_snapshot=snapshot)
+
+    def _recovery_snapshot(self, row: dict[str, Any]) -> dict[str, Any]:
+        try:
+            snapshot = json.loads(str(row.get("decision_snapshot_json") or "{}"))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            snapshot = {}
+        replay = snapshot.get("protective_exit_replay") if isinstance(snapshot, dict) else {}
+        return replay if isinstance(replay, dict) else {}
+
+    def _record_recovery(self, client_order_id: str, **updates: Any) -> None:
+        row = self.db.fetch_one(
+            "SELECT decision_snapshot_json FROM broker_order_intents WHERE mode=? AND client_order_id=?",
+            (self.mode, client_order_id),
+        ) or {}
+        try:
+            snapshot = json.loads(str(row.get("decision_snapshot_json") or "{}"))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            snapshot = {}
+        replay = snapshot.get("protective_exit_replay")
+        if not isinstance(replay, dict):
+            replay = {}
+        replay.update(updates)
+        snapshot["protective_exit_replay"] = replay
+        self.db.execute(
+            "UPDATE broker_order_intents SET decision_snapshot_json=?,updated_at=? WHERE mode=? AND client_order_id=?",
+            (_safe_json(snapshot), iso_now(), self.mode, client_order_id),
+        )
+
     async def _safe_protective_exit_intent(self, intent: OrderIntent) -> OrderIntent:
         """Size an exit from evidence that remains safe during a bad full refresh.
 
@@ -1091,7 +1141,12 @@ class KalshiBroker(Broker):
         targeted_lookup_succeeded = False
         try:
             assert self.client is not None
-            payload = await self.client.positions(ticker=intent.ticker)
+            targeted_position = getattr(self.client, "position_for_ticker", None)
+            payload = (
+                await targeted_position(intent.ticker, fast=True)
+                if callable(targeted_position)
+                else await self.client.positions(ticker=intent.ticker)
+            )
             targeted_lookup_succeeded = True
             for row in payload.get("market_positions") or payload.get("positions") or []:
                 if str(row.get("ticker") or row.get("market_ticker") or "") != intent.ticker:
@@ -1361,6 +1416,7 @@ class KalshiBroker(Broker):
             return existing
         if self._is_protective_exit(intent):
             intent = await self._safe_protective_exit_intent(intent)
+            intent = self._remember_protective_payload(intent)
         now = iso_now()
         deadline = None
         if intent.cancel_after_seconds:
@@ -1437,24 +1493,16 @@ class KalshiBroker(Broker):
             )
             self._audit("SUBMISSION_AMBIGUOUS", {"error": str(exc)}, intent=intent)
             if self._is_protective_exit(intent):
-                # Never make a safety sell wait on account-wide history. Start
-                # a short exact-ID/position check before returning uncertainty.
-                try:
-                    await asyncio.wait_for(
-                        self.recover_ambiguous_protective_exit(intent.client_order_id),
-                        timeout=4.0,
-                    )
-                except asyncio.TimeoutError:
-                    self._audit(
-                        "PROTECTIVE_EXIT_RECOVERY_DEFERRED",
-                        {"reason": "targeted recovery timed out", "timeout_seconds": 4},
-                        intent=intent,
-                    )
-                except Exception as recovery_error:
-                    self._audit(
-                        "PROTECTIVE_EXIT_RECOVERY_FAILED",
-                        {"error": str(recovery_error)}, intent=intent,
-                    )
+                # The trigger path returns immediately.  A supervised worker
+                # performs narrow reads/replays; it never waits on history.
+                self._record_recovery(
+                    intent.client_order_id, recovery_state="UNCERTAIN",
+                    uncertain_since=iso_now(), last_error=str(exc), next_retry_at=iso_now(),
+                )
+                self._start_protective_exit_recovery(intent.client_order_id)
+                # Give an already-local/private fact one event-loop turn to be
+                # adopted, without synchronously waiting on a REST deadline.
+                await asyncio.sleep(0)
             elif intent.action == "BUY":
                 # An uncertain entry must never be re-submitted blindly, but
                 # it also must not require a manual account-wide refresh just
@@ -1492,6 +1540,11 @@ class KalshiBroker(Broker):
                 intent=intent,
             )
             raise
+        return self._accept_submission_response(intent, response)
+
+    def _accept_submission_response(
+        self, intent: OrderIntent, response: dict[str, Any]
+    ) -> dict[str, Any]:
         exchange_order_id = str(response.get("order_id") or "")
         fill_count = _number(response.get("fill_count") or response.get("fill_count_fp"))
         remaining = _number(response.get("remaining_count") or response.get("remaining_count_fp"), intent.contracts)
@@ -1583,6 +1636,8 @@ class KalshiBroker(Broker):
                 return self.portfolio()
             result = await self._reconcile_once(full_audit=full_audit)
             self._reconcile_generation += 1
+            if self.session_armed:
+                self.resume_protective_exit_recovery()
             return result
 
     def adopt_private_event(self, event: dict[str, Any]) -> dict[str, str | None]:
@@ -1688,14 +1743,45 @@ class KalshiBroker(Broker):
                 None,
             )
 
-        order_call = lookup(client_order_id) if callable(lookup) else fallback_order_lookup()
+        if callable(lookup):
+            try:
+                order_call = lookup(client_order_id, ticker=ticker, fast=True)
+            except TypeError:  # Narrow test/dialect clients may not expose kwargs.
+                order_call = lookup(client_order_id)
+        else:
+            order_call = fallback_order_lookup()
+        targeted_position = getattr(self.client, "position_for_ticker", None)
+        position_call = (
+            targeted_position(ticker, fast=True)
+            if callable(targeted_position) else self.client.positions(ticker=ticker)
+        )
         order_result, position_result = await asyncio.gather(
-            order_call, self.client.positions(ticker=ticker), return_exceptions=True
+            order_call, position_call, return_exceptions=True
         )
         order_ok = not isinstance(order_result, Exception)
         position_ok = not isinstance(position_result, Exception)
         if isinstance(order_result, dict):
-            self._upsert_order(order_result)
+            returned_id = str(order_result.get("client_order_id") or "")
+            if returned_id and returned_id != client_order_id:
+                self._audit("PROTECTIVE_EXIT_RECOVERY_ID_MISMATCH", {},
+                            client_order_id=client_order_id, ticker=ticker)
+                order_result = None
+            else:
+                # Some narrow endpoints omit the echoed client id. We queried
+                # this exact id, so restore it before the durable upsert and
+                # explicitly transition the intent before the worker decides
+                # whether a replay is needed.
+                order_result = {
+                    **order_result, "client_order_id": client_order_id,
+                    "ticker": str(order_result.get("ticker") or ticker),
+                }
+                order_status = self._order_status(order_result)
+                self._upsert_order(order_result)
+                self._set_intent(
+                    client_order_id, order_status,
+                    exchange_order_id=str(order_result.get("order_id") or order_result.get("exchange_order_id") or "") or None,
+                    error=None,
+                )
         if isinstance(position_result, dict):
             rows = [
                 row for row in (position_result.get("market_positions") or position_result.get("positions") or [])
@@ -1728,20 +1814,156 @@ class KalshiBroker(Broker):
             )
             self._resolve_closed_protective_exit(ticker)
             status = "RESOLVED_EXTERNALLY"
-        elif order_ok and order_result is None and status in {"SUBMITTING", "RECONCILIATION_REQUIRED"}:
-            self._set_intent(
-                client_order_id, "REJECTED",
-                error="Targeted exchange lookup did not report this exit order; a new reduce-only retry may use confirmed remaining exposure.",
-            )
-            status = "REJECTED"
+        # Absence is visibility-lag evidence, not rejection. The worker will
+        # replay this *same* id; a fresh id is only permitted after a terminal
+        # exchange order state.
         self._audit(
             "PROTECTIVE_EXIT_TARGETED_RECOVERY",
             {"order_lookup_succeeded": order_ok, "position_lookup_succeeded": position_ok,
              "order_found": isinstance(order_result, dict), "position_flat": flat,
+             "ticker_scoped": True,
              "final_state": status or "RECONCILIATION_REQUIRED"},
             client_order_id=client_order_id, ticker=ticker,
         )
         return {"state": status or "RECONCILIATION_REQUIRED", "position_flat": flat}
+
+    def _start_protective_exit_recovery(self, client_order_id: str) -> None:
+        task = self._protective_recovery_tasks.get(client_order_id)
+        if task and not task.done():
+            return
+        task = asyncio.create_task(self._protective_exit_recovery_worker(client_order_id))
+        self._protective_recovery_tasks[client_order_id] = task
+
+        def finished(done: asyncio.Task[None]) -> None:
+            if self._protective_recovery_tasks.get(client_order_id) is done:
+                self._protective_recovery_tasks.pop(client_order_id, None)
+            if done.cancelled():
+                return
+            error = done.exception()
+            if error:
+                self._audit("PROTECTIVE_EXIT_RECOVERY_WORKER_CRASHED", {
+                    "error": str(error), "client_order_id": client_order_id,
+                }, client_order_id=client_order_id)
+                async def restart() -> None:
+                    await asyncio.sleep(.25)
+                    if self.session_armed:
+                        self._start_protective_exit_recovery(client_order_id)
+                asyncio.create_task(restart())
+
+        task.add_done_callback(finished)
+
+    def resume_protective_exit_recovery(self) -> None:
+        """Rehydrate persisted uncertain exits after arm/reconnect, never a new id."""
+        rows = self.db.fetch_all(
+            """
+            SELECT client_order_id,decision_snapshot_json FROM broker_order_intents
+            WHERE mode=? AND action='SELL' AND status IN ('SUBMITTING','RECONCILIATION_REQUIRED')
+            """, (self.mode,)
+        )
+        for row in rows:
+            try:
+                snapshot = json.loads(str(row.get("decision_snapshot_json") or "{}"))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                snapshot = {}
+            if isinstance(snapshot, dict) and snapshot.get("protective_exit"):
+                self._start_protective_exit_recovery(str(row["client_order_id"]))
+
+    async def stop_protective_exit_recovery(self) -> None:
+        tasks = list(self._protective_recovery_tasks.values())
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._protective_recovery_tasks.clear()
+
+    async def _protective_exit_recovery_worker(self, client_order_id: str) -> None:
+        """Short, same-ID recovery/replay lane for a possibly received IOC."""
+        delay = 0.15
+        while True:
+            row = self.db.fetch_one(
+                "SELECT * FROM broker_order_intents WHERE mode=? AND client_order_id=?",
+                (self.mode, client_order_id),
+            )
+            if not row or str(row.get("status") or "") in FINAL_ORDER_STATES:
+                return
+            try:
+                marker = json.loads(str(row.get("decision_snapshot_json") or "{}"))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                marker = {}
+            if not isinstance(marker, dict) or not marker.get("protective_exit"):
+                self._audit("PROTECTIVE_EXIT_RECOVERY_SKIPPED_NON_PROTECTIVE", {},
+                            client_order_id=client_order_id)
+                return
+            result = await self.recover_ambiguous_protective_exit(client_order_id)
+            state = str(result.get("state") or "")
+            if state in FINAL_ORDER_STATES | {"ACKNOWLEDGED", "RESTING", "PARTIALLY_FILLED", "FILLED"}:
+                self._record_recovery(client_order_id, recovery_state="ADOPTED", next_retry_at=None)
+                return
+            # A restart/manual disarm may continue narrow reads elsewhere, but
+            # it must never replay an order until the user arms this process.
+            if not self.session_armed:
+                self._record_recovery(client_order_id, recovery_state="WAITING_FOR_ARM")
+                self._audit("PROTECTIVE_EXIT_REPLAY_PAUSED_DISARMED", {}, client_order_id=client_order_id)
+                return
+            row = self.db.fetch_one(
+                "SELECT * FROM broker_order_intents WHERE mode=? AND client_order_id=?",
+                (self.mode, client_order_id),
+            ) or {}
+            replay = self._recovery_snapshot(row)
+            attempts = int(_number(replay.get("submit_attempts"))) + 1
+            self._record_recovery(
+                client_order_id, recovery_state="REPLAYING", submit_attempts=attempts,
+                last_submit_at=iso_now(), next_retry_at=None,
+            )
+            try:
+                assert self.client is not None
+                response = await self.client.create_order(
+                    ticker=str(row["ticker"]), client_order_id=client_order_id,
+                    side=str(row["side"]), action="SELL",
+                    contracts=int(_number(row["requested_contracts"])),
+                    limit_price=_number(row["limit_price"]), reduce_only=True,
+                    post_only=bool(replay.get("post_only", False)),
+                    live_authorized=True,
+                    exchange_index=replay.get("exchange_index"),
+                    time_in_force=str(replay.get("time_in_force") or "immediate_or_cancel"),
+                    cancel_order_on_pause=bool(replay.get("cancel_order_on_pause", False)),
+                )
+            except AmbiguousSubmissionError as exc:
+                self._record_recovery(
+                    client_order_id, recovery_state="UNCERTAIN", last_error=str(exc),
+                    next_retry_at=iso_now(),
+                )
+                self._audit("PROTECTIVE_EXIT_SAME_ID_REPLAY_AMBIGUOUS", {
+                    "attempt": attempts, "delay_seconds": delay,
+                }, client_order_id=client_order_id, ticker=str(row.get("ticker") or ""))
+            except KalshiTradingError as exc:
+                duplicate = any(term in f"{exc.code or ''} {exc}".lower()
+                                for term in ("duplicate", "already exists", "client_order"))
+                if duplicate:
+                    self._record_recovery(client_order_id, recovery_state="CHECKING_DUPLICATE")
+                    self._audit("PROTECTIVE_EXIT_SAME_ID_DUPLICATE", {}, client_order_id=client_order_id)
+                else:
+                    detail = _exchange_error_detail(exc)
+                    self._set_intent(client_order_id, "REJECTED", error=str(exc),
+                                     error_code=detail.get("code"), error_details=detail)
+                    self._record_recovery(client_order_id, recovery_state="TERMINAL_REJECTED")
+                    return
+            else:
+                replay_intent = OrderIntent(
+                    self.mode, str(row["ticker"]), str(row["side"]), "SELL",
+                    int(_number(row["requested_contracts"])), _number(row["limit_price"]),
+                    str(row["strategy"]), str(row["source"]), client_order_id=client_order_id,
+                    post_only=bool(replay.get("post_only", False)),
+                    time_in_force=str(replay.get("time_in_force") or "immediate_or_cancel"),
+                    cancel_order_on_pause=bool(replay.get("cancel_order_on_pause", False)),
+                    decision_snapshot=json.loads(str(row.get("decision_snapshot_json") or "{}")),
+                    risk_snapshot={"exchange_index": replay.get("exchange_index")},
+                )
+                self._accept_submission_response(replay_intent, response)
+                self._record_recovery(client_order_id, recovery_state="ACKNOWLEDGED", next_retry_at=None)
+                return
+            await asyncio.sleep(delay + random.uniform(0, delay * 0.2))
+            delay = min(2.0, delay * 2)
 
     async def recover_ambiguous_entry(self, intent: OrderIntent) -> dict[str, Any]:
         """Resolve one uncertain buy from exact, targeted exchange evidence.
