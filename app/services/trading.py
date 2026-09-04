@@ -172,12 +172,12 @@ class TradingCoordinator:
             broker = self.brokers[mode]
             assert isinstance(broker, KalshiBroker)
             if broker.client:
-                try:
-                    await broker.reconcile()
-                except (KalshiTradingError, ValueError):
-                    pass
                 self._start_private_stream(mode)
             self._start_reconciliation_loop(mode)
+            # Do the authoritative account read asynchronously after the
+            # server is up; it must not hold public prices or exits hostage
+            # during application launch.
+            self._reconciliation_wake[mode].set()
 
     async def stop(self) -> None:
         for task in self._private_streams.values():
@@ -511,14 +511,33 @@ class TradingCoordinator:
         task.add_done_callback(restart_if_unexpectedly_stopped)
 
     def summary(self, current: dict[str, Any] | None = None) -> dict[str, Any]:
+        selected_mode = self.selected_mode
+        selected_broker = self.brokers[selected_mode]
+        selected = (
+            selected_broker.portfolio(include_ledger=False)
+            if isinstance(selected_broker, KalshiBroker)
+            else selected_broker.portfolio()
+        )
+        self._annotate_threshold_breach_exits(selected_mode, selected, current)
+        # The dashboard is pushed several times per second.  Full broker
+        # histories contain raw exchange payloads and made this response MBs
+        # large, starving both the UI and the event loop.  Detailed history is
+        # fetched by /api/trading/selected when the Trading page opens.
+        for key in ("orders", "fills", "intents", "settlements"):
+            selected.pop(key, None)
         modes = {
-            mode: self.brokers[mode].portfolio() for mode in ("PAPER", "DEMO", "LIVE")
+            mode: {
+                "mode": mode,
+                "readiness": (
+                    self.brokers[mode].readiness()
+                    if isinstance(self.brokers[mode], KalshiBroker) else {}
+                ),
+            }
+            for mode in ("PAPER", "DEMO", "LIVE")
         }
-        for mode, portfolio in modes.items():
-            self._annotate_threshold_breach_exits(mode, portfolio, current)
         return {
-            "selected_mode": self.selected_mode,
-            "selected": modes[self.selected_mode],
+            "selected_mode": selected_mode,
+            "selected": selected,
             "modes": modes,
         }
 

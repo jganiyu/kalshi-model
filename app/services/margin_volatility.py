@@ -131,9 +131,9 @@ class MarginVolatilityService:
     def backfill_recent(self, hours: int = 2) -> int:
         """Seed the new metric from recent local history without rewriting it."""
         existing = self.db.fetch_one(
-            "SELECT COUNT(*) AS count FROM margin_volatility_observations"
+            "SELECT 1 AS present FROM margin_volatility_observations LIMIT 1"
         ) or {}
-        if int(existing.get("count") or 0) > 0:
+        if existing.get("present"):
             return 0
         since = (datetime.now(UTC) - timedelta(hours=max(1, hours))).isoformat()
         ticks = self.db.fetch_all(

@@ -124,7 +124,7 @@ class PaperBroker(Broker):
     def __init__(self, service: PaperTradingService):
         self.service = service
 
-    def portfolio(self) -> dict[str, Any]:
+    def portfolio(self, *, include_ledger: bool = True) -> dict[str, Any]:
         return {"mode": self.mode, **self.service.portfolio()}
 
     async def submit(self, intent: OrderIntent) -> dict[str, Any]:
@@ -492,7 +492,7 @@ class KalshiBroker(Broker):
             return "Verifying timed-out order · entries resume next round."
         return "Reconciling Kalshi account activity."
 
-    def portfolio(self) -> dict[str, Any]:
+    def portfolio(self, *, include_ledger: bool = True) -> dict[str, Any]:
         account = self._latest_account_snapshot()
         positions = self.db.fetch_all(
             "SELECT * FROM broker_positions WHERE mode=? AND status='open' ORDER BY updated_at DESC",
@@ -560,7 +560,7 @@ class KalshiBroker(Broker):
             "orders": orders,
             "open_orders": open_orders,
             "fills": fills,
-            "ledger": self.trade_ledger(),
+            "ledger": self.trade_ledger() if include_ledger else [],
             "intents": intents,
             "settlements": settlements,
             "open_positions": len(positions),

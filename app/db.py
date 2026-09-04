@@ -1023,7 +1023,6 @@ class Database:
         connection = sqlite3.connect(self.path, timeout=15, check_same_thread=False)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
-        connection.execute("PRAGMA journal_mode = WAL")
         connection.execute("PRAGMA busy_timeout = 15000")
         return connection
 
@@ -1042,6 +1041,15 @@ class Database:
                 connection.close()
 
     def initialize(self) -> None:
+        # WAL is a persistent database setting.  Reasserting it for every
+        # short-lived read connection serializes readers behind SQLite's
+        # journal lock and can starve the live event loop during market data.
+        with self._write_lock:
+            connection = self.connect()
+            try:
+                connection.execute("PRAGMA journal_mode = WAL")
+            finally:
+                connection.close()
         with self.transaction() as connection:
             connection.execute(
                 "CREATE TABLE IF NOT EXISTS schema_migrations "

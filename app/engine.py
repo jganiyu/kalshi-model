@@ -110,6 +110,8 @@ class AnalysisEngine:
             "uncertainty_pct": DEFAULT_BENCHMARK_UNCERTAINTY_PCT,
         }
         self._recent_btc_samples: list[tuple[float, float]] = []
+        self._recent_btc_volume_points: list[tuple[float, float]] = []
+        self._btc_samples_loaded = False
         self.dashboard: dict[str, Any] = {
             "system": {"status": "starting", "message": "Connecting to public data feeds."},
             "current": None,
@@ -119,6 +121,7 @@ class AnalysisEngine:
             "strategy": {"texas_holdem": self._texas_recovery_state()},
         }
         self._runner: asyncio.Task[None] | None = None
+        self._initial_collect_task: asyncio.Task[None] | None = None
         self._bootstrap_task: asyncio.Task[None] | None = None
         self._stream_tasks: list[asyncio.Task[None]] = []
         self._kalshi_stream_task: asyncio.Task[None] | None = None
@@ -128,6 +131,10 @@ class AnalysisEngine:
         self._pending_trade_review: tuple[dict[str, Any], str] | None = None
         self._last_trade_review_key: tuple[str, int, str] | None = None
         self._live_refresh_task: asyncio.Task[None] | None = None
+        self._trading_summary_task: asyncio.Task[None] | None = None
+        self._trading_summary: dict[str, Any] = {
+            "selected_mode": "PAPER", "selected": {}, "modes": {}
+        }
         self._stopping = asyncio.Event()
         self._update_lock = asyncio.Lock()
         self._previous_ticker: str | None = None
@@ -154,8 +161,6 @@ class AnalysisEngine:
         }
 
     async def start(self) -> None:
-        self.margin_volatility.backfill_recent()
-        self._benchmark_calibration = self.models.benchmark_calibration()
         self.http = httpx.AsyncClient(
             timeout=PUBLIC_MARKET_HTTP_TIMEOUT,
             headers={"User-Agent": "kalshi-model/0.1 local-analysis-only"},
@@ -174,8 +179,8 @@ class AnalysisEngine:
             self.http, self.config.kalshi_demo_api_base, self.config.kalshi_series
         )
         await self.trading.start(self.trading_http)
-        await self.collect_once()
         self._runner = asyncio.create_task(self._run_loop())
+        self._initial_collect_task = asyncio.create_task(self._collect_initial())
         bitcoin_streams = BitcoinWebSocketFeeds(
             self._handle_stream_quote, self._handle_stream_status,
             self._handle_stream_trade,
@@ -188,19 +193,22 @@ class AnalysisEngine:
         )
         self._start_kalshi_stream()
         existing = self.db.fetch_one(
-            "SELECT COUNT(*) AS count FROM signal_snapshots WHERE material_reason='historical bootstrap'"
+            "SELECT 1 AS present FROM signal_snapshots "
+            "WHERE material_reason='historical bootstrap' LIMIT 1"
         )
-        if not existing or existing["count"] == 0:
+        if not existing:
             self._bootstrap_task = asyncio.create_task(self._bootstrap())
 
     async def stop(self) -> None:
         self._stopping.set()
         tasks = [task for task in (
             self._runner,
+            self._initial_collect_task,
             self._bootstrap_task,
             self._publish_task,
             self._trade_review_task,
             self._live_refresh_task,
+            self._trading_summary_task,
             self._kalshi_stream_task,
             *self._stream_tasks,
         ) if task]
@@ -212,6 +220,15 @@ class AnalysisEngine:
             await self.http.aclose()
         if self.trading_http:
             await self.trading_http.aclose()
+
+    async def _collect_initial(self) -> None:
+        try:
+            await self.collect_once()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.exception("Initial collection failed")
+            self._degrade(str(exc))
 
     def _start_kalshi_stream(self) -> None:
         key_id = self.config.kalshi_api_key_id
@@ -305,7 +322,7 @@ class AnalysisEngine:
         )
         current_market, next_market = market_pair
         observed_at = iso_now()
-        btc_state = self._save_bitcoin(composite, observed_at)
+        btc_state = await self._save_bitcoin(composite, observed_at)
         self._latest_quotes = {quote.exchange: quote for quote in composite.quotes}
         self._latest_btc = btc_state
         self._current_market = current_market
@@ -400,12 +417,13 @@ class AnalysisEngine:
             "notification": notification,
             "strategy": {"texas_holdem": self._texas_recovery_state()},
             "paper": self._portfolio_summary(),
-            "trading": self.trading.summary(current_payload),
+            "trading": self._trading_summary,
             "calibration": self.calibration_summary(),
             "model": self.models.active(),
         }
         self._schedule_publish()
         self.trading.schedule_process(current_payload)
+        self._schedule_trading_summary()
 
     async def _execution_state_for(
         self,
@@ -470,9 +488,23 @@ class AnalysisEngine:
 
     def refresh_trading_dashboard(self) -> None:
         """Publish current broker safety state without waiting for a market tick."""
-        self.dashboard["trading"] = self.trading.summary(self.dashboard.get("current"))
+        self._schedule_trading_summary()
         self.dashboard["strategy"] = {"texas_holdem": self._texas_recovery_state()}
         self._schedule_publish()
+
+    def _schedule_trading_summary(self) -> None:
+        if self._trading_summary_task and not self._trading_summary_task.done():
+            return
+
+        async def refresh() -> None:
+            summary = await asyncio.to_thread(
+                self.trading.summary, self.dashboard.get("current")
+            )
+            self._trading_summary = summary
+            self.dashboard["trading"] = summary
+            self._schedule_publish()
+
+        self._trading_summary_task = asyncio.create_task(refresh())
 
     def _texas_recovery_state(self) -> dict[str, Any]:
         """Keep the Texas HUD visible while public market data reconnects."""
@@ -618,7 +650,7 @@ class AnalysisEngine:
             if composite.price is not None:
                 now = time.monotonic()
                 persist = now - self._last_btc_persist >= 1.0
-                self._latest_btc = self._save_bitcoin(
+                self._latest_btc = await self._save_bitcoin(
                     composite, observed_at, persist=persist
                 )
                 if persist:
@@ -845,6 +877,9 @@ class AnalysisEngine:
             str(self._current_market["ticker"]), current
         )
         self._schedule_trade_review(current, observed_at)
+        # Protection and order evaluation must not wait for summary assembly,
+        # which can involve local history reads for all account modes.
+        self.trading.schedule_process(current)
         reliable = current["decision"]["reason_code"] != "DATA_UNRELIABLE"
         self.dashboard = {
             **self.dashboard,
@@ -855,10 +890,10 @@ class AnalysisEngine:
             "notification": notification,
             "strategy": {"texas_holdem": self._texas_recovery_state()},
             "paper": self._portfolio_summary(),
-            "trading": self.trading.summary(current),
+            "trading": self._trading_summary,
         }
         self._schedule_publish()
-        self.trading.schedule_process(current)
+        self._schedule_trading_summary()
 
     def _schedule_trade_review(
         self, current: dict[str, Any], observed_at: str
@@ -901,7 +936,7 @@ class AnalysisEngine:
                 self.trade_reviews.observe, payload, observed_at
             )
 
-    def _save_bitcoin(
+    async def _save_bitcoin(
         self, composite: CompositeQuote, observed_at: str, *, persist: bool = True
     ) -> dict[str, Any]:
         if composite.price is None:
@@ -924,19 +959,41 @@ class AnalysisEngine:
                         quote.volume, quote.latency_ms,
                     ),
                 )
-        recent = self.db.fetch_all(
-            """
-            SELECT observed_at, composite_price, source_json FROM btc_ticks
-            WHERE observed_at >= ? ORDER BY observed_at ASC
-            """,
-            ((datetime.now(UTC) - timedelta(minutes=65)).isoformat(),),
-        )
+        now_epoch = datetime.now(UTC).timestamp()
+        recent: list[dict[str, Any]] = []
+        if not self._btc_samples_loaded:
+            recent = await asyncio.to_thread(
+                self.db.fetch_all,
+                """
+                SELECT observed_at, composite_price, source_json FROM btc_ticks
+                WHERE observed_at >= ? ORDER BY observed_at ASC
+                """,
+                ((datetime.now(UTC) - timedelta(minutes=65)).isoformat(),),
+            )
+            samples = [
+                (parse_time(row["observed_at"]).timestamp(), float(row["composite_price"]))
+                for row in recent
+                if parse_time(row["observed_at"])
+            ]
+            for row in recent:
+                try:
+                    timestamp = parse_time(row["observed_at"])
+                    source = json.loads(row["source_json"])
+                    if timestamp:
+                        self._recent_btc_volume_points.append((
+                            timestamp.timestamp(),
+                            sum(float(quote.get("volume") or 0) for quote in source.get("quotes", [])),
+                        ))
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    continue
+            self._btc_samples_loaded = True
+        else:
+            samples = list(self._recent_btc_samples)
+        samples.append((now_epoch, composite.price))
         samples = [
-            (parse_time(row["observed_at"]).timestamp(), float(row["composite_price"]))
-            for row in recent
-            if parse_time(row["observed_at"])
+            (timestamp, price) for timestamp, price in samples
+            if now_epoch - timestamp <= 65 * 60
         ]
-        samples.append((datetime.now(UTC).timestamp(), composite.price))
         latest_timestamp = samples[-1][0]
         self._recent_btc_samples = [
             (timestamp, price)
@@ -954,21 +1011,14 @@ class AnalysisEngine:
         high_low_5m_pct = (
             (max(recent_5m) - min(recent_5m)) / composite.price if recent_5m else 0.0
         )
-        volume_points: list[tuple[float, float]] = []
-        for row in recent[-3:]:
-            try:
-                previous_source = json.loads(row["source_json"])
-                total_volume = sum(
-                    float(quote.get("volume") or 0)
-                    for quote in previous_source.get("quotes", [])
-                )
-                timestamp = parse_time(row["observed_at"])
-                if timestamp:
-                    volume_points.append((timestamp.timestamp(), total_volume))
-            except (TypeError, ValueError, json.JSONDecodeError):
-                continue
         current_total_volume = sum(float(quote.volume or 0) for quote in composite.quotes)
-        volume_points.append((samples[-1][0], current_total_volume))
+        self._recent_btc_volume_points.append((samples[-1][0], current_total_volume))
+        self._recent_btc_volume_points = [
+            (timestamp, volume)
+            for timestamp, volume in self._recent_btc_volume_points
+            if now_epoch - timestamp <= 65 * 60
+        ]
+        volume_points = self._recent_btc_volume_points[-3:]
         volume_acceleration = None
         if len(volume_points) >= 3:
             first_dt = volume_points[-2][0] - volume_points[-3][0]
