@@ -74,6 +74,13 @@ def test_kalshi_fallback_book_has_a_tighter_bounded_timeout() -> None:
 
 def test_rest_book_fallback_applies_only_to_its_cached_active_ticker() -> None:
     async def scenario() -> None:
+        class Trading:
+            def __init__(self) -> None:
+                self.calls: list[tuple[str, dict]] = []
+
+            def schedule_protective_exits(self, mode: str, current: dict) -> None:
+                self.calls.append((mode, current))
+
         engine = AnalysisEngine.__new__(AnalysisEngine)
         engine._update_lock = asyncio.Lock()
         engine._current_market = {
@@ -82,7 +89,13 @@ def test_rest_book_fallback_applies_only_to_its_cached_active_ticker() -> None:
         engine._last_kalshi_ws_book = 0.0
         engine._stream_status = {"Kalshi": {"connected": False}}
         engine.config = type("Config", (), {"kalshi_book_stale_seconds": 2.0})()
-        engine.dashboard = {"current": {"ticker": "ACTIVE", "orderbook": {}}}
+        engine.dashboard = {"current": {
+            "ticker": "ACTIVE", "orderbook": {}, "execution_market_mode": "LIVE",
+            "close_time": (datetime.now(UTC) + timedelta(minutes=10)).isoformat(),
+            "time_remaining_seconds": 0,
+            "texas_holdem": {"side": "YES", "executable_bid": .40},
+        }}
+        engine.trading = Trading()
         engine._schedule_publish = lambda: None
 
         payload = {"orderbook_fp": {
@@ -96,13 +109,20 @@ def test_rest_book_fallback_applies_only_to_its_cached_active_ticker() -> None:
         assert current["yes_bid"] == .45
         assert current["yes_ask"] == .50
         assert current["quote_source"] == "REST_FALLBACK"
+        assert current["texas_holdem"]["executable_bid"] == .45
+        assert current["time_remaining_seconds"] > 0
         assert engine._stream_status["Kalshi"]["fallback"]["receive_ms"] == 12.0
+        assert len(engine.trading.calls) == 1
+        assert engine.trading.calls[0][0] == "LIVE"
+        assert engine.trading.calls[0][1]["executable_quote_at"] == current["executable_quote_at"]
+        assert engine.trading.calls[0][1]["texas_holdem"]["executable_bid"] == .45
 
         before = dict(current)
         await engine._apply_kalshi_fallback_book(
             "OLD", payload, datetime.now(UTC).isoformat(), 12.0
         )
         assert engine.dashboard["current"] == before
+        assert len(engine.trading.calls) == 1
 
     asyncio.run(scenario())
 

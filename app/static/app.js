@@ -288,17 +288,54 @@ function thresholdExitResultLabel(trade = {}) {
   return labels[reason] ? ` · ${labels[reason]}` : "";
 }
 
+const EXECUTABLE_QUOTE_MAX_AGE_MS = 20_000;
+
+function executableQuoteState(current = state.dashboard?.current) {
+  const ticker = String(current?.ticker || "");
+  const timestamp = current?.executable_quote_at;
+  const quotedAt = timestamp ? new Date(timestamp).getTime() : NaN;
+  const ageMs = Number.isFinite(quotedAt) ? Math.max(0, Date.now() - quotedAt) : Infinity;
+  return {
+    ticker,
+    fresh: Boolean(ticker) && ageMs <= EXECUTABLE_QUOTE_MAX_AGE_MS,
+    stale: Boolean(ticker) && Number.isFinite(ageMs) && ageMs > EXECUTABLE_QUOTE_MAX_AGE_MS,
+  };
+}
+
+function executablePrice(side, action = "SELL", current = state.dashboard?.current) {
+  if (!executableQuoteState(current).fresh) return null;
+  const normalizedSide = String(side || "").toUpperCase();
+  const key = `${normalizedSide.toLowerCase()}_${action === "BUY" ? "ask" : "bid"}`;
+  const value = numberOrNull(current?.[key]);
+  return value !== null && value > 0 ? value : null;
+}
+
+function executablePriceLabel(side, action = "SELL", current = state.dashboard?.current) {
+  const quote = executableQuoteState(current);
+  if (!quote.ticker) return "No quote";
+  if (quote.stale) return "Quote stale";
+  const price = executablePrice(side, action, current);
+  return price === null ? "Unavailable" : cents(price);
+}
+
+function openTradeExecutablePriceLabel(position = {}, current = state.dashboard?.current) {
+  const positionTicker = String(position.ticker || "");
+  const quote = executableQuoteState(current);
+  // A quote is executable only for the active contract.  Never carry a price
+  // from a newly opened market onto an older position's row.
+  if (!positionTicker || positionTicker !== quote.ticker) return "Current executable unavailable";
+  return `Current executable ${executablePriceLabel(position.side, "SELL", current)}`;
+}
+
 function texasExitText(position = {}) {
   const current = state.dashboard?.current?.texas_holdem || {};
   const status = position.texas_exit_status || current.status || "Watching";
   const phase = current.phase?.label || "Opening play";
   const target = current.active_target;
-  const bid = current.executable_bid;
   const fields = [
     `Texas Hold’em exit: ${status}`,
     `Phase ${phase}`,
     `Active target ${cents(target, 0)}`,
-    `Current bid ${cents(bid, 1)}`,
   ];
   if (position.texas_exit_reason || current.blocker) {
     fields.push(`Reason: ${position.texas_exit_reason || current.blocker}`);
@@ -333,6 +370,7 @@ function renderDashboardOpenTrades(mode, portfolio = {}) {
       <strong class="${side === "YES" ? "yes" : "no"}" title="${escapeHtml(position.ticker || "Current market")}">${escapeHtml(marketSideLabel(side))} · ${escapeHtml(String(strategy).replaceAll("_", " "))}</strong>
       <small>${escapeHtml(status)}</small>
       <p>${escapeHtml(compact(position.contracts))} contracts · ${escapeHtml(cents(entryPrice))} entry · ${escapeHtml(money(exposure))} exposure</p>
+      <p class="open-trade-executable-price" data-open-trade-executable-price data-ticker="${escapeHtml(String(position.ticker || ""))}" data-side="${escapeHtml(side)}">${escapeHtml(openTradeExecutablePriceLabel(position))}</p>
       <p class="threshold-breach-state">${escapeHtml(String(strategy).toUpperCase() === "TEXAS_HOLDEM" ? texasExitText(position) : thresholdBreachExitText(protection))}</p>
     </article>`;
   });
@@ -819,9 +857,32 @@ function renderConnectionHud(streams, btc, current) {
 }
 
 function paperQuote(side = state.paperOrder.side, action = state.paperOrder.action) {
+  return executablePrice(side, action);
+}
+
+function renderFastExecutablePrices() {
   const current = state.dashboard?.current;
-  const value = current?.[`${side.toLowerCase()}_${action === "BUY" ? "ask" : "bid"}`];
-  return Number.isFinite(Number(value)) && Number(value) > 0 ? Number(value) : null;
+  const quote = executableQuoteState(current);
+  const action = state.paperOrder.action;
+  for (const side of ["YES", "NO"]) {
+    const price = $(side === "YES" ? "#paper-up-price" : "#paper-down-price");
+    if (!price) continue;
+    price.textContent = executablePriceLabel(side, action, current);
+    price.dataset.quoteState = quote.fresh ? "fresh" : quote.stale ? "stale" : "unavailable";
+  }
+  const bestPrice = $("#paper-best-price");
+  if (bestPrice) {
+    const bookSide = action === "BUY" ? "ask" : "bid";
+    bestPrice.textContent = `Best ${bookSide} ${executablePriceLabel(state.paperOrder.side, action, current)}`;
+    bestPrice.dataset.quoteState = quote.fresh ? "fresh" : quote.stale ? "stale" : "unavailable";
+  }
+  $$('[data-open-trade-executable-price]').forEach((element) => {
+    // Markers are rendered with their contract identity.  An old position may
+    // remain visible while Kalshi has already moved to the next round.
+    if (element.dataset.ticker !== quote.ticker) return;
+    element.textContent = `Current executable ${executablePriceLabel(element.dataset.side, "SELL", current)}`;
+    element.dataset.quoteState = quote.fresh ? "fresh" : quote.stale ? "stale" : "unavailable";
+  });
 }
 
 function paperAvailableContracts(side = state.paperOrder.side) {
@@ -1791,6 +1852,9 @@ function renderLiveMarketUpdate(data) {
     const sources = system.streams?.bitcoin?.sources || [];
     btcConnection.textContent = sources.length ? `${sources.join(" + ")} live` : "REST fallback";
   }
+  // Keep execution-facing controls on the fast market lane.  Do not wait for
+  // the 15-second full dashboard snapshot just to repaint a fresh Kalshi book.
+  renderFastExecutablePrices();
   renderOrderBook("YES", current.orderbook || {}, current.execution_market_mode || "LIVE");
   renderOrderBook("NO", current.orderbook || {}, current.execution_market_mode || "LIVE");
   syncPriceMovement();

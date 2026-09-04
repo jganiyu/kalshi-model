@@ -159,6 +159,12 @@ class TradingCoordinator:
         # one processor and retain the newest snapshot for its next pass.
         self._latest_process_current: dict[str, Any] | None = None
         self._process_task: asyncio.Task[None] | None = None
+        # A fresh public Kalshi book can require an immediate risk-reducing
+        # check even while the slower analysis/entry pass is busy.  Keep this
+        # lane per exchange environment: the live public book must never be
+        # repurposed as a Demo or Paper execution quote.
+        self._latest_protective_current: dict[str, dict[str, Any]] = {}
+        self._protective_exit_tasks: dict[str, asyncio.Task[None]] = {}
 
     @property
     def selected_mode(self) -> str:
@@ -194,10 +200,13 @@ class TradingCoordinator:
             task.cancel()
         for task in self._private_status_recovery_tasks.values():
             task.cancel()
+        for task in self._protective_exit_tasks.values():
+            task.cancel()
         await asyncio.gather(
             *self._private_streams.values(), *self._reconciliation_tasks.values(),
             *self._submission_tasks, *self._private_event_recovery_tasks.values(),
             *self._private_status_recovery_tasks.values(),
+            *self._protective_exit_tasks.values(),
             return_exceptions=True,
         )
         self._private_streams.clear()
@@ -205,6 +214,8 @@ class TradingCoordinator:
         self._submission_tasks.clear()
         self._private_event_recovery_tasks.clear()
         self._private_status_recovery_tasks.clear()
+        self._latest_protective_current.clear()
+        self._protective_exit_tasks.clear()
 
     def _configure_broker(self, mode: str) -> None:
         broker = self.brokers[mode]
@@ -1690,6 +1701,42 @@ class TradingCoordinator:
             if self._process_task is done else None
         )
         self._track_task(task)
+
+    def schedule_protective_exits(
+        self, mode: str, current: dict[str, Any] | None
+    ) -> None:
+        """Coalesce a fresh, executable quote into one exit-only pass.
+
+        This deliberately bypasses entries, reconciliation, and full strategy
+        analysis.  It is used only by the independent *Live* public-book
+        fallback; callers must select the matching execution environment.
+        """
+        normalized = normalize_mode(mode)
+        if normalized not in {"DEMO", "LIVE"} or not current:
+            return
+        self._latest_protective_current[normalized] = current
+        existing = self._protective_exit_tasks.get(normalized)
+        if existing and not existing.done():
+            return
+
+        async def coalesced_exits() -> None:
+            while (snapshot := self._latest_protective_current.pop(normalized, None)):
+                try:
+                    broker = self.broker(normalized)
+                    if isinstance(broker, KalshiBroker):
+                        await self._process_exits(broker, snapshot)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    # A failed exit pass must not strand the next fresh quote.
+                    continue
+
+        task = asyncio.create_task(coalesced_exits())
+        self._protective_exit_tasks[normalized] = task
+        task.add_done_callback(
+            lambda done: self._protective_exit_tasks.pop(normalized, None)
+            if self._protective_exit_tasks.get(normalized) is done else None
+        )
 
     async def _process_exits(self, broker: KalshiBroker, current: dict[str, Any]) -> None:
         ticker = str(current.get("ticker") or "")

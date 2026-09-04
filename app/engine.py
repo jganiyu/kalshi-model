@@ -817,6 +817,7 @@ class AnalysisEngine:
     ) -> None:
         """Apply a REST book only when it still belongs to the active ticker."""
         applied_started = time.monotonic()
+        protective_current: dict[str, Any] | None = None
         async with self._update_lock:
             market = self._current_market
             if not market or str(market.get("ticker") or "") != ticker:
@@ -844,6 +845,29 @@ class AnalysisEngine:
                         "quote_source", "received_at", "fallback_receive_ms",
                     )
                 })
+                # The Texas HUD's price is the executable bid for its held
+                # outcome, not the stale value from the last full analysis.
+                # A Live public book is never substituted into a Demo/Paper
+                # execution view.
+                if str(updated.get("execution_market_mode") or "") == "LIVE":
+                    texas = updated.get("texas_holdem")
+                    side = str((texas or {}).get("side") or "").upper()
+                    bid = state.get(f"{side.lower()}_bid") if side in {"YES", "NO"} else None
+                    if isinstance(texas, dict) and bid is not None:
+                        updated_texas = dict(texas)
+                        updated_texas["executable_bid"] = bid
+                        updated["texas_holdem"] = updated_texas
+                    # Phase boundaries are time based.  Keep an exit-only pass
+                    # accurate even if a BTC/full-analysis update is delayed.
+                    close = parse_time(updated.get("close_time") or market.get("close_time"))
+                    received = parse_time(received_at)
+                    if close and received:
+                        updated["time_remaining_seconds"] = max(
+                            0.0, (close - received).total_seconds()
+                        )
+                    # This is a snapshot, not an entry signal.  The trading
+                    # coordinator coalesces it into one Live exit-only pass.
+                    protective_current = updated
                 self.dashboard["current"] = updated
             fallback = self._stream_status["Kalshi"].setdefault("fallback", {})
             fallback.update({
@@ -855,6 +879,8 @@ class AnalysisEngine:
             fallback.pop("error", None)
         fallback["published_at"] = iso_now()
         self._schedule_publish()
+        if protective_current is not None:
+            self.trading.schedule_protective_exits("LIVE", protective_current)
 
     async def _handle_market_lifecycle(self, message: dict[str, Any]) -> None:
         payload = message.get("msg") or {}

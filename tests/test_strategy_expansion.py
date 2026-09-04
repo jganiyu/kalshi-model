@@ -1091,3 +1091,23 @@ def test_dashboard_open_trades_and_collapsible_manual_ticket_markup() -> None:
     assert '.paper-controller.manual-collapsed .paper-side-picker button[data-paper-side="YES"]' in styles
     assert '.paper-controller.manual-collapsed .paper-side-picker button[data-paper-side="NO"]' in styles
     assert '.manual-order-toggle { width: 100%; height: 32px; margin-top: auto;' in styles
+
+
+def test_fast_market_frames_refresh_only_current_executable_prices() -> None:
+    root = Path(__file__).resolve().parents[1]
+    script = (root / "app/static/app.js").read_text()
+    styles = (root / "app/static/styles.css").read_text()
+
+    # Fast frames use fresh asks for buys and fresh bids for held-position
+    # executable values, without invoking the full dashboard renderer.
+    assert 'const EXECUTABLE_QUOTE_MAX_AGE_MS = 20_000;' in script
+    assert 'function executablePrice(side, action = "SELL"' in script
+    assert 'action === "BUY" ? "ask" : "bid"' in script
+    assert 'function renderFastExecutablePrices()' in script
+    assert 'data-open-trade-executable-price' in script
+    assert 'if (element.dataset.ticker !== quote.ticker) return;' in script
+    assert 'renderFastExecutablePrices();' in script
+    live_update = script[script.index('function renderLiveMarketUpdate'):script.index('function queueLiveMarketUpdate')]
+    assert live_update.index('renderFastExecutablePrices();') < live_update.index('renderOrderBook("YES"')
+    assert 'Quote stale' in script
+    assert '.open-trade-executable-price[data-quote-state="stale"]' in styles

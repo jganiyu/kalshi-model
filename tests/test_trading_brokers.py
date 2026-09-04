@@ -2312,6 +2312,38 @@ async def test_scheduled_exit_processing_is_single_flight_and_keeps_latest_tick(
 
 
 @run_async
+async def test_fresh_live_book_exit_lane_is_coalesced_and_mode_isolated(
+    tmp_path: Path,
+) -> None:
+    db = make_db(tmp_path)
+    coordinator = TradingCoordinator(
+        AppConfig(database_path=db.path), db, PaperTradingService(db)
+    )
+    started = asyncio.Event()
+    release = asyncio.Event()
+    seen: list[tuple[str, str]] = []
+
+    async def slow_exits(broker, current: dict[str, object]) -> None:
+        seen.append((broker.mode, str(current["ticker"])))
+        started.set()
+        await release.wait()
+
+    coordinator._process_exits = slow_exits  # type: ignore[method-assign]
+    # The fallback has a Live book.  Paper is intentionally ignored rather
+    # than leaking that quote into a different execution environment.
+    coordinator.schedule_protective_exits("PAPER", {"ticker": "never"})
+    coordinator.schedule_protective_exits("LIVE", {"ticker": "first"})
+    await started.wait()
+    coordinator.schedule_protective_exits("LIVE", {"ticker": "stale"})
+    coordinator.schedule_protective_exits("LIVE", {"ticker": "latest"})
+    release.set()
+    task = coordinator._protective_exit_tasks["LIVE"]
+    await task
+    assert seen == [("LIVE", "first"), ("LIVE", "latest")]
+    assert coordinator._protective_exit_tasks == {}
+
+
+@run_async
 async def test_timed_out_automatic_remainder_is_canceled(tmp_path: Path) -> None:
     db = make_db(tmp_path)
     coordinator = TradingCoordinator(
