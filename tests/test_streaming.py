@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 import base64
+import asyncio
 import inspect
 
+import httpx
 import pytest
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
 
 from app.engine import AnalysisEngine
 from app.services.market_data import ExchangeQuote, live_composite_quote
+from app.services.kalshi import KalshiPublicClient
 from app.services.streaming import (
     BitcoinWebSocketFeeds,
     KalshiOrderBook,
@@ -22,6 +25,28 @@ def test_lifecycle_subscription_is_on_kalshi_not_bitcoin_stream() -> None:
     assert "market_lifecycle_v2" not in inspect.getsource(
         BitcoinWebSocketFeeds._coinbase_connection
     )
+
+
+def test_public_kalshi_requests_have_a_short_independent_timeout() -> None:
+    async def scenario() -> None:
+        observed_timeout: dict[str, float] = {}
+
+        def responder(request: httpx.Request) -> httpx.Response:
+            observed_timeout.update(request.extensions["timeout"])
+            return httpx.Response(200, json={"orderbook_fp": {}})
+
+        http = httpx.AsyncClient(transport=httpx.MockTransport(responder))
+        try:
+            client = KalshiPublicClient(http, "https://example.test", "KXBTC15M")
+            await client.orderbook("TEST")
+        finally:
+            await http.aclose()
+
+        assert observed_timeout == {
+            "connect": 2.5, "read": 3.5, "write": 3.5, "pool": 1.0,
+        }
+
+    asyncio.run(scenario())
 
 
 def test_kalshi_websocket_headers_sign_expected_message(tmp_path) -> None:

@@ -322,6 +322,10 @@ class KalshiWebSocketFeed:
             self.websocket_url,
             ssl=TLS_CONTEXT,
             additional_headers=headers,
+            # A failed handshake must yield quickly to bounded REST polling;
+            # it must never leave the displayed book frozen on a socket open.
+            open_timeout=5,
+            close_timeout=2,
             ping_interval=20,
             ping_timeout=20,
             max_queue=2048,

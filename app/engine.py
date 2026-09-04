@@ -70,12 +70,29 @@ KALSHI_HTTP_LIMITS = httpx.Limits(
     keepalive_expiry=120.0,
 )
 
+# Public price discovery must remain independent from authenticated account
+# recovery.  In particular, a slow /portfolio request must never consume the
+# connection pool that keeps the displayed BTC/contract price and order book
+# current.
+PUBLIC_MARKET_HTTP_LIMITS = httpx.Limits(
+    max_connections=8,
+    max_keepalive_connections=4,
+    keepalive_expiry=30.0,
+)
+PUBLIC_MARKET_HTTP_TIMEOUT = httpx.Timeout(
+    connect=2.5,
+    read=3.5,
+    write=3.5,
+    pool=1.0,
+)
+
 
 class AnalysisEngine:
     def __init__(self, config: AppConfig, db: Database):
         self.config = config
         self.db = db
         self.http: httpx.AsyncClient | None = None
+        self.trading_http: httpx.AsyncClient | None = None
         self.bitcoin: BitcoinCompositeFeed | None = None
         self.kalshi: KalshiPublicClient | None = None
         self.kalshi_demo: KalshiPublicClient | None = None
@@ -140,6 +157,11 @@ class AnalysisEngine:
         self.margin_volatility.backfill_recent()
         self._benchmark_calibration = self.models.benchmark_calibration()
         self.http = httpx.AsyncClient(
+            timeout=PUBLIC_MARKET_HTTP_TIMEOUT,
+            headers={"User-Agent": "kalshi-model/0.1 local-analysis-only"},
+            limits=PUBLIC_MARKET_HTTP_LIMITS,
+        )
+        self.trading_http = httpx.AsyncClient(
             timeout=httpx.Timeout(8.0, connect=5.0),
             headers={"User-Agent": "kalshi-model/0.1 local-analysis-only"},
             limits=KALSHI_HTTP_LIMITS,
@@ -151,7 +173,7 @@ class AnalysisEngine:
         self.kalshi_demo = KalshiPublicClient(
             self.http, self.config.kalshi_demo_api_base, self.config.kalshi_series
         )
-        await self.trading.start(self.http)
+        await self.trading.start(self.trading_http)
         await self.collect_once()
         self._runner = asyncio.create_task(self._run_loop())
         bitcoin_streams = BitcoinWebSocketFeeds(
@@ -188,6 +210,8 @@ class AnalysisEngine:
         await self.trading.stop()
         if self.http:
             await self.http.aclose()
+        if self.trading_http:
+            await self.trading_http.aclose()
 
     def _start_kalshi_stream(self) -> None:
         key_id = self.config.kalshi_api_key_id

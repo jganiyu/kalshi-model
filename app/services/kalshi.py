@@ -68,7 +68,13 @@ class KalshiPublicClient:
         self.series = series
 
     async def _get(self, path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
-        response = await self.client.get(f"{self.base_url}{path}", params=params)
+        # The engine gives this client a small, dedicated public-data pool.
+        # Repeating the timeout here also keeps direct callers bounded: stale
+        # market data is unsafe, but it must not stall the next refresh.
+        response = await self.client.get(
+            f"{self.base_url}{path}", params=params,
+            timeout=httpx.Timeout(connect=2.5, read=3.5, write=3.5, pool=1.0),
+        )
         response.raise_for_status()
         return response.json()
 
