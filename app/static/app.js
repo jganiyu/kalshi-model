@@ -846,7 +846,7 @@ function renderDashboard(data) {
   renderOrderBook("NO", current?.orderbook || {}, current?.execution_market_mode || "LIVE");
   const recent = trading.mode === "PAPER"
     ? data.paper?.recent_paper_trades || []
-    : (paper.ledger || []).slice(0, 8);
+    : paper.recent_trades || [];
   renderRecentTrades(recent, trading.mode);
   renderPaperController();
   drawChart();

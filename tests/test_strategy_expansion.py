@@ -1065,6 +1065,7 @@ def test_next_threshold_forecast_is_isolated_beneath_current_threshold() -> None
     markup = (root / "app/templates/index.html").read_text()
     script = (root / "app/static/app.js").read_text()
     styles = (root / "app/static/styles.css").read_text()
+    server = (root / "app/main.py").read_text()
 
     threshold_stat = markup[
         markup.index('<div class="chart-price-stat">'):
@@ -1079,6 +1080,9 @@ def test_next_threshold_forecast_is_isolated_beneath_current_threshold() -> None
     assert 'container.hidden = true;' in script
     assert 'renderNextThresholdForecast(data);' in script
     assert 'renderNextThresholdForecast(dashboard);' in script
+    # Final-minute state changes every second.  It must travel with compact
+    # market frames rather than waiting for the 15-second full dashboard poll.
+    assert '"next_threshold_forecast": dashboard.get("next_threshold_forecast")' in server
     assert '.next-threshold-forecast {' in styles
 
 

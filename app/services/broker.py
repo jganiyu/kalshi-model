@@ -643,6 +643,17 @@ class KalshiBroker(Broker):
         sql += " ORDER BY updated_at DESC"
         return self.db.fetch_all(sql, tuple(params))
 
+    def recent_trades(self, limit: int = 5) -> list[dict[str, Any]]:
+        """Small, indexed activity feed for the Dashboard only."""
+        return self.db.fetch_all(
+            """
+            SELECT ticker,side,action,contracts,price,fee,strategy,source,filled_at
+            FROM broker_fills WHERE mode=?
+            ORDER BY filled_at DESC,id DESC LIMIT ?
+            """,
+            (self.mode, max(1, min(int(limit), 8))),
+        )
+
     def trade_ledger(self) -> list[dict[str, Any]]:
         fills = self.db.fetch_all(
             "SELECT * FROM broker_fills WHERE mode=? ORDER BY filled_at ASC,id ASC",

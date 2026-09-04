@@ -540,6 +540,10 @@ class TradingCoordinator:
         # fetched by /api/trading/selected when the Trading page opens.
         for key in ("orders", "fills", "intents", "settlements"):
             selected.pop(key, None)
+        if isinstance(selected_broker, KalshiBroker):
+            # This indexed five-row query restores Dashboard context without
+            # rebuilding the complete ledger/history on every live update.
+            selected["recent_trades"] = selected_broker.recent_trades(5)
         modes = {
             mode: {
                 "mode": mode,

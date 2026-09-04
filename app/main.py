@@ -156,6 +156,11 @@ async def live(websocket: WebSocket) -> None:
                 "data": {
                     "btc": dashboard.get("btc") or {},
                     "current": dashboard.get("current") or {},
+                    # The forecast advances once per proxy second in the final
+                    # minute.  It must use this fast lane too: otherwise the
+                    # browser only sees it on the 15-second full dashboard
+                    # poll, often after the collection window has ended.
+                    "next_threshold_forecast": dashboard.get("next_threshold_forecast"),
                     "system": {
                         "status": (dashboard.get("system") or {}).get("status"),
                         "message": (dashboard.get("system") or {}).get("message"),
