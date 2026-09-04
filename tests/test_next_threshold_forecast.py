@@ -84,7 +84,7 @@ def test_forecast_freezes_then_compares_to_the_published_threshold() -> None:
         next_market=successor, known_markets=(current, successor), proxy_price=101.0,
         observed_at=stamp(opens + timedelta(seconds=14)), official_threshold=market_strike,
     )
-    assert inactive is None
+    assert inactive and inactive["status"] == "inactive"
 
 
 def test_forecast_is_inactive_outside_the_final_minute_and_resets_for_new_target() -> None:
@@ -95,7 +95,7 @@ def test_forecast_is_inactive_outside_the_final_minute_and_resets_for_new_target
         next_market=first, known_markets=(None, first), proxy_price=100.0,
         observed_at=stamp(opens - timedelta(seconds=61)), official_threshold=market_strike,
     )
-    assert state is None
+    assert state and state["status"] == "inactive"
     state, _ = forecast.observe(
         next_market=first, known_markets=(None, first), proxy_price=100.0,
         observed_at=stamp(opens - timedelta(seconds=1)), official_threshold=market_strike,
@@ -109,6 +109,25 @@ def test_forecast_is_inactive_outside_the_final_minute_and_resets_for_new_target
     )
     assert state and state["ticker"] == "SECOND"
     assert state["samples_collected"] == 1 and state["estimate"] == pytest.approx(200.0)
+
+
+def test_final_minute_stays_active_when_kalshi_has_not_published_successor() -> None:
+    forecast = NextThresholdForecast()
+    closes = datetime(2026, 9, 4, 12, 15, tzinfo=UTC)
+    current = {
+        "ticker": "CURRENT",
+        "open_time": stamp(closes - timedelta(minutes=15)),
+        "close_time": stamp(closes),
+    }
+    state, _ = forecast.observe(
+        next_market=None,
+        known_markets=(current, None),
+        proxy_price=101.25,
+        observed_at=stamp(closes - timedelta(seconds=34)),
+    )
+    assert state and state["status"] == "active"
+    assert state["ticker"].startswith("PENDING-NEXT-")
+    assert state["samples_collected"] == 1
 
 
 def test_engine_persists_only_read_only_terminal_forecast_evidence(tmp_path: Path) -> None:

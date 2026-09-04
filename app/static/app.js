@@ -86,7 +86,7 @@ function renderNextThresholdForecast(data) {
   if (!container) return;
   const status = String(forecast?.status || "").toLowerCase();
   const visibleStatuses = new Set([
-    "active", "collecting", "frozen", "comparing", "awaiting_official", "complete", "completed",
+    "inactive", "active", "collecting", "frozen", "comparing", "awaiting_official", "complete", "completed",
   ]);
   if (!forecast || !visibleStatuses.has(status)) {
     container.hidden = true;
@@ -104,15 +104,19 @@ function renderNextThresholdForecast(data) {
     ? Math.min(Math.max(0, Math.round(samples)), safeTarget) : 0;
   const official = numberOrNull(forecast.official_threshold ?? forecast.comparison?.official_threshold);
   const error = numberOrNull(forecast.error_dollars ?? forecast.comparison?.error_dollars);
-  const phase = status === "frozen" || status === "awaiting_official"
+  const phase = status === "inactive"
+    ? "Waiting for final minute"
+    : status === "frozen" || status === "awaiting_official"
     ? "Frozen · awaiting Kalshi"
     : status === "comparing" ? "Comparing with Kalshi"
     : status === "complete" || status === "completed" ? "Final proxy estimate"
     : `${safeSamples}/${safeTarget} one-second samples`;
 
   $("#next-threshold-estimate").textContent = money(estimate);
-  $("#next-threshold-progress").textContent = status === "active" || status === "collecting"
-    ? `${safeSamples}/${safeTarget}` : `${safeSamples}/${safeTarget} · frozen`;
+  $("#next-threshold-progress").textContent = status === "inactive"
+    ? "Standby"
+    : status === "active" || status === "collecting"
+      ? `${safeSamples}/${safeTarget}` : `${safeSamples}/${safeTarget} · frozen`;
   const comparison = status === "comparing" && official !== null
     ? `Kalshi ${money(official)}${error === null ? "" : ` · error ${signedMoney(error)}`}`
     : null;

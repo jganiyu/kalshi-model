@@ -644,15 +644,46 @@ class KalshiBroker(Broker):
         return self.db.fetch_all(sql, tuple(params))
 
     def recent_trades(self, limit: int = 5) -> list[dict[str, Any]]:
-        """Small, indexed activity feed for the Dashboard only."""
-        return self.db.fetch_all(
+        """Small, enriched activity feed for the Dashboard only.
+
+        This intentionally stays a five-row, index-led query.  A fill often
+        predates the reconciliation snapshot which records its available
+        balance, so use the first durable snapshot *after* that fill when the
+        fill was imported without the value.  Settlement margin is only shown
+        once Kalshi has published the settlement print; inventing one before
+        then would be misleading.
+        """
+        rows = self.db.fetch_all(
             """
-            SELECT ticker,side,action,contracts,price,fee,strategy,source,filled_at
-            FROM broker_fills WHERE mode=?
-            ORDER BY filled_at DESC,id DESC LIMIT ?
+            SELECT f.ticker,f.side,f.action,f.contracts,f.price,f.fee,
+                   f.strategy,f.source,f.filled_at,
+                   COALESCE(
+                     f.available_cash_after,
+                     (
+                       SELECT a.available_balance
+                       FROM broker_account_snapshots a
+                       WHERE a.mode=f.mode AND a.observed_at >= f.filled_at
+                       ORDER BY a.observed_at ASC LIMIT 1
+                     )
+                   ) AS available_cash_after,
+                   COALESCE(
+                     json_extract(s.raw_json,'$.expiration_value'),
+                     json_extract(m.raw_json,'$.expiration_value')
+                   ) AS settlement_price,
+                   m.strike AS settlement_strike
+            FROM broker_fills f
+            LEFT JOIN settlements s ON s.ticker=f.ticker
+            LEFT JOIN markets m ON m.ticker=f.ticker
+            WHERE f.mode=?
+            ORDER BY f.filled_at DESC,f.id DESC LIMIT ?
             """,
             (self.mode, max(1, min(int(limit), 8))),
         )
+        for row in rows:
+            row["settlement_margin"] = settlement_margin(
+                row.pop("settlement_price", None), row.pop("settlement_strike", None)
+            )
+        return rows
 
     def trade_ledger(self) -> list[dict[str, Any]]:
         fills = self.db.fetch_all(

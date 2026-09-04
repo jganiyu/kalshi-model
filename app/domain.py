@@ -75,6 +75,25 @@ class NextThresholdForecast:
             "observed_at": observed.isoformat(),
         }
 
+    @staticmethod
+    def _inactive_payload(
+        observed: datetime, next_market: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Keep the Dashboard slot honest outside its one-minute sample window."""
+        identity = NextThresholdForecast._market_identity(next_market)
+        return {
+            "status": "inactive",
+            "ticker": identity[0] if identity else None,
+            "target_open_time": identity[1] if identity else None,
+            "estimate": None,
+            "estimate_price": None,
+            "samples_collected": 0,
+            "sample_target": NEXT_THRESHOLD_WINDOW_SECONDS,
+            "coverage": 0.0,
+            "qualifier": "Starts in the final minute before the next round",
+            "observed_at": observed.isoformat(),
+        }
+
     def observe(
         self,
         *,
@@ -120,7 +139,16 @@ class NextThresholdForecast:
                     evidence = dict(comparison)
                     evidence["final_state"] = "COMPARED"
                     self._last_persisted_key = key
-            if self._frozen.get("status") == "comparing" and self._comparison_until and now >= self._comparison_until:
+            # Do not leave a frozen card on screen forever when Kalshi has not
+            # yet published (or we never learned) the successor ticker.
+            freeze_expired = (
+                self._target_open_epoch is not None
+                and now >= self._target_open_epoch + NEXT_THRESHOLD_COMPARISON_SECONDS
+            )
+            if (
+                (self._frozen.get("status") == "comparing" and self._comparison_until and now >= self._comparison_until)
+                or freeze_expired
+            ):
                 self._frozen = None
                 self._comparison_until = None
                 self._target_ticker = None
@@ -131,11 +159,28 @@ class NextThresholdForecast:
                 return dict(self._frozen), evidence
 
         identity = self._market_identity(next_market)
+        # Kalshi can publish the successor contract late.  The collection
+        # window is still deterministic: it starts 60 seconds before the
+        # active contract closes.  Use a deliberately non-tradable placeholder
+        # identity until the successor arrives rather than dropping the monitor.
+        current = known_markets[0] if known_markets else None
+        current_close = parse_time((current or {}).get("close_time"))
+        if current_close and 0 <= current_close.timestamp() - now <= NEXT_THRESHOLD_WINDOW_SECONDS:
+            successor_is_immediate = (
+                identity is not None and abs(identity[2] - current_close.timestamp()) <= 5.0
+            )
+            if not successor_is_immediate:
+                close_key = int(current_close.timestamp())
+                identity = (
+                    f"PENDING-NEXT-{close_key}",
+                    current_close.isoformat(),
+                    current_close.timestamp(),
+                )
         if identity is None:
-            return None, evidence
+            return self._inactive_payload(observed, next_market), evidence
         ticker, open_time, open_epoch = identity
         if not (open_epoch - NEXT_THRESHOLD_WINDOW_SECONDS <= now < open_epoch):
-            return None, evidence
+            return self._inactive_payload(observed, next_market), evidence
         if ticker != self._target_ticker or open_time != self._target_open_time:
             self._target_ticker = ticker
             self._target_open_time = open_time

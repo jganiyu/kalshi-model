@@ -2122,6 +2122,42 @@ def test_exchange_trade_ledger_aggregates_settlement_and_available_cash(
     assert broker.portfolio()["ledger"] == ledger
 
 
+def test_recent_exchange_trades_are_small_but_include_balance_and_settlement_margin(
+    tmp_path: Path,
+) -> None:
+    db = make_db(tmp_path)
+    broker = KalshiBroker("LIVE", db, FakeTradingClient())  # type: ignore[arg-type]
+    filled_at = "2026-09-04T10:00:00Z"
+    db.execute(
+        """
+        INSERT INTO markets(ticker,status,strike,raw_json,first_seen_at,updated_at)
+        VALUES ('RECENT','finalized',100.0,'{"expiration_value":"102.50"}',?,?)
+        """,
+        (filled_at, filled_at),
+    )
+    db.execute(
+        """
+        INSERT INTO broker_fills(
+          mode,fill_id,ticker,side,action,contracts,price,fee,strategy,source,filled_at,raw_json
+        ) VALUES ('LIVE','recent-fill','RECENT','YES','BUY',2,.45,.01,'TEXAS_HOLDEM','automatic',?,'{}')
+        """,
+        (filled_at,),
+    )
+    db.execute(
+        """
+        INSERT INTO broker_account_snapshots(
+          mode,observed_at,available_balance,portfolio_value,allocated_capital,raw_json
+        ) VALUES ('LIVE','2026-09-04T10:00:01Z',299.09,0,0,'{}')
+        """
+    )
+
+    recent = broker.recent_trades(5)
+
+    assert len(recent) == 1
+    assert recent[0]["available_cash_after"] == pytest.approx(299.09)
+    assert recent[0]["settlement_margin"] == pytest.approx(2.5)
+
+
 def test_broker_cash_migration_preserves_history_and_backfills_nearby_snapshot(
     tmp_path: Path,
 ) -> None:
