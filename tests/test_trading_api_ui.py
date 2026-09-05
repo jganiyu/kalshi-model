@@ -154,6 +154,9 @@ def test_trading_ui_contains_mode_safety_and_confirmation_controls() -> None:
     assert "Unsettled positions" in template
     assert "they are not resting orders" in template
     assert "trade.display_status || trade.status" in script
+    # Filled order rows show the confirmed execution price; resting rows fall
+    # back to their limit rather than displaying a misleading 0.01 sell cap.
+    assert "order.average_fill_price ?? order.limit_price" in script
     assert 'data-window="15"' in template
     assert 'data-window="180"' not in template
     assert "Settle margin" in template
