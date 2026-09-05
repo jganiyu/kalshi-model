@@ -309,7 +309,7 @@ def test_texas_v2_mvi_gate_boost_and_mode_isolation(tmp_path: Path) -> None:
         execution_risk_by_side={},
     )
     assert admitted["attempt_count"] == 1
-    assert seen[-1]["bankroll_fraction"] == pytest.approx(.05)
+    assert seen[-1]["bankroll_fraction"] == pytest.approx(.01)
     quotes["NO"]["margin_volatility"]["mvi"] = 8.0
     quotes["NO"]["ask_size"] = 99  # a new executable quote permits retry
     boosted = service._texas_holdem_state(
@@ -321,7 +321,7 @@ def test_texas_v2_mvi_gate_boost_and_mode_isolation(tmp_path: Path) -> None:
         execution_risk_by_side={},
     )
     assert boosted["attempt_count"] == 2
-    assert seen[-1]["bankroll_fraction"] == pytest.approx(.075)
+    assert seen[-1]["bankroll_fraction"] == pytest.approx(.015)
     evidence = db.fetch_one(
         "SELECT evidence_json FROM texas_holdem_attempts WHERE attempt_number=2"
     ) or {}

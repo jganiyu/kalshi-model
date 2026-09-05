@@ -116,6 +116,16 @@ class PaperTradingService:
         except (TypeError, ValueError):
             return 4.0
 
+    @staticmethod
+    def _texas_v2_base_allocation(settings: dict[str, Any], mode: str) -> float:
+        """Independent Texas 2.0 base fraction; ordinary risk caps remain hard ceilings."""
+        try:
+            return max(0.0, min(1.0, float(settings.get(
+                f"{str(mode).lower()}_texas_holdem_v2_base_allocation_pct", .01
+            ))))
+        except (TypeError, ValueError):
+            return .01
+
     def texas_holdem_pass_next_round(
         self, *, environment: str, source_ticker: str, market_open_time: str | None
     ) -> dict[str, Any]:
@@ -556,7 +566,7 @@ class PaperTradingService:
                             and mvi_value >= TEXAS_V2_MVI_BOOST_THRESHOLD
                             else 1.0
                         )
-                        base_allocation = float(settings.get("max_risk_per_trade_pct", 0.05))
+                        base_allocation = self._texas_v2_base_allocation(settings, mode) if texas_v2 else float(settings.get("max_risk_per_trade_pct", 0.05))
                         metadata = {
                             "market_open_time": market_open_time,
                             "trigger_timestamp": market_observed_at or iso_now(),
@@ -711,6 +721,7 @@ class PaperTradingService:
             "rules": ({
                 "version": TEXAS_V2_RULE_VERSION,
                 "mvi_minimum": mvi_minimum,
+                "base_allocation_pct": self._texas_v2_base_allocation(settings, mode),
                 "mvi_boost_threshold": TEXAS_V2_MVI_BOOST_THRESHOLD,
                 "mvi_boost_multiplier": TEXAS_V2_MVI_BOOST_MULTIPLIER,
                 "thesis_checkpoint_seconds": TEXAS_V2_THESIS_CHECKPOINT_SECONDS,
