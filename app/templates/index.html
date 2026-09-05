@@ -255,7 +255,7 @@
               <button class="standard-edge-hud-arm" id="hud-arm-trading" data-arm-session type="button" hidden>Arm session</button>
             </div>
             <div class="standard-edge-hud-inner texas-holdem-hud" id="texas-holdem-hud" hidden>
-              <div class="standard-edge-hud-kicker"><span>Texas Hold’em Strategy</span><button class="hud-help" type="button" aria-label="About Texas Hold’em" data-tooltip="A three-street contrarian opening play. It buys the contract opposite BTC's opening position versus To Beat, then manages phase targets and a River stop.">i</button></div>
+              <div class="standard-edge-hud-kicker"><span id="texas-holdem-title">Texas Hold’em 2.0</span><button class="hud-help" type="button" aria-label="About Texas Hold’em 2.0" data-tooltip="A fresh reliable MVI must meet your configured gate. MVI 8 or above increases normal allocation 1.5× within risk limits. Five minutes after the first fill, a no-breach position more than $50 unfavorable exits with a reduce-only IOC.">i</button></div>
               <div class="standard-edge-hud-heading">
                 <strong id="texas-holdem-phase">THE FLOP</strong>
                 <div class="standard-edge-hud-status-wrap"><span class="standard-edge-hud-state" id="texas-holdem-status">Waiting</span></div>
@@ -270,8 +270,10 @@
                 <span><small>Filled</small><strong id="texas-filled">--</strong></span>
                 <span><small>Current bid</small><strong id="texas-current-bid">--</strong></span>
                 <span><small>Active target</small><strong id="texas-active-target">--</strong></span>
+                <span id="texas-mvi-gate-control"><small>MVI gate</small><strong><input id="texas-mvi-minimum" type="number" min="0" max="10" step="0.1" aria-label="Texas 2.0 minimum MVI"> MVI</strong></span>
               </div>
               <p class="standard-edge-hud-blocker"><button class="hud-help" type="button" aria-label="About the opening play status" data-tooltip="Shows the opening IOC state, phase exit state, or the first blocker preventing the play.">i</button><span id="texas-holdem-blocker">Waiting for the opening play.</span></p>
+              <p class="standard-edge-hud-blocker"><span id="texas-v2-rules">MVI gate --</span></p>
               <button class="standard-edge-hud-arm" id="texas-pass-next-round" type="button">Pass next round</button>
               <button class="standard-edge-hud-arm" id="texas-hud-arm-trading" data-arm-session type="button" hidden>Arm session</button>
             </div>

@@ -1051,6 +1051,21 @@ MIGRATIONS: list[tuple[int, str]] = [
             ON next_threshold_forecasts(target_open_time DESC);
         """,
     ),
+    (
+        25,
+        """
+        -- Texas Hold'em 2.0 is additive. Existing rounds are deliberately
+        -- stamped legacy so historical data is never relabelled.
+        ALTER TABLE texas_holdem_rounds ADD COLUMN strategy TEXT NOT NULL DEFAULT 'TEXAS_HOLDEM';
+        ALTER TABLE texas_holdem_rounds ADD COLUMN first_filled_at TEXT;
+        ALTER TABLE texas_holdem_rounds ADD COLUMN thesis_checkpoint_at TEXT;
+        ALTER TABLE texas_holdem_rounds ADD COLUMN post_fill_breached_at TEXT;
+        ALTER TABLE texas_holdem_rounds ADD COLUMN thesis_status TEXT;
+        ALTER TABLE texas_holdem_rounds ADD COLUMN thesis_evidence_json TEXT NOT NULL DEFAULT '{}';
+        CREATE INDEX idx_texas_holdem_rounds_strategy_status
+            ON texas_holdem_rounds(environment,strategy,status,updated_at);
+        """,
+    ),
 ]
 
 

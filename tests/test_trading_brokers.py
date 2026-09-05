@@ -649,7 +649,7 @@ def test_additive_migration_preserves_existing_paper_history(tmp_path: Path) -> 
         )
     db.initialize()
     assert db.fetch_one("SELECT side FROM paper_trades WHERE ticker='OLD'")["side"] == "NO"
-    assert db.fetch_one("SELECT MAX(version) version FROM schema_migrations")["version"] == 22
+    assert db.fetch_one("SELECT MAX(version) version FROM schema_migrations")["version"] == MIGRATIONS[-1][0]
     assert db.fetch_one("SELECT COUNT(*) count FROM broker_order_intents")["count"] == 0
 
 
@@ -2287,7 +2287,7 @@ def test_broker_cash_migration_preserves_history_and_backfills_nearby_snapshot(
     )
     assert fill and fill["available_cash_after"] == pytest.approx(99.59)
     assert settlement and settlement["available_cash_after"] == pytest.approx(100.59)
-    assert db.fetch_one("SELECT MAX(version) version FROM schema_migrations")["version"] == 21
+    assert db.fetch_one("SELECT MAX(version) version FROM schema_migrations")["version"] == MIGRATIONS[-1][0]
 
 
 @run_async
@@ -2771,7 +2771,10 @@ async def test_breached_exchange_position_uses_reduce_only_exit_once_after_armin
     )
     assert position and position["threshold_exit_status"] == "Blocked"
     assert "did not fill" in position["threshold_exit_block_reason"]
-    displayed = coordinator.summary(current)["modes"][mode]["positions"][0][
+    # The compact Dashboard response includes full position detail only for
+    # its selected execution environment.
+    db.update_settings({"trading_mode": mode})
+    displayed = coordinator.summary(current)["selected"]["positions"][0][
         "threshold_breach_exit"
     ]
     assert displayed["status"] == "Blocked"

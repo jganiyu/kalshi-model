@@ -14,8 +14,14 @@ import httpx
 
 from app.config import AppConfig
 from app.db import Database
-from app.domain import kalshi_fee, parse_time, threshold_breach_exit_state
-from app.domain import texas_holdem_exit_reason
+from app.domain import (
+    TEXAS_HOLDEM_V2,
+    is_texas_holdem_strategy,
+    kalshi_fee,
+    parse_time,
+    threshold_breach_exit_state,
+    texas_holdem_exit_reason,
+)
 from app.services.broker import (
     fill_aggregate,
     KalshiBroker,
@@ -51,10 +57,12 @@ def _json_object(value: Any) -> dict[str, Any]:
 
 def _is_texas_position(position: dict[str, Any]) -> bool:
     """Use persisted strategy evidence; never rely on a UI-only marker."""
-    if str(position.get("strategy") or "").upper() == "TEXAS_HOLDEM":
+    if is_texas_holdem_strategy(position.get("strategy")):
         return True
     metadata = _json_object(position.get("strategy_metadata_json"))
-    return str(metadata.get("strategy") or metadata.get("strategy_name") or "").upper() == "TEXAS_HOLDEM"
+    return is_texas_holdem_strategy(
+        metadata.get("strategy") or metadata.get("strategy_name")
+    )
 
 
 def manual_market_quality(
@@ -678,9 +686,32 @@ class TradingCoordinator:
             """SELECT 1 FROM texas_holdem_rounds WHERE environment=? AND ticker=?
                UNION ALL
                SELECT 1 FROM broker_order_intents
-               WHERE mode=? AND ticker=? AND strategy='TEXAS_HOLDEM' LIMIT 1""",
+               WHERE mode=? AND ticker=?
+                 AND strategy IN ('TEXAS_HOLDEM','TEXAS_HOLDEM_2_0') LIMIT 1""",
             (mode, ticker, mode, ticker),
         ) is not None
+
+    def _ensure_texas_v2_fill_clock(
+        self, mode: str, ticker: str, side: str, fallback: str | None = None
+    ) -> dict[str, Any] | None:
+        """Use durable exchange fill evidence; never move the 2.0 clock later."""
+        row = self.db.fetch_one(
+            "SELECT * FROM texas_holdem_rounds WHERE environment=? AND ticker=?",
+            (mode, ticker),
+        )
+        if not row or str(row.get("strategy") or "") != TEXAS_HOLDEM_V2:
+            return row
+        earliest = self.db.fetch_one(
+            """
+            SELECT MIN(filled_at) AS filled_at FROM broker_fills
+            WHERE mode=? AND ticker=? AND side=? AND action='BUY'
+              AND strategy='TEXAS_HOLDEM_2_0'
+            """,
+            (mode, ticker, side),
+        ) or {}
+        return self.paper._ensure_texas_v2_fill_clock(
+            row, earliest.get("filled_at") or fallback or datetime_now()
+        )
 
     async def reconcile(self, mode: str) -> dict[str, Any]:
         broker = self.broker(mode)
@@ -1003,7 +1034,8 @@ class TradingCoordinator:
             key in self._pending_automatic_keys
             or broker.has_automatic_entry(
                 ticker,
-                exclude_strategy="TEXAS_HOLDEM" if strategy == "TEXAS_HOLDEM" else None,
+                exclude_strategy="TEXAS_HOLDEM"
+                if strategy == "TEXAS_HOLDEM" else None,
             )
         ):
             return broker, None, 0.0, "An automatic entry already exists for this market."
@@ -1048,7 +1080,7 @@ class TradingCoordinator:
         )
         if maximum_entry_price is not None and price > float(maximum_entry_price) + 1e-12:
             return broker, None, effective, "The executable entry exceeds the Texas Hold'em price cap."
-        if strategy == "TEXAS_HOLDEM" and maximum_entry_price is not None:
+        if is_texas_holdem_strategy(strategy) and maximum_entry_price is not None:
             # Threshold exits use a market-style IOC floor.  The symmetric safe
             # entry is a marketable IOC *ceiling*: sweep available offers, but
             # never let tick normalization move the all-in limit above the cap.
@@ -1114,7 +1146,7 @@ class TradingCoordinator:
                 "submitted_limit_price": price,
                 "entry_price_cap": maximum_entry_price,
                 "market_style_ioc": bool(
-                    strategy == "TEXAS_HOLDEM"
+                    is_texas_holdem_strategy(strategy)
                     and time_in_force == "immediate_or_cancel"
                 ),
                 "margin_volatility_index": (strategy_metadata or {}).get(
@@ -1138,7 +1170,7 @@ class TradingCoordinator:
                 "exchange_index": exchange_index,
             },
         )
-        if strategy == "TEXAS_HOLDEM":
+        if is_texas_holdem_strategy(strategy):
             self.db.execute(
                 """
                 UPDATE texas_holdem_rounds SET target_contracts=COALESCE(target_contracts,?),
@@ -1160,7 +1192,7 @@ class TradingCoordinator:
                 "effective_bankroll_allocation": effective,
             }
         assessment = kwargs.get("assessment") or {}
-        texas = kwargs.get("strategy") == "TEXAS_HOLDEM"
+        texas = is_texas_holdem_strategy(kwargs.get("strategy"))
         risk = broker.risk_check(
             intent,
             spread=assessment.get("spread"),
@@ -1219,12 +1251,12 @@ class TradingCoordinator:
             spread=assessment.get("spread"),
             liquidity=assessment.get("ask_size"),
             data_quality=(
-                "High" if strategy == "TEXAS_HOLDEM" and assessment.get("data_reliable")
+                "High" if is_texas_holdem_strategy(strategy) and assessment.get("data_reliable")
                 else str(assessment.get("decision_confidence") or "Low")
             ),
             data_reliable=bool(
                 assessment.get("data_reliable")
-                and (strategy == "TEXAS_HOLDEM" or assessment.get("trade_allowed"))
+                and (is_texas_holdem_strategy(strategy) or assessment.get("trade_allowed"))
             ),
             market_open=True,
         )
@@ -1242,7 +1274,7 @@ class TradingCoordinator:
         submit_started_at = time.time()
         try:
             result = await broker.submit(intent)
-            if intent.strategy == "TEXAS_HOLDEM" and intent.action == "BUY":
+            if is_texas_holdem_strategy(intent.strategy) and intent.action == "BUY":
                 attempt_number = int(
                     (intent.decision_snapshot.get("strategy_metadata") or {}).get(
                         "attempt_number", 0
@@ -1289,6 +1321,7 @@ class TradingCoordinator:
                         "exchange_index": intent.risk_snapshot.get("exchange_index"),
                         "client_order_id": intent.client_order_id,
                         "exchange_order_id": result.get("exchange_order_id"),
+                        "resulting_contracts": intent.contracts,
                         "filled_contracts": float(fill.get("amount") or 0.0),
                         "final_state": str(result.get("status") or "ACKNOWLEDGED"),
                     })
@@ -1336,7 +1369,11 @@ class TradingCoordinator:
                         intent.side,
                     ),
                 )
-            if intent.action == "SELL" and intent.source.startswith("texas_"):
+            if intent.action == "SELL" and (
+                intent.source.startswith("texas_")
+                or (is_texas_holdem_strategy(intent.strategy)
+                    and intent.source == "global_profit_take")
+            ):
                 position = self.db.fetch_one(
                     "SELECT contracts,status FROM broker_positions WHERE mode=? AND ticker=? AND side=?",
                     (intent.mode, intent.ticker, intent.side),
@@ -1372,10 +1409,10 @@ class TradingCoordinator:
                     UPDATE broker_positions SET strategy=?,source=?,stop_loss_price=?,
                         target_exit_price=?,fallback_exit_mode=?,fallback_exit_seconds=?,
                         strategy_metadata_json=?,threshold_breach_enabled=CASE
-                            WHEN ?='TEXAS_HOLDEM' THEN 0 ELSE threshold_breach_enabled END,
-                        threshold_exit_status=CASE WHEN ?='TEXAS_HOLDEM' THEN 'Watching'
+                            WHEN ? IN ('TEXAS_HOLDEM','TEXAS_HOLDEM_2_0') THEN 0 ELSE threshold_breach_enabled END,
+                        threshold_exit_status=CASE WHEN ? IN ('TEXAS_HOLDEM','TEXAS_HOLDEM_2_0') THEN 'Watching'
                             ELSE threshold_exit_status END,
-                        threshold_exit_block_reason=CASE WHEN ?='TEXAS_HOLDEM'
+                        threshold_exit_block_reason=CASE WHEN ? IN ('TEXAS_HOLDEM','TEXAS_HOLDEM_2_0')
                             THEN 'Threshold Breach Exit is inactive for Texas Hold''em positions.'
                             ELSE threshold_exit_block_reason END
                     WHERE mode=? AND ticker=? AND side=? AND status='open'
@@ -1389,7 +1426,7 @@ class TradingCoordinator:
                         intent.mode, intent.ticker, intent.side,
                     ),
                 )
-                if intent.strategy == "TEXAS_HOLDEM":
+                if is_texas_holdem_strategy(intent.strategy):
                     position = self.db.fetch_one(
                         "SELECT contracts,average_price,fees FROM broker_positions WHERE mode=? AND ticker=? AND side=? AND status='open'",
                         (intent.mode, intent.ticker, intent.side),
@@ -1414,12 +1451,16 @@ class TradingCoordinator:
                             round_status, datetime_now(), intent.mode, intent.ticker,
                         ),
                     )
+                    if filled > 0:
+                        self._ensure_texas_v2_fill_clock(
+                            intent.mode, intent.ticker, intent.side, datetime_now()
+                        )
             # Full reconciliation is an audit/backfill, never a prerequisite
             # for retaining an acknowledged Texas fill.
             try:
                 await broker.reconcile()
             except (KalshiTradingError, ValueError) as exc:
-                if intent.strategy == "TEXAS_HOLDEM" and intent.action == "BUY":
+                if is_texas_holdem_strategy(intent.strategy) and intent.action == "BUY":
                     sync_message = f"Filled; account sync pending: {exc}"
                     attempt_number = int(
                         (intent.decision_snapshot.get("strategy_metadata") or {}).get(
@@ -1446,7 +1487,7 @@ class TradingCoordinator:
                         (sync_message, datetime_now(), intent.mode, intent.ticker),
                     )
         except (KalshiTradingError, ValueError) as exc:
-            if intent.strategy == "TEXAS_HOLDEM" and intent.action == "BUY":
+            if is_texas_holdem_strategy(intent.strategy) and intent.action == "BUY":
                 attempt_number = int(
                     (intent.decision_snapshot.get("strategy_metadata") or {}).get(
                         "attempt_number", 0
@@ -1534,12 +1575,18 @@ class TradingCoordinator:
                             intent.side,
                         ),
                     )
-                elif intent.source.startswith("texas_") and exit_resolved:
+                elif (intent.source.startswith("texas_") or (
+                    is_texas_holdem_strategy(intent.strategy)
+                    and intent.source == "global_profit_take"
+                )) and exit_resolved:
                     # The targeted/private position evidence already made this
                     # exit terminal. The original timeout must not regress the
                     # Texas HUD back to a failure.
                     pass
-                elif intent.source.startswith("texas_") and isinstance(exc, AmbiguousSubmissionError):
+                elif (intent.source.startswith("texas_") or (
+                    is_texas_holdem_strategy(intent.strategy)
+                    and intent.source == "global_profit_take"
+                )) and isinstance(exc, AmbiguousSubmissionError):
                     adopted = str(latest_exit.get("status") or "")
                     accepted = adopted in {
                         "ACKNOWLEDGED", "RESTING", "PARTIALLY_FILLED", "FILLED",
@@ -1564,7 +1611,10 @@ class TradingCoordinator:
                         """,
                         (exit_reason, datetime_now(), intent.mode, intent.ticker),
                     )
-                elif intent.source.startswith("texas_"):
+                elif intent.source.startswith("texas_") or (
+                    is_texas_holdem_strategy(intent.strategy)
+                    and intent.source == "global_profit_take"
+                ):
                     # This path is reached only after the fresh, priority
                     # reduce-only submission.  A stale reconciliation 401 no
                     # longer preempts it; mark it auth-blocked only when this
@@ -1768,7 +1818,7 @@ class TradingCoordinator:
             <= float(self.db.settings().get("max_data_age_seconds", 20))
         )
         market_open = str(current.get("status") or "").lower() in {"active", "open"}
-        if not ticker or not broker.session_armed or not quote_fresh or not market_open:
+        if not ticker or not broker.session_armed or not market_open:
             return
         settings = self.db.settings()
         slippage = float(settings.get("slippage_cents", 0.5)) / 100
@@ -1777,6 +1827,8 @@ class TradingCoordinator:
         threshold = current.get("strike")
         quality = current.get("data_quality") or {}
         data_reliable = bool(quality.get("reliable"))
+        btc_state = current.get("btc_state") or {}
+        btc_observed_at = current.get("btc_observed_at") or btc_state.get("observed_at")
         for position in broker.open_positions(ticker):
             side = str(position.get("side"))
             texas_position = self._is_persisted_texas_position(broker.mode, position)
@@ -1819,6 +1871,25 @@ class TradingCoordinator:
                     side,
                 ),
             )
+            thesis_state: dict[str, Any] | None = None
+            if texas_position:
+                round_row = self._ensure_texas_v2_fill_clock(
+                    broker.mode, ticker, side, position.get("opened_at")
+                )
+                if round_row:
+                    # This is deliberately before phase/profit selection and
+                    # before the executable-book guard. A fresh BTC threshold
+                    # touch is evidence even when another exit wins or the
+                    # book recovers a moment later.
+                    thesis_state = self.paper.texas_v2_thesis_state(
+                        round_row,
+                        btc_proxy=btc_proxy,
+                        observed_at=str(current.get("observed_at") or ""),
+                        btc_observed_at=btc_observed_at,
+                        data_reliable=data_reliable,
+                    )
+            if not quote_fresh:
+                continue
             bid = current.get(f"{side.lower()}_bid")
             if bid is None:
                 if threshold_exit["breached"]:
@@ -1841,6 +1912,8 @@ class TradingCoordinator:
                 threshold=float(threshold) if threshold is not None else None,
                 data_reliable=data_reliable,
             )
+            if reason is None and thesis_state and thesis_state.get("status") == "EXIT_TRIGGERED":
+                reason, priority = "TEXAS_THESIS_FAILURE", 0
             if reason is None:
                 continue
             # Kalshi has no unpriced market order. A threshold-breach exit uses
@@ -1927,9 +2000,13 @@ class TradingCoordinator:
                 "submitted_limit_floor": candidate_limit
                 if market_style_exit else None,
             }
-            if reason.startswith("TEXAS_"):
+            if reason.startswith("TEXAS_") or (
+                texas_position and reason == "GLOBAL_PROFIT_TAKE"
+            ):
                 _, texas_state = texas_holdem_exit_reason(bid, seconds_remaining, settings)
                 decision_snapshot["texas_holdem"] = texas_state
+                if thesis_state:
+                    decision_snapshot["texas_thesis"] = thesis_state
             if reason == "THRESHOLD_BREACH_EXIT":
                 decision_snapshot.update(
                     {
@@ -1941,7 +2018,9 @@ class TradingCoordinator:
                         "threshold_triggered_at": datetime_now(),
                     }
                 )
-            elif reason.startswith("TEXAS_"):
+            elif reason.startswith("TEXAS_") or (
+                texas_position and reason == "GLOBAL_PROFIT_TAKE"
+            ):
                 self.db.execute(
                     """
                     UPDATE broker_positions SET texas_exit_status='Exit pending',

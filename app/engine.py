@@ -19,6 +19,12 @@ from app.domain import (
     DEFAULT_BENCHMARK_UNCERTAINTY_PCT,
     NextThresholdForecast,
     SETTLEMENT_WINDOW_SECONDS,
+    TEXAS_HOLDEM_V2,
+    TEXAS_V2_MVI_BOOST_MULTIPLIER,
+    TEXAS_V2_MVI_BOOST_THRESHOLD,
+    TEXAS_V2_RULE_VERSION,
+    TEXAS_V2_THESIS_CHECKPOINT_SECONDS,
+    TEXAS_V2_THESIS_UNFAVORABLE_DISTANCE,
     calibration_metrics,
     clamp,
     iso_now,
@@ -542,6 +548,8 @@ class AnalysisEngine:
         }
         return {
             "enabled": bool(settings.get("texas_holdem_enabled", False)),
+            "strategy": TEXAS_HOLDEM_V2,
+            "display_name": "Texas Hold’em 2.0",
             "status": "WAITING_FOR_MARKET_DATA",
             "phase": {"key": "FLOP", "label": "The Flop"},
             "side": None,
@@ -557,6 +565,17 @@ class AnalysisEngine:
             "market_open_time": None,
             "pass": {"passed": False, "scheduled": False, "next_open_time": None},
             "threshold_breach_exempt": True,
+            "rules": {
+                "version": TEXAS_V2_RULE_VERSION,
+                "mvi_minimum": self.paper._texas_v2_mvi_minimum(
+                    settings, str(settings.get("trading_mode") or "PAPER")
+                ),
+                "mvi_boost_threshold": TEXAS_V2_MVI_BOOST_THRESHOLD,
+                "mvi_boost_multiplier": TEXAS_V2_MVI_BOOST_MULTIPLIER,
+                "thesis_checkpoint_seconds": TEXAS_V2_THESIS_CHECKPOINT_SECONDS,
+                "thesis_unfavorable_distance": TEXAS_V2_THESIS_UNFAVORABLE_DISTANCE,
+            },
+            "thesis": {"enabled": True, "status": "WAITING"},
         }
 
     def _schedule_publish(self) -> None:
@@ -1731,13 +1750,25 @@ class AnalysisEngine:
                 settings.get(f"{trading_mode.lower()}_automatic_trading_enabled", False)
             ) and bool(readiness.get("automatic_armed"))
             texas_enabled = bool(settings.get("texas_holdem_enabled", False))
+            try:
+                texas_mvi = float((margin_volatility or {}).get("mvi"))
+            except (TypeError, ValueError):
+                texas_mvi = float("nan")
+            texas_boost = (
+                TEXAS_V2_MVI_BOOST_MULTIPLIER
+                if texas_enabled
+                and bool((margin_volatility or {}).get("reliable"))
+                and math.isfinite(texas_mvi)
+                and texas_mvi >= TEXAS_V2_MVI_BOOST_THRESHOLD
+                else 1.0
+            )
             execution_risk_by_side = {
                 side: self.trading.preview_automatic_risk(
-                    strategy="TEXAS_HOLDEM" if texas_enabled else "STANDARD_EDGE",
+                    strategy=TEXAS_HOLDEM_V2 if texas_enabled else "STANDARD_EDGE",
                     ticker=str(market["ticker"]),
                     assessment=assessments[side],
                     bankroll_fraction=(
-                        float(settings.get("max_risk_per_trade_pct", 0.05))
+                        float(settings.get("max_risk_per_trade_pct", 0.05)) * texas_boost
                         if texas_enabled else float(decisions[side].suggested_fraction or 0.0)
                     ),
                     model_version=model_version,
@@ -1794,7 +1825,7 @@ class AnalysisEngine:
                     trading_mode,
                     str(market["ticker"]),
                     strategy=(
-                        "TEXAS_HOLDEM"
+                        TEXAS_HOLDEM_V2
                         if settings.get("texas_holdem_enabled", False)
                         else None
                     ),

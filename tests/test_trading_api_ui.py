@@ -148,7 +148,9 @@ def test_trading_ui_contains_mode_safety_and_confirmation_controls() -> None:
     assert "Click Confirm within 6 seconds" in script
     assert "VERIFY DEMO TRADING" in script
     assert "data.ledger || []" in script
-    assert "paper.ledger || []" in script
+    # Dashboard recent fills use the bounded, indexed recent-trades payload;
+    # the complete ledger remains on the Trading page.
+    assert "paper.recent_trades || []" in script
     assert "Unsettled positions" in template
     assert "they are not resting orders" in template
     assert "trade.display_status || trade.status" in script

@@ -9,6 +9,14 @@ from typing import Any, Callable
 
 from app.db import Database
 from app.domain import (
+    TEXAS_HOLDEM_LEGACY,
+    TEXAS_HOLDEM_V2,
+    TEXAS_V2_MVI_BOOST_MULTIPLIER,
+    TEXAS_V2_MVI_BOOST_THRESHOLD,
+    TEXAS_V2_RULE_VERSION,
+    TEXAS_V2_THESIS_CHECKPOINT_SECONDS,
+    TEXAS_V2_THESIS_UNFAVORABLE_DISTANCE,
+    is_texas_holdem_strategy,
     iso_now,
     kalshi_fee,
     parse_time,
@@ -16,6 +24,8 @@ from app.domain import (
     threshold_breach_exit_state,
     texas_holdem_exit_reason,
     texas_holdem_phase,
+    texas_threshold_breached,
+    texas_unfavorable_distance,
 )
 from app.services.decision import Decision
 from app.services.directional_momentum import directional_gate
@@ -94,6 +104,18 @@ class PaperTradingService:
             (str(environment).upper(), ticker),
         )
 
+    @staticmethod
+    def _texas_v2_mvi_minimum(settings: dict[str, Any], mode: str) -> float:
+        """Read the isolated gate, with a one-release fallback for old DBs."""
+        value = settings.get(
+            f"{str(mode).lower()}_texas_holdem_v2_mvi_minimum",
+            settings.get("texas_holdem_v2_mvi_minimum", 4.0),
+        )
+        try:
+            return max(0.0, min(10.0, float(value)))
+        except (TypeError, ValueError):
+            return 4.0
+
     def texas_holdem_pass_next_round(
         self, *, environment: str, source_ticker: str, market_open_time: str | None
     ) -> dict[str, Any]:
@@ -157,7 +179,8 @@ class PaperTradingService:
             row = self.db.fetch_one(
                 """
                 SELECT COALESCE(SUM(remaining_contracts),0) amount
-                FROM paper_entries WHERE ticker=? AND side=? AND strategy='TEXAS_HOLDEM'
+                FROM paper_entries WHERE ticker=? AND side=?
+                  AND strategy IN ('TEXAS_HOLDEM','TEXAS_HOLDEM_2_0')
                   AND status='open'
                 """,
                 (ticker, side),
@@ -167,11 +190,165 @@ class PaperTradingService:
                 """
                 SELECT COALESCE(SUM(contracts),0) amount
                 FROM broker_positions WHERE mode=? AND ticker=? AND side=?
-                  AND strategy='TEXAS_HOLDEM' AND status='open'
+                  AND strategy IN ('TEXAS_HOLDEM','TEXAS_HOLDEM_2_0') AND status='open'
                 """,
                 (mode, ticker, side),
             ) or {}
         return float(row.get("amount") or 0.0)
+
+    def _ensure_texas_v2_fill_clock(
+        self, row: dict[str, Any], first_filled_at: str | None
+    ) -> dict[str, Any]:
+        """Latch the earliest confirmed fill; later partial fills never reset it."""
+        if str(row.get("strategy") or TEXAS_HOLDEM_LEGACY) != TEXAS_HOLDEM_V2:
+            return row
+        candidates = [
+            parsed for parsed in (
+                parse_time(row.get("first_filled_at")), parse_time(first_filled_at)
+            ) if parsed is not None
+        ]
+        if not candidates:
+            return row
+        first_time = min(candidates)
+        first = first_time.isoformat()
+        checkpoint = (first_time + timedelta(
+            seconds=TEXAS_V2_THESIS_CHECKPOINT_SECONDS
+        )).isoformat()
+        self.db.execute(
+            """
+            UPDATE texas_holdem_rounds
+            SET first_filled_at=?,thesis_checkpoint_at=?,updated_at=?
+            WHERE id=?
+            """,
+            (first, checkpoint, iso_now(), row["id"]),
+        )
+        return self._texas_round(str(row["environment"]), str(row["ticker"])) or row
+
+    def _rehydrate_texas_v2_breach(self, row: dict[str, Any]) -> dict[str, Any]:
+        """Recover a post-fill crossing from durable review points after restart."""
+        if (
+            str(row.get("strategy") or TEXAS_HOLDEM_LEGACY) != TEXAS_HOLDEM_V2
+            or row.get("post_fill_breached_at")
+            or not row.get("first_filled_at")
+        ):
+            return row
+        side = str(row.get("side") or "")
+        threshold = row.get("threshold")
+        first = str(row["first_filled_at"])
+        first_time = parse_time(first)
+        if first_time is None:
+            return row
+        points = self.db.fetch_all(
+            """
+            SELECT p.observed_at,p.btc_proxy,p.threshold
+            FROM trade_review_points p
+            JOIN trade_review_sessions s ON s.id=p.session_id
+            WHERE s.environment=? AND s.ticker=? AND p.data_reliable=1
+            ORDER BY p.observed_at ASC,p.id ASC
+            """,
+            (row["environment"], row["ticker"]),
+        )
+        crossed = next(
+            (
+                point for point in points
+                if parse_time(point.get("observed_at")) is not None
+                and parse_time(point.get("observed_at")) >= first_time
+                and texas_threshold_breached(
+                    side, point.get("btc_proxy"), threshold or point.get("threshold")
+                )
+            ),
+            None,
+        )
+        if crossed:
+            self.db.execute(
+                "UPDATE texas_holdem_rounds SET post_fill_breached_at=?,updated_at=? WHERE id=?",
+                (crossed["observed_at"], iso_now(), row["id"]),
+            )
+            return self._texas_round(str(row["environment"]), str(row["ticker"])) or row
+        return row
+
+    def texas_v2_thesis_state(
+        self,
+        row: dict[str, Any],
+        *,
+        btc_proxy: Any,
+        observed_at: str | None,
+        btc_observed_at: str | None = None,
+        data_reliable: bool,
+    ) -> dict[str, Any]:
+        """Evaluate the one-shot five-minute no-breach thesis checkpoint."""
+        if str(row.get("strategy") or TEXAS_HOLDEM_LEGACY) != TEXAS_HOLDEM_V2:
+            return {"enabled": False}
+        row = self._rehydrate_texas_v2_breach(row)
+        observed = parse_time(observed_at)
+        # A fresh executable quote is not evidence that the BTC proxy itself
+        # is fresh. Callers must provide the independently observed proxy tick.
+        btc_observed = parse_time(btc_observed_at)
+        first = parse_time(row.get("first_filled_at"))
+        checkpoint = parse_time(row.get("thesis_checkpoint_at"))
+        side = str(row.get("side") or "")
+        threshold = row.get("threshold")
+        try:
+            proxy_value = float(btc_proxy)
+            threshold_value = float(threshold)
+        except (TypeError, ValueError):
+            proxy_value = threshold_value = float("nan")
+        max_age = float(self.db.settings().get("max_data_age_seconds", 20))
+        btc_fresh = bool(
+            observed and btc_observed
+            and 0 <= (observed - btc_observed).total_seconds() <= max_age
+            and math.isfinite(proxy_value) and math.isfinite(threshold_value)
+        )
+        current_reliable = bool(data_reliable and btc_fresh)
+        if (
+            current_reliable and observed and first and observed >= first
+            and texas_threshold_breached(side, proxy_value, threshold_value)
+            and not row.get("post_fill_breached_at")
+        ):
+            self.db.execute(
+                "UPDATE texas_holdem_rounds SET post_fill_breached_at=?,updated_at=? WHERE id=?",
+                (observed_at, iso_now(), row["id"]),
+            )
+            row = self._texas_round(str(row["environment"]), str(row["ticker"])) or row
+        status = str(row.get("thesis_status") or "WAITING")
+        evidence = _strategy_metadata(row.get("thesis_evidence_json"))
+        distance = texas_unfavorable_distance(
+            side, proxy_value, threshold_value
+        ) if current_reliable else None
+        if status == "WAITING" and checkpoint and observed and observed >= checkpoint and current_reliable:
+            evidence = {
+                "rule_version": TEXAS_V2_RULE_VERSION,
+                "first_filled_at": row.get("first_filled_at"),
+                "checkpoint_at": row.get("thesis_checkpoint_at"),
+                "observed_at": observed_at,
+                "side": side,
+                "threshold": threshold,
+                "btc_proxy": proxy_value,
+                "btc_observed_at": btc_observed_at,
+                "post_fill_breached_at": row.get("post_fill_breached_at"),
+                "unfavorable_distance": distance,
+                "strict_distance_rule": TEXAS_V2_THESIS_UNFAVORABLE_DISTANCE,
+            }
+            if row.get("post_fill_breached_at"):
+                status = "BREACHED"
+            elif distance is not None and distance > TEXAS_V2_THESIS_UNFAVORABLE_DISTANCE:
+                status = "EXIT_TRIGGERED"
+            else:
+                status = "NO_EXIT"
+            self.db.execute(
+                "UPDATE texas_holdem_rounds SET thesis_status=?,thesis_evidence_json=?,updated_at=? WHERE id=?",
+                (status, json.dumps(evidence, sort_keys=True), iso_now(), row["id"]),
+            )
+        return {
+            "enabled": True,
+            "status": status,
+            "first_filled_at": row.get("first_filled_at"),
+            "checkpoint_at": row.get("thesis_checkpoint_at"),
+            "post_fill_breached_at": row.get("post_fill_breached_at"),
+            "unfavorable_distance": distance,
+            "btc_fresh": btc_fresh,
+            "evidence": evidence,
+        }
 
     def _texas_holdem_state(
         self,
@@ -194,6 +371,7 @@ class PaperTradingService:
     ) -> dict[str, Any]:
         settings = self.db.settings()
         mode = str(execution_mode or "PAPER").upper()
+        mvi_minimum = self._texas_v2_mvi_minimum(settings, mode)
         phase = texas_holdem_phase(seconds_remaining)
         maximum_price = float(settings.get("texas_holdem_max_entry_price", 0.50))
         entry_window = int(settings.get("texas_holdem_entry_window_seconds", 20))
@@ -226,13 +404,13 @@ class PaperTradingService:
             self.db.execute(
                 """
                 INSERT INTO texas_holdem_rounds(
-                    environment,ticker,market_open_time,threshold,opening_btc_proxy,
+                    environment,ticker,strategy,market_open_time,threshold,opening_btc_proxy,
                     side,status,entry_price_cap,flop_target,turn_target,river_target,
                     river_stop,created_at,updated_at
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
-                    mode, ticker, market_open_time, threshold,
+                    mode, ticker, TEXAS_HOLDEM_V2, market_open_time, threshold,
                     opening_proxy, proposed_side, "PASSED" if passed else "WAITING", maximum_price,
                     targets["flop"], targets["turn"], targets["river"],
                     targets["river_stop"], now_iso, now_iso,
@@ -244,6 +422,8 @@ class PaperTradingService:
                 "UPDATE texas_holdem_passes SET consumed_at=? WHERE id=?",
                 (market_observed_at or iso_now(), passed["id"]),
             )
+        strategy = str(row.get("strategy") or TEXAS_HOLDEM_LEGACY)
+        texas_v2 = strategy == TEXAS_HOLDEM_V2
         stored_side = str(row.get("side") or "") or None
         side = stored_side or proposed_side
         filled = self._texas_filled_contracts(mode, ticker, side) if side else 0.0
@@ -258,6 +438,9 @@ class PaperTradingService:
                 "UPDATE texas_holdem_rounds SET filled_contracts=?,status=?,updated_at=? WHERE id=?",
                 (filled, status, market_observed_at or iso_now(), row["id"]),
             )
+            row = self._ensure_texas_v2_fill_clock(
+                row, market_observed_at or iso_now()
+            )
         if passed and filled <= 0:
             status = "PASSED"
             blocker = "This Texas Hold’em round was passed. The next round remains eligible."
@@ -265,6 +448,10 @@ class PaperTradingService:
                 "UPDATE texas_holdem_rounds SET status=?,fold_reason=?,updated_at=? WHERE id=?",
                 (status, blocker, market_observed_at or iso_now(), row["id"]),
             )
+        elif texas_v2 and status == "PARTIALLY_FILLED":
+            # An accepted partial IOC is confirmed exposure. It is never a
+            # license for a later automatic buy during recovery.
+            blocker = "A partially filled Texas Hold’em 2.0 entry already holds confirmed exposure."
         elif status not in {"ENTERED", "FOLDED", "EXITED", "PASSED"} and not (
             status == "PARTIALLY_FILLED" and blocker
         ):
@@ -292,6 +479,26 @@ class PaperTradingService:
                 buy = dict(assessment.get("buy") or {})
                 executable = buy.get("executable_price")
                 reliable = bool(assessment.get("data_reliable"))
+                mvi_state = dict(assessment.get("margin_volatility") or {})
+                mvi_value = mvi_state.get("mvi")
+                try:
+                    mvi_value = float(mvi_value) if mvi_value is not None else None
+                except (TypeError, ValueError):
+                    mvi_value = None
+                mvi_observed_at = mvi_state.get("observed_at")
+                mvi_observed = parse_time(mvi_observed_at)
+                decision_observed = parse_time(market_observed_at)
+                mvi_fresh = bool(
+                    mvi_observed and decision_observed
+                    and 0 <= (decision_observed - mvi_observed).total_seconds()
+                    <= float(settings.get("max_data_age_seconds", 20))
+                )
+                mvi_reliable = (
+                    bool(mvi_state.get("reliable"))
+                    and mvi_value is not None
+                    and math.isfinite(mvi_value)
+                    and mvi_fresh
+                )
                 quote_marker = json.dumps(
                     {
                         "raw_ask": buy.get("raw_price"),
@@ -304,6 +511,16 @@ class PaperTradingService:
                 risk = (execution_risk_by_side or {}).get(side) or {}
                 if not reliable:
                     blocker = str(assessment.get("quality_reason") or "Market data is unreliable.")
+                elif texas_v2 and not mvi_reliable:
+                    blocker = "Texas Hold’em 2.0 requires a fresh reliable MVI reading."
+                elif (
+                    texas_v2
+                    and mvi_value < mvi_minimum
+                ):
+                    blocker = (
+                        f"Texas Hold’em 2.0 requires MVI ≥ {mvi_minimum:.1f} "
+                        f"(current {mvi_value:.2f})."
+                    )
                 elif executable is None:
                     blocker = "No executable opening ask is available."
                 elif float(executable) > maximum_price + 1e-12:
@@ -317,80 +534,138 @@ class PaperTradingService:
                     blocker = str(risk.get("primary_blocker") or "Risk controls block the opening play.")
                 else:
                     attempt_number = attempts + 1
-                    remaining = max(0, math.ceil(target_contracts - filled)) if target_contracts > 0 else None
-                    metadata = {
-                        "market_open_time": market_open_time,
-                        "trigger_timestamp": market_observed_at or iso_now(),
-                        "configured_window_seconds": entry_window,
-                        "opening_btc_proxy_margin": margin,
-                        "entry_price_cap": maximum_price,
-                        "flop_target": targets["flop"],
-                        "flop_stop": targets["flop_stop"],
-                        "turn_target": targets["turn"],
-                        "turn_stop": targets["turn_stop"],
-                        "river_target": targets["river"],
-                        "river_stop": targets["river_stop"],
-                        "threshold_breach_exempt": True,
-                        "attempt_number": attempt_number,
-                        "quote_marker": quote_marker,
-                        "quote_timestamp": market_observed_at,
-                        "quote_age_seconds": 0.0,
-                        "requested_contracts": remaining,
-                        "time_in_force": "immediate_or_cancel",
-                        "exchange_index": assessment.get("exchange_index"),
-                    }
-                    opener = fixed_entry_handler or self.open_fixed_strategy
-                    entered, effective = opener(
-                        ticker=ticker,
-                        strategy="TEXAS_HOLDEM",
-                        assessment=assessment,
-                        bankroll_fraction=float(settings.get("max_risk_per_trade_pct", 0.05)),
-                        model_version=model_version,
-                        reason="Opening play bought the contract opposite the BTC proxy's position versus To Beat.",
-                        stop_loss_cents=None,
-                        strategy_metadata=metadata,
-                        requested_contracts=remaining,
-                        time_in_force="immediate_or_cancel",
-                        maximum_entry_price=maximum_price,
+                    # Contracts are integer quantities.  A fractional value
+                    # here is reconciliation evidence, not permission to buy
+                    # another full contract after a partial fill.
+                    remaining = (
+                        max(0, math.floor(target_contracts - filled + 1e-9))
+                        if target_contracts > 0 else None
                     )
-                    status = "ATTEMPTING" if entered else "WAITING"
-                    if entered and mode == "PAPER":
-                        refreshed = self._texas_round(mode, ticker) or {}
-                        target_contracts = float(
-                            refreshed.get("target_contracts") or target_contracts or 0.0
+                    if target_contracts > 0 and remaining < 1:
+                        status = "PARTIALLY_FILLED" if filled > 0 else status
+                        blocker = "The confirmed remaining quantity is below one contract."
+                        self.db.execute(
+                            "UPDATE texas_holdem_rounds SET status=?,fold_reason=?,updated_at=? WHERE id=?",
+                            (status, blocker, market_observed_at or iso_now(), row["id"]),
                         )
-                        filled = self._texas_filled_contracts(mode, ticker, side)
-                        status = (
-                            "ENTERED"
-                            if filled > 0 and (
-                                target_contracts <= 0
-                                or filled + 1e-9 >= target_contracts
+                        # No IOC was created, so this must not consume an attempt.
+                    else:
+                        boost_multiplier = (
+                            TEXAS_V2_MVI_BOOST_MULTIPLIER
+                            if texas_v2 and mvi_value is not None
+                            and mvi_value >= TEXAS_V2_MVI_BOOST_THRESHOLD
+                            else 1.0
+                        )
+                        base_allocation = float(settings.get("max_risk_per_trade_pct", 0.05))
+                        metadata = {
+                            "market_open_time": market_open_time,
+                            "trigger_timestamp": market_observed_at or iso_now(),
+                            "configured_window_seconds": entry_window,
+                            "opening_btc_proxy_margin": margin,
+                            "entry_price_cap": maximum_price,
+                            "flop_target": targets["flop"],
+                            "flop_stop": targets["flop_stop"],
+                            "turn_target": targets["turn"],
+                            "turn_stop": targets["turn_stop"],
+                            "river_target": targets["river"],
+                            "river_stop": targets["river_stop"],
+                            "strategy": strategy,
+                            "threshold_breach_exempt": True,
+                            "attempt_number": attempt_number,
+                            "quote_marker": quote_marker,
+                            "quote_timestamp": market_observed_at,
+                            "quote_age_seconds": 0.0,
+                            "requested_contracts": remaining,
+                            "time_in_force": "immediate_or_cancel",
+                            "exchange_index": assessment.get("exchange_index"),
+                        }
+                        if texas_v2:
+                            metadata.update({
+                                "strategy_version": TEXAS_V2_RULE_VERSION,
+                                "mvi_minimum": mvi_minimum,
+                                "mvi_boost_threshold": TEXAS_V2_MVI_BOOST_THRESHOLD,
+                                "mvi_boost_multiplier": boost_multiplier,
+                                "margin_volatility_index": mvi_value,
+                                "margin_volatility_reliable": mvi_reliable,
+                                "margin_volatility_observed_at": mvi_observed_at,
+                                "thesis_checkpoint_seconds": TEXAS_V2_THESIS_CHECKPOINT_SECONDS,
+                                "thesis_unfavorable_distance": TEXAS_V2_THESIS_UNFAVORABLE_DISTANCE,
+                                "pre_boost_bankroll_fraction": base_allocation,
+                                "post_boost_bankroll_fraction": base_allocation * boost_multiplier,
+                            })
+                        opener = fixed_entry_handler or self.open_fixed_strategy
+                        entered, effective = opener(
+                            ticker=ticker,
+                            strategy=strategy,
+                            assessment=assessment,
+                            bankroll_fraction=base_allocation * boost_multiplier,
+                            model_version=model_version,
+                            reason="Opening play bought the contract opposite the BTC proxy's position versus To Beat.",
+                            stop_loss_cents=None,
+                            strategy_metadata=metadata,
+                            requested_contracts=remaining,
+                            time_in_force="immediate_or_cancel",
+                            maximum_entry_price=maximum_price,
+                        )
+                        metadata["effective_bankroll_fraction"] = effective
+                        metadata["allocation_boosted"] = boost_multiplier > 1.0
+                        status = "ATTEMPTING" if entered else "WAITING"
+                        if entered and mode == "PAPER":
+                            refreshed = self._texas_round(mode, ticker) or {}
+                            target_contracts = float(
+                                refreshed.get("target_contracts") or target_contracts or 0.0
                             )
-                            else "PARTIALLY_FILLED" if filled > 0 else "WAITING"
+                            filled = self._texas_filled_contracts(mode, ticker, side)
+                            if filled > 0:
+                                row = self._ensure_texas_v2_fill_clock(
+                                    row, market_observed_at or iso_now()
+                                )
+                            status = (
+                                "ENTERED"
+                                if filled > 0 and (
+                                    target_contracts <= 0
+                                    or filled + 1e-9 >= target_contracts
+                                )
+                                else "PARTIALLY_FILLED" if filled > 0 else "WAITING"
+                            )
+                            entry_evidence = self.db.fetch_one(
+                                """SELECT initial_contracts,entry_price,entry_fees
+                                   FROM paper_entries WHERE ticker=? AND strategy=?
+                                   ORDER BY id DESC LIMIT 1""",
+                                (ticker, strategy),
+                            ) or {}
+                            metadata["resulting_contracts"] = entry_evidence.get(
+                                "initial_contracts"
+                            )
+                            metadata["resulting_entry_price"] = entry_evidence.get(
+                                "entry_price"
+                            )
+                            metadata["resulting_entry_fees"] = entry_evidence.get(
+                                "entry_fees"
+                            )
+                        blocker = None if entered else str(risk.get("primary_blocker") or "The opening attempt could not be submitted.")
+                        self.db.execute(
+                            """
+                            UPDATE texas_holdem_rounds SET side=?,status=?,attempt_count=?,
+                                last_quote_marker=?,fold_reason=?,updated_at=? WHERE id=?
+                            """,
+                            (side, status, attempt_number, quote_marker, blocker,
+                             market_observed_at or iso_now(), row["id"]),
                         )
-                    blocker = None if entered else str(risk.get("primary_blocker") or "The opening attempt could not be submitted.")
-                    self.db.execute(
-                        """
-                        UPDATE texas_holdem_rounds SET side=?,status=?,attempt_count=?,
-                            last_quote_marker=?,fold_reason=?,updated_at=? WHERE id=?
-                        """,
-                        (side, status, attempt_number, quote_marker, blocker,
-                         market_observed_at or iso_now(), row["id"]),
-                    )
-                    self.db.execute(
-                        """
-                        INSERT OR REPLACE INTO texas_holdem_attempts(
-                            round_id,attempt_number,observed_at,quote_marker,side,
-                            executable_price,requested_contracts,status,blocker,evidence_json
-                        ) VALUES (?,?,?,?,?,?,?,?,?,?)
-                        """,
-                        (
-                            row["id"], attempt_number, market_observed_at or iso_now(),
-                            quote_marker, side, executable, remaining, status, blocker,
-                            json.dumps(metadata, sort_keys=True),
-                        ),
-                    )
-                    attempts = attempt_number
+                        self.db.execute(
+                            """
+                            INSERT OR REPLACE INTO texas_holdem_attempts(
+                                round_id,attempt_number,observed_at,quote_marker,side,
+                                executable_price,requested_contracts,status,blocker,evidence_json
+                            ) VALUES (?,?,?,?,?,?,?,?,?,?)
+                            """,
+                            (
+                                row["id"], attempt_number, market_observed_at or iso_now(),
+                                quote_marker, side, executable, remaining, status, blocker,
+                                json.dumps(metadata, sort_keys=True),
+                            ),
+                        )
+                        attempts = attempt_number
         if status in {"FOLDED", "PARTIALLY_FILLED"} and blocker:
             self.db.execute(
                 "UPDATE texas_holdem_rounds SET status=?,fold_reason=?,updated_at=? WHERE id=?",
@@ -400,8 +675,17 @@ class PaperTradingService:
         bid = ((side_assessment or {}).get("sell") or {}).get("raw_price")
         active_target = targets[str(phase["key"]).lower()]
         scheduled_pass = self._scheduled_texas_holdem_pass(mode, ticker)
+        latest_attempt = self.db.fetch_one(
+            """SELECT evidence_json FROM texas_holdem_attempts
+               WHERE round_id=? ORDER BY attempt_number DESC LIMIT 1""",
+            (row["id"],),
+        ) or {}
+        latest_evidence = _strategy_metadata(latest_attempt.get("evidence_json"))
         return {
-            "strategy": "TEXAS_HOLDEM",
+            "strategy": str(row.get("strategy") or TEXAS_HOLDEM_LEGACY),
+            "display_name": "Texas Hold’em 2.0"
+            if str(row.get("strategy") or TEXAS_HOLDEM_LEGACY) == TEXAS_HOLDEM_V2
+            else "Texas Hold’em",
             "enabled": True,
             "phase": phase,
             "side": side,
@@ -422,6 +706,24 @@ class PaperTradingService:
                 "next_open_time": (scheduled_pass or {}).get("target_open_time"),
             },
             "threshold_breach_exempt": True,
+            "allocation_boosted": bool(latest_evidence.get("allocation_boosted"))
+            if texas_v2 else False,
+            "rules": ({
+                "version": TEXAS_V2_RULE_VERSION,
+                "mvi_minimum": mvi_minimum,
+                "mvi_boost_threshold": TEXAS_V2_MVI_BOOST_THRESHOLD,
+                "mvi_boost_multiplier": TEXAS_V2_MVI_BOOST_MULTIPLIER,
+                "thesis_checkpoint_seconds": TEXAS_V2_THESIS_CHECKPOINT_SECONDS,
+                "thesis_unfavorable_distance": TEXAS_V2_THESIS_UNFAVORABLE_DISTANCE,
+            } if texas_v2 else {}),
+            "thesis": self.texas_v2_thesis_state(
+                row,
+                btc_proxy=(float(row.get("threshold")) + margin)
+                if row.get("threshold") is not None and margin is not None else None,
+                observed_at=market_observed_at,
+                btc_observed_at=None,
+                data_reliable=bool((assessments.get(side or "") or {}).get("data_reliable")),
+            ),
         }
 
     def portfolio(self) -> dict[str, Any]:
@@ -669,13 +971,13 @@ class PaperTradingService:
             SELECT e.*,t.outcome,t.status AS trade_status
             FROM paper_entries e
             JOIN paper_trades t ON t.id=e.trade_id
-            WHERE e.strategy IN ('STANDARD_EDGE','EARLY_THRESHOLD','LATE_CONVICTION','SWING','TEXAS_HOLDEM')
+            WHERE e.strategy IN ('STANDARD_EDGE','EARLY_THRESHOLD','LATE_CONVICTION','SWING','TEXAS_HOLDEM','TEXAS_HOLDEM_2_0')
             ORDER BY e.id ASC
             """
         )
         results: dict[str, dict[str, Any]] = {}
         for strategy in (
-            "STANDARD_EDGE", "EARLY_THRESHOLD", "LATE_CONVICTION", "SWING", "TEXAS_HOLDEM"
+            "STANDARD_EDGE", "EARLY_THRESHOLD", "LATE_CONVICTION", "SWING", "TEXAS_HOLDEM", "TEXAS_HOLDEM_2_0"
         ):
             entries = [row for row in rows if row.get("strategy") == strategy]
             settled = [row for row in entries if row.get("status") == "settled"]
@@ -1147,6 +1449,8 @@ class PaperTradingService:
                     "texas_turn_target": "TEXAS_TURN_TARGET",
                     "texas_river_target": "TEXAS_RIVER_TARGET",
                     "texas_river_stop": "TEXAS_RIVER_STOP",
+                    "texas_thesis_failure": "TEXAS_THESIS_FAILURE",
+                    "global_profit_take": "GLOBAL_PROFIT_TAKE",
                 }.get(str(order.get("source") or ""), "MANUAL")
                 allocated_cost, allocated_entry_fees, affected_entry_ids = self._consume_entries(
                     connection,
@@ -1341,7 +1645,7 @@ class PaperTradingService:
         liquidity: dict[str, int | None] = {}
         closed = 0
         for entry in entries:
-            if entry.get("strategy") == "TEXAS_HOLDEM":
+            if is_texas_holdem_strategy(entry.get("strategy")):
                 continue
             side = str(entry["side"])
             bid = self.executable_price(market, side, "SELL")
@@ -1427,7 +1731,7 @@ class PaperTradingService:
                 "SELECT 1 FROM texas_holdem_rounds WHERE environment='PAPER' AND ticker=?",
                 (ticker,),
             ) is not None
-            entry_enabled = enabled and entry.get("strategy") != "TEXAS_HOLDEM" and not legacy_texas
+            entry_enabled = enabled and not is_texas_holdem_strategy(entry.get("strategy")) and not legacy_texas
             state = threshold_breach_exit_state(
                 side,
                 float(btc_proxy) if btc_proxy is not None else None,
@@ -1567,7 +1871,7 @@ class PaperTradingService:
         entries = self.db.fetch_all(
             """
             SELECT * FROM paper_entries
-            WHERE ticker=? AND strategy='TEXAS_HOLDEM' AND status='open'
+            WHERE ticker=? AND strategy IN ('TEXAS_HOLDEM','TEXAS_HOLDEM_2_0') AND status='open'
               AND remaining_contracts>0 ORDER BY id ASC
             """,
             (ticker,),
@@ -1581,7 +1885,34 @@ class PaperTradingService:
         for entry in entries:
             side = str(entry["side"])
             bid = self.executable_price(market, side, "SELL")
-            reason, phase = texas_holdem_exit_reason(bid, seconds_remaining, settings)
+            round_row = self._texas_round("PAPER", ticker) or {}
+            # Evaluate first even when a higher-priority phase/profit exit is
+            # already due: a real post-fill breach is durable evidence, not a
+            # condition that should disappear because another exit won.
+            quality = market.get("data_quality") or {}
+            btc_state = market.get("btc_state") or {}
+            thesis = self.texas_v2_thesis_state(
+                self._ensure_texas_v2_fill_clock(round_row, entry.get("opened_at")),
+                btc_proxy=market.get("btc_proxy"),
+                observed_at=market.get("observed_at"),
+                btc_observed_at=market.get("btc_observed_at") or btc_state.get("observed_at"),
+                data_reliable=bool(quality.get("reliable")),
+            )
+            # Global profit and phase exits retain priority over the 2.0
+            # thesis-failure checkpoint at the same fresh observation.
+            reason = None
+            phase: dict[str, Any] = {}
+            if (
+                settings.get("global_profit_take_enabled", True)
+                and bid is not None
+                and bid + 1e-12 >= float(settings.get("global_profit_take_price", .99))
+            ):
+                reason = "GLOBAL_PROFIT_TAKE"
+            else:
+                reason, phase = texas_holdem_exit_reason(bid, seconds_remaining, settings)
+            if not reason:
+                if thesis.get("status") == "EXIT_TRIGGERED":
+                    reason = "TEXAS_THESIS_FAILURE"
             if not reason or bid is None:
                 continue
             bid_size = market.get(f"{side.lower()}_bid_size")
@@ -1602,7 +1933,7 @@ class PaperTradingService:
                 """,
                 (
                     ticker, side, "SELL", "MARKET", "open", iso_now(), fill_price,
-                    contracts, source, entry["id"], "TEXAS_HOLDEM",
+                    contracts, source, entry["id"], entry.get("strategy") or TEXAS_HOLDEM_LEGACY,
                 ),
             )
             order = self.db.fetch_one("SELECT * FROM paper_orders WHERE id=?", (order_id,))
@@ -2497,8 +2828,8 @@ class PaperTradingService:
             or expected_value is None
             or self._automatic_entry_exists(
                 ticker,
-                exclude_strategy="TEXAS_HOLDEM"
-                if strategy == "TEXAS_HOLDEM" else None,
+                exclude_strategy=TEXAS_HOLDEM_LEGACY
+                if strategy == TEXAS_HOLDEM_LEGACY else None,
             )
         ):
             return False, 0.0
@@ -2556,7 +2887,7 @@ class PaperTradingService:
                 ).get("cushion_ratio"),
             },
         )
-        if strategy in {"SWING", "TEXAS_HOLDEM"}:
+        if strategy == "SWING" or is_texas_holdem_strategy(strategy):
             initial_bid = (assessment.get("sell") or {}).get("raw_price")
             self.db.execute(
                 """
@@ -2571,7 +2902,7 @@ class PaperTradingService:
                     json.dumps(strategy_metadata or {}, sort_keys=True), order_id,
                 ),
             )
-        if strategy == "TEXAS_HOLDEM":
+        if is_texas_holdem_strategy(strategy):
             self.db.execute(
                 """
                 UPDATE paper_entries SET threshold_breach_enabled=0,
@@ -2925,10 +3256,7 @@ class PaperTradingService:
         status_open = str(market_status or "").lower() in {"active", "open"}
         texas_enabled = bool(settings.get("texas_holdem_enabled", False))
         entry_exists = (
-            self._automatic_entry_exists(
-                ticker,
-                exclude_strategy="TEXAS_HOLDEM" if texas_enabled else None,
-            )
+            self._automatic_entry_exists(ticker)
             if entry_exists_override is None else bool(entry_exists_override)
         )
         observed = parse_time(market_observed_at)
@@ -3002,13 +3330,13 @@ class PaperTradingService:
                 fixed_entry_handler=fixed_entry_handler,
                 execution_risk_by_side=execution_risk_by_side,
             )
-            result["active_strategy"] = "TEXAS_HOLDEM"
+            result["active_strategy"] = TEXAS_HOLDEM_V2
             result["texas_holdem"] = texas
             result["entered"] = texas.get("status") in {
                 "ATTEMPTING", "PARTIALLY_FILLED", "ENTERED",
             }
             self.reset_automatic_confirmation()
-            return finish(priority_strategy="TEXAS_HOLDEM", blocked_reason=texas.get("blocker"))
+            return finish(priority_strategy=TEXAS_HOLDEM_V2, blocked_reason=texas.get("blocker"))
         if not enabled:
             self.reset_automatic_confirmation()
             return finish(

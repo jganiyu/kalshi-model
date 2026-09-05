@@ -277,7 +277,7 @@ function renderRecentTrades(trades, mode = "PAPER") {
     <tr><td>${shortDate(trade.activity_at || trade.opened_at || trade.filled_at)}</td><td>${marketSideLabel(trade.side)}</td>
     <td>${cents(trade.entry_price ?? trade.price)}</td><td>${trade.contracts}</td>
     <td class="${Number(trade.settlement_margin) > 0 ? "positive" : Number(trade.settlement_margin) < 0 ? "negative" : ""}">${signedMoney(trade.settlement_margin)}</td>
-    <td>${String(trade.strategy || trade.source || "manual").replaceAll("_", " ")}</td>
+    <td>${displayStrategy(trade.strategy || trade.source || "manual")}</td>
     <td class="${Number(trade.realized_pnl) > 0 ? "positive" : Number(trade.realized_pnl) < 0 ? "negative" : ""}">${String(trade.display_status || trade.status || (mode === "PAPER" ? "open" : trade.action || "filled"))}${thresholdExitResultLabel(trade)}${trade.realized_pnl == null ? "" : ` · ${money(trade.realized_pnl)}`}</td>
     <td>${trade.available_cash_after == null ? "—" : money(trade.available_cash_after)}</td></tr>
   `).join("") : `<tr><td class="book-empty" colspan="8">No ${mode === "PAPER" ? "paper trades" : "fills"} yet</td></tr>`;
@@ -315,6 +315,7 @@ function thresholdExitResultLabel(trade = {}) {
     TEXAS_TURN_TARGET: "Texas Hold’em · Turn target",
     TEXAS_RIVER_TARGET: "Texas Hold’em · River target",
     TEXAS_RIVER_STOP: "Texas Hold’em · River stop",
+    TEXAS_THESIS_FAILURE: "Texas Hold’em 2.0 · Thesis failure",
   };
   return labels[reason] ? ` · ${labels[reason]}` : "";
 }
@@ -358,6 +359,13 @@ function openTradeExecutablePriceLabel(position = {}, current = state.dashboard?
   return `Current executable ${executablePriceLabel(position.side, "SELL", current)}`;
 }
 
+function displayStrategy(value) {
+  const strategy = String(value || "Manual").toUpperCase();
+  if (strategy === "TEXAS_HOLDEM_2_0") return "Texas Hold’em 2.0";
+  if (strategy === "TEXAS_HOLDEM") return "Texas Hold’em";
+  return String(value || "Manual").replaceAll("_", " ");
+}
+
 function texasExitText(position = {}) {
   const current = state.dashboard?.current?.texas_holdem || {};
   const status = position.texas_exit_status || current.status || "Watching";
@@ -398,11 +406,11 @@ function renderDashboardOpenTrades(mode, portfolio = {}) {
     const status = position.display_status || position.status || "Open";
     const protection = position.threshold_breach_exit || {};
     return `<article class="dashboard-open-trade">
-      <strong class="${side === "YES" ? "yes" : "no"}" title="${escapeHtml(position.ticker || "Current market")}">${escapeHtml(marketSideLabel(side))} · ${escapeHtml(String(strategy).replaceAll("_", " "))}</strong>
+      <strong class="${side === "YES" ? "yes" : "no"}" title="${escapeHtml(position.ticker || "Current market")}">${escapeHtml(marketSideLabel(side))} · ${escapeHtml(displayStrategy(strategy))}</strong>
       <small>${escapeHtml(status)}</small>
       <p>${escapeHtml(compact(position.contracts))} contracts · ${escapeHtml(cents(entryPrice))} entry · ${escapeHtml(money(exposure))} exposure</p>
       <p class="open-trade-executable-price" data-open-trade-executable-price data-ticker="${escapeHtml(String(position.ticker || ""))}" data-side="${escapeHtml(side)}">${escapeHtml(openTradeExecutablePriceLabel(position))}</p>
-      <p class="threshold-breach-state">${escapeHtml(String(strategy).toUpperCase() === "TEXAS_HOLDEM" ? texasExitText(position) : thresholdBreachExitText(protection))}</p>
+      <p class="threshold-breach-state">${escapeHtml(["TEXAS_HOLDEM", "TEXAS_HOLDEM_2_0"].includes(String(strategy).toUpperCase()) ? texasExitText(position) : thresholdBreachExitText(protection))}</p>
     </article>`;
   });
   const orderRows = restingOrders.map((order) => {
@@ -594,6 +602,7 @@ function renderTexasHoldemHud(texas = {}) {
     return;
   }
   $("#standard-edge-hud").dataset.status = String(texas.status || "WATCHING").toLowerCase();
+  $("#texas-holdem-title").textContent = texas.display_name || "Texas Hold’em 2.0";
   const phaseKey = String(texas.phase?.key || texasPhaseProgress(texas.market_open_time).phase);
   $("#texas-holdem-phase").textContent = `THE ${phaseKey}`;
   $("#texas-holdem-status").textContent = String(texas.status || "WAITING").replaceAll("_", " ");
@@ -607,6 +616,24 @@ function renderTexasHoldemHud(texas = {}) {
   $("#texas-active-target").textContent = cents(texas.active_target, 0);
   $("#texas-holdem-blocker").textContent = texas.blocker
     || (texas.status === "ENTERED" ? "Position entered. Watching the active street exit." : "Opening play is active.");
+  const thesis = texas.thesis || {};
+  const isV2 = Boolean(texas.rules?.version);
+  const thesisDetail = thesis.status === "EXIT_TRIGGERED"
+    ? "Thesis failure exit triggered"
+    : thesis.status === "NO_EXIT" ? "5m thesis checkpoint held"
+      : thesis.status === "BREACHED" ? "Post-fill breach recorded"
+        : "5m thesis checkpoint pending";
+  $("#texas-v2-rules").textContent = isV2
+    ? `MVI ≥${Number(texas.rules?.mvi_minimum ?? 4).toFixed(1)} · 5m no-breach >$50 exit · ${thesisDetail}`
+    : "Legacy Texas rules";
+  $("#texas-mvi-gate-control").hidden = !isV2;
+  const mviInput = $("#texas-mvi-minimum");
+  if (isV2 && document.activeElement !== mviInput) {
+    mviInput.value = Number(texas.rules?.mvi_minimum ?? 4).toFixed(1);
+  }
+  if (texas.allocation_boosted) {
+    $("#texas-holdem-status").textContent += " · BOOSTED 1.5×";
+  }
   const passButton = $("#texas-pass-next-round");
   const pass = texas.pass || {};
   // A consumed pass belongs to this market, so it must not prevent the user
@@ -643,17 +670,22 @@ async function updateTexasQuickSetting(event) {
     "texas-river-target": "texas_holdem_river_target",
     "texas-river-stop": "texas_holdem_river_stop",
   };
+  const isMviGate = input.id === "texas-mvi-minimum";
   const centsValue = Number(input.value);
   const isStop = mapping[input.id]?.endsWith("_stop");
-  if (!Number.isFinite(centsValue) || centsValue < (isStop ? 0 : 1) || centsValue > 99) {
-    showToast("Texas Hold’em setting not changed", isStop ? "Enter 0¢ to disable, or 1¢ through 99¢." : "Enter a value from 1¢ through 99¢.");
+  if (!Number.isFinite(centsValue) || (isMviGate ? centsValue < 0 || centsValue > 10 : centsValue < (isStop ? 0 : 1) || centsValue > 99)) {
+    showToast("Texas Hold’em setting not changed", isMviGate ? "Enter MVI from 0.0 through 10.0." : isStop ? "Enter 0¢ to disable, or 1¢ through 99¢." : "Enter a value from 1¢ through 99¢.");
     await refreshDashboard();
     return;
   }
   try {
     await api("/api/settings", {
       method: "PUT",
-      body: JSON.stringify({ [mapping[input.id]]: centsValue / 100 }),
+      body: JSON.stringify({
+        [isMviGate
+          ? `${String(selectedTrading().mode || "PAPER").toLowerCase()}_texas_holdem_v2_mvi_minimum`
+          : mapping[input.id]]: isMviGate ? centsValue : centsValue / 100,
+      }),
     });
     await refreshDashboard();
     showToast("Texas Hold’em updated", "The active position is using the new phase value.");
@@ -1992,6 +2024,9 @@ const calibrationGroups = [
   ["Texas Hold’em Strategy", [
     { id: "texas_holdem_enabled", label: "Enable Texas Hold’em Strategy", type: "toggle", tip: "Runs one contrarian opening play per market and replaces Standard Edge automatic entries while enabled. Default: off." },
     { id: "texas_holdem_max_entry_price", label: "Maximum entry price", unit: "cents", min: 1, max: 99, step: 1, scale: 100, tip: "Highest all-in executable contract price allowed for the opening IOC buy. Default: 50 cents." },
+    { id: "paper_texas_holdem_v2_mvi_minimum", label: "Paper Texas 2.0 minimum MVI", unit: "MVI", min: 0, max: 10, step: .1, tip: "Fresh reliable MVI required for Paper Texas Hold’em 2.0 entry. Default: 4." },
+    { id: "demo_texas_holdem_v2_mvi_minimum", label: "Demo Texas 2.0 minimum MVI", unit: "MVI", min: 0, max: 10, step: .1, tip: "Fresh reliable MVI required for Demo Texas Hold’em 2.0 entry. Default: 4." },
+    { id: "live_texas_holdem_v2_mvi_minimum", label: "Live Texas 2.0 minimum MVI", unit: "MVI", min: 0, max: 10, step: .1, tip: "Fresh reliable MVI required for Live Texas Hold’em 2.0 entry. Default: 4." },
     { id: "texas_holdem_flop_target", label: "Flop target", unit: "cents", min: 1, max: 99, step: 1, scale: 100, tip: "Executable bid that closes the position during minutes 0–5. Default: 60 cents." },
     { id: "texas_holdem_flop_stop", label: "Flop stop", unit: "cents", min: 0, max: 99, step: 1, scale: 100, tip: "Executable bid that folds during minutes 0–5. Use 0 to disable. Default: 60 cents." },
     { id: "texas_holdem_turn_target", label: "Turn target", unit: "cents", min: 1, max: 99, step: 1, scale: 100, tip: "Executable bid that closes the position during minutes 5–10. Default: 50 cents." },
@@ -2151,6 +2186,7 @@ function renderCalibrationResults(data) {
   const strategyLabels = {
     STANDARD_EDGE: "Standard edge",
     TEXAS_HOLDEM: "Texas Hold’em",
+    TEXAS_HOLDEM_2_0: "Texas Hold’em 2.0",
   };
   $("#strategy-results").innerHTML = Object.entries(strategyLabels).map(([key, label]) => {
     const result = strategyResults[key] || {};
@@ -2696,7 +2732,7 @@ async function loadPaper() {
         : "Historical review was not recorded for this trade";
     return `
     <tr class="trade-ledger-row ${reviewAvailable ? "review-available" : ""}" data-review-ref="${escapeHtml(trade.review_ref || "")}" data-review-mode="${mode}" data-review-available="${reviewAvailable}" tabindex="${reviewAvailable ? "0" : "-1"}" aria-expanded="false" title="${escapeHtml(reviewTitle)}"><td>${shortDate(trade.activity_at || trade.opened_at || trade.filled_at)}${reviewUnavailable ? '<small class="review-unavailable">Historical review unavailable</small>' : ""}</td><td>${escapeHtml(trade.ticker)}</td><td>${marketSideLabel(trade.side)}</td>
-    <td>${cents(trade.entry_price ?? trade.price)}</td><td>${trade.contracts}</td><td>${String(trade.strategy || trade.source || "automatic").replaceAll("_", " ").toUpperCase()}${(trade.entries || []).some((entry) => entry.stop_status === "active") ? " · STOP ACTIVE" : ""}</td><td>${mode === "PAPER" ? points(trade.edge) : "—"}</td>
+    <td>${cents(trade.entry_price ?? trade.price)}</td><td>${trade.contracts}</td><td>${displayStrategy(trade.strategy || trade.source || "automatic").toUpperCase()}${(trade.entries || []).some((entry) => entry.stop_status === "active") ? " · STOP ACTIVE" : ""}</td><td>${mode === "PAPER" ? points(trade.edge) : "—"}</td>
     <td><span class="status-pill ${String(trade.display_status || trade.status || "filled").toLowerCase()}">${String(trade.display_status || trade.status || trade.action || "FILLED").toUpperCase()}${thresholdExitResultLabel(trade)}</span></td>
     <td class="${Number(trade.realized_pnl) > 0 ? "positive" : Number(trade.realized_pnl) < 0 ? "negative" : ""}">${trade.realized_pnl == null ? "--" : money(trade.realized_pnl)}</td>
     <td>${trade.available_cash_after == null ? "—" : money(trade.available_cash_after)}</td></tr>
@@ -3128,7 +3164,7 @@ function bindEvents() {
   });
   $("#run-backtest").addEventListener("click", runBacktest);
   $("#standard-edge-gate-release").addEventListener("change", toggleStandardEdgeGateRelease);
-  ["#texas-flop-target", "#texas-flop-stop", "#texas-turn-target", "#texas-turn-stop", "#texas-river-target", "#texas-river-stop"].forEach((selector) => {
+  ["#texas-flop-target", "#texas-flop-stop", "#texas-turn-target", "#texas-turn-stop", "#texas-river-target", "#texas-river-stop", "#texas-mvi-minimum"].forEach((selector) => {
     $(selector).addEventListener("change", updateTexasQuickSetting);
   });
   $("#texas-pass-next-round").addEventListener("click", passTexasHoldemNextRound);

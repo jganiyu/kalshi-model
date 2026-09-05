@@ -585,6 +585,50 @@ def threshold_breach_exit_state(
     }
 
 
+TEXAS_HOLDEM_LEGACY = "TEXAS_HOLDEM"
+TEXAS_HOLDEM_V2 = "TEXAS_HOLDEM_2_0"
+TEXAS_HOLDEM_STRATEGIES = frozenset({TEXAS_HOLDEM_LEGACY, TEXAS_HOLDEM_V2})
+# The entry gate is a saved, per-environment setting.  These two values are
+# deliberately versioned strategy rules rather than calibration knobs.
+TEXAS_V2_MVI_BOOST_THRESHOLD = 8.0
+TEXAS_V2_MVI_BOOST_MULTIPLIER = 1.5
+TEXAS_V2_THESIS_CHECKPOINT_SECONDS = 300.0
+TEXAS_V2_THESIS_UNFAVORABLE_DISTANCE = 50.0
+TEXAS_V2_RULE_VERSION = "texas-holdem-2.0.0"
+
+
+def is_texas_holdem_strategy(value: object) -> bool:
+    return str(value or "").upper() in TEXAS_HOLDEM_STRATEGIES
+
+
+def texas_threshold_breached(side: object, btc_proxy: object, threshold: object) -> bool:
+    """A touch counts; the side is the held Kalshi outcome."""
+    try:
+        proxy = float(btc_proxy)
+        strike = float(threshold)
+    except (TypeError, ValueError):
+        return False
+    normalized = str(side or "").upper()
+    return proxy + 1e-12 >= strike if normalized == "YES" else (
+        proxy <= strike + 1e-12 if normalized == "NO" else False
+    )
+
+
+def texas_unfavorable_distance(side: object, btc_proxy: object, threshold: object) -> float | None:
+    """Positive values mean BTC remains on the wrong side for the held outcome."""
+    try:
+        proxy = float(btc_proxy)
+        strike = float(threshold)
+    except (TypeError, ValueError):
+        return None
+    normalized = str(side or "").upper()
+    if normalized == "YES":
+        return strike - proxy
+    if normalized == "NO":
+        return proxy - strike
+    return None
+
+
 def texas_holdem_phase(seconds_remaining: float | None) -> dict[str, object]:
     """Return the authoritative five-minute Texas Hold'em market phase."""
     remaining = max(0.0, min(900.0, float(seconds_remaining or 0.0)))

@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from app.db import Database
+from app.db import MIGRATIONS, Database
 from app.config import AppConfig
 from app.domain import iso_now
 from app.engine import AnalysisEngine
@@ -42,7 +42,7 @@ def test_database_migrations_and_settings_persist(tmp_path: Path) -> None:
     reopened.initialize()
     assert reopened.settings()["starting_bankroll"] == 2_500.0
     assert "unknown" not in reopened.settings()
-    assert reopened.fetch_one("SELECT MAX(version) version FROM schema_migrations")["version"] == 23
+    assert reopened.fetch_one("SELECT MAX(version) version FROM schema_migrations")["version"] == MIGRATIONS[-1][0]
     assert ModelManager(reopened).active()["version"] == "baseline-1.1"
 
 

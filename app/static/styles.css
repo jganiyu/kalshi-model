@@ -365,6 +365,8 @@ nav { display: grid; gap: 2px; }
 .texas-holdem-details small, .texas-holdem-details strong { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .texas-holdem-details small { margin-bottom: 3px; color: var(--muted); font-size: 8px; }
 .texas-holdem-details strong { font-family: var(--number-font); font-size: 9px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.texas-holdem-details input { width: 34px; padding: 1px 2px; border: 0; border-bottom: 1px solid var(--line-strong); border-radius: 0; background: transparent; color: var(--ink); font: inherit; text-align: right; }
+.texas-holdem-details input:focus { border-color: var(--green); outline: 0; }
 .hud-help {
   position: relative;
   display: inline-grid;

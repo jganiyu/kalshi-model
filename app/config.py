@@ -123,6 +123,10 @@ DEFAULT_SETTINGS: dict[str, object] = {
     "texas_holdem_river_stop": 0.60,
     "texas_holdem_entry_window_seconds": 20,
     "texas_holdem_additional_retries": 2,
+    # Texas 2.0 gates are deliberately isolated by execution environment.
+    "paper_texas_holdem_v2_mvi_minimum": 4.0,
+    "demo_texas_holdem_v2_mvi_minimum": 4.0,
+    "live_texas_holdem_v2_mvi_minimum": 4.0,
     "early_threshold_enabled": False,
     "early_bankroll_pct": 0.03,
     "early_min_probability": 0.65,
