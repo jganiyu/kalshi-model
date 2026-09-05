@@ -2753,7 +2753,7 @@ async function loadPaper() {
     `).join("") : '<tr><td colspan="8" class="empty-state">No unsettled positions.</td></tr>';
     $("#exchange-order-table").innerHTML = (data.orders || []).length ? data.orders.map((order) => `
       <tr><td>${shortDate(order.updated_at)}</td><td>${order.ticker}</td><td>${marketSideLabel(order.side)}</td><td>${order.action}</td>
-      <td>${order.filled_contracts}</td><td>${order.remaining_contracts}</td><td>${cents(order.limit_price)}</td><td>${order.status}</td>
+      <td>${order.filled_contracts ?? 0}</td><td>${order.remaining_contracts ?? 0}</td><td>${cents(order.average_fill_price ?? order.limit_price)}</td><td>${order.status}</td>
       <td>${["ACKNOWLEDGED", "RESTING", "PARTIALLY_FILLED"].includes(order.status) ? `<button class="table-action" data-cancel-exchange-order="${order.exchange_order_id}">Cancel</button>` : ""}</td></tr>
     `).join("") : '<tr><td colspan="9" class="empty-state">No exchange orders.</td></tr>';
   }

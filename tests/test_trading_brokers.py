@@ -2235,8 +2235,36 @@ def test_recent_exchange_trades_are_small_but_include_balance_and_settlement_mar
     recent = broker.recent_trades(5)
 
     assert len(recent) == 1
+    assert recent[0]["entry_price"] == pytest.approx(.45)
+    assert recent[0]["realized_pnl"] is None
     assert recent[0]["available_cash_after"] == pytest.approx(299.09)
     assert recent[0]["settlement_margin"] == pytest.approx(2.5)
+
+
+def test_recent_exchange_sell_uses_round_trip_entry_and_realized_result(
+    tmp_path: Path,
+) -> None:
+    db = make_db(tmp_path)
+    broker = KalshiBroker("LIVE", db, FakeTradingClient())  # type: ignore[arg-type]
+    db.execute(
+        """
+        INSERT INTO broker_fills(
+          mode,fill_id,ticker,side,action,contracts,price,fee,strategy,source,filled_at,raw_json
+        ) VALUES
+          ('LIVE','entry','ROUND-TRIP','YES','BUY',2,.40,.01,'MANUAL','manual',
+           '2026-09-04T10:00:00Z','{}'),
+          ('LIVE','exit','ROUND-TRIP','YES','SELL',2,.60,.01,'MANUAL','manual',
+           '2026-09-04T10:01:00Z','{}')
+        """
+    )
+
+    recent = broker.recent_trades(5)
+
+    assert len(recent) == 2
+    sell = next(row for row in recent if row["action"] == "SELL")
+    assert sell["entry_price"] == pytest.approx(.40)
+    assert sell["realized_pnl"] == pytest.approx(.38)
+    assert sell["status"] == "CLOSED"
 
 
 def test_broker_cash_migration_preserves_history_and_backfills_nearby_snapshot(

@@ -676,6 +676,7 @@ class KalshiBroker(Broker):
                        SELECT a.available_balance
                        FROM broker_account_snapshots a
                        WHERE a.mode=f.mode AND a.observed_at >= f.filled_at
+                         AND (julianday(a.observed_at)-julianday(f.filled_at))*86400 <= 30
                        ORDER BY a.observed_at ASC LIMIT 1
                      )
                    ) AS available_cash_after,
@@ -692,7 +693,24 @@ class KalshiBroker(Broker):
             """,
             (self.mode, max(1, min(int(limit), 8))),
         )
+        # Recent activity is fill-level, while the dashboard's price/result
+        # columns describe the round trip.  Use the same durable FIFO ledger
+        # projection as the Trading page so sell fills do not masquerade as
+        # entries at their exit price and closed trades show their result.
+        ledger_by_key = {
+            (str(trade.get("ticker")), str(trade.get("side"))): trade
+            for trade in self.trade_ledger()
+        }
         for row in rows:
+            trade = ledger_by_key.get((str(row.get("ticker")), str(row.get("side")))) or {}
+            row["entry_price"] = trade.get("price")
+            row["realized_pnl"] = trade.get("realized_pnl")
+            row["status"] = trade.get("status")
+            row["display_status"] = trade.get("display_status")
+            # Keep each activity row's own fill timestamp; the ledger's
+            # terminal activity timestamp would make earlier entry fills look
+            # as though they happened at the later exit/settlement.
+            row["activity_at"] = row.get("filled_at")
             row["settlement_margin"] = settlement_margin(
                 row.pop("settlement_price", None), row.pop("settlement_strike", None)
             )
