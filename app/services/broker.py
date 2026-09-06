@@ -657,63 +657,48 @@ class KalshiBroker(Broker):
         return self.db.fetch_all(sql, tuple(params))
 
     def recent_trades(self, limit: int = 5) -> list[dict[str, Any]]:
-        """Small, enriched activity feed for the Dashboard only.
+        """Return one accurate economic trade per Dashboard row.
 
-        This intentionally stays a five-row, index-led query.  A fill often
-        predates the reconciliation snapshot which records its available
-        balance, so use the first durable snapshot *after* that fill when the
-        fill was imported without the value.  Settlement margin is only shown
-        once Kalshi has published the settlement print; inventing one before
-        then would be misleading.
+        Kalshi can report a single order as several fills.  The Trading
+        ledger intentionally exposes that detail; the Dashboard must not
+        mistake those fragments (or a buy and its sell) for separate trades.
+        Its compact feed therefore uses the durable FIFO round-trip ledger.
         """
-        rows = self.db.fetch_all(
-            """
-            SELECT f.ticker,f.side,f.action,f.contracts,f.price,f.fee,
-                   f.strategy,f.source,f.filled_at,
-                   COALESCE(
-                     f.available_cash_after,
-                     (
-                       SELECT a.available_balance
-                       FROM broker_account_snapshots a
-                       WHERE a.mode=f.mode AND a.observed_at >= f.filled_at
-                         AND (julianday(a.observed_at)-julianday(f.filled_at))*86400 <= 30
-                       ORDER BY a.observed_at ASC LIMIT 1
-                     )
-                   ) AS available_cash_after,
-                   COALESCE(
-                     json_extract(s.raw_json,'$.expiration_value'),
-                     json_extract(m.raw_json,'$.expiration_value')
-                   ) AS settlement_price,
-                   m.strike AS settlement_strike
-            FROM broker_fills f
-            LEFT JOIN settlements s ON s.ticker=f.ticker
-            LEFT JOIN markets m ON m.ticker=f.ticker
-            WHERE f.mode=?
-            ORDER BY f.filled_at DESC,f.id DESC LIMIT ?
-            """,
-            (self.mode, max(1, min(int(limit), 8))),
-        )
-        # Recent activity is fill-level, while the dashboard's price/result
-        # columns describe the round trip.  Use the same durable FIFO ledger
-        # projection as the Trading page so sell fills do not masquerade as
-        # entries at their exit price and closed trades show their result.
-        ledger_by_key = {
-            (str(trade.get("ticker")), str(trade.get("side"))): trade
-            for trade in self.trade_ledger()
-        }
+        rows = self.trade_ledger()[: max(1, min(int(limit), 8))]
         for row in rows:
-            trade = ledger_by_key.get((str(row.get("ticker")), str(row.get("side")))) or {}
-            row["entry_price"] = trade.get("price")
-            row["realized_pnl"] = trade.get("realized_pnl")
-            row["status"] = trade.get("status")
-            row["display_status"] = trade.get("display_status")
-            # Keep each activity row's own fill timestamp; the ledger's
-            # terminal activity timestamp would make earlier entry fills look
-            # as though they happened at the later exit/settlement.
-            row["activity_at"] = row.get("filled_at")
-            row["settlement_margin"] = settlement_margin(
-                row.pop("settlement_price", None), row.pop("settlement_strike", None)
-            )
+            # Imported fills occasionally predate the first account snapshot.
+            # A snapshot is useful only when it is demonstrably adjacent to
+            # this trade's last activity; do not show a later balance as if it
+            # were the balance after this transaction.
+            if row.get("available_cash_after") is None and row.get("activity_at"):
+                snapshot = self.db.fetch_one(
+                    """
+                    SELECT available_balance FROM broker_account_snapshots
+                    WHERE mode=? AND observed_at>=?
+                      AND (julianday(observed_at)-julianday(?))*86400<=30
+                    ORDER BY observed_at ASC LIMIT 1
+                    """,
+                    (self.mode, row["activity_at"], row["activity_at"]),
+                )
+                if snapshot:
+                    row["available_cash_after"] = snapshot.get("available_balance")
+            if row.get("settlement_margin") is None:
+                market = self.db.fetch_one(
+                    """
+                    SELECT strike,raw_json FROM markets WHERE ticker=?
+                    """,
+                    (row["ticker"],),
+                )
+                if market:
+                    try:
+                        market_payload = json.loads(str(market.get("raw_json") or "{}"))
+                    except (TypeError, ValueError):
+                        market_payload = {}
+                    row["settlement_margin"] = settlement_margin(
+                        market_payload.get("expiration_value"),
+                        market.get("strike"),
+                    )
+            row["entry_price"] = row.get("price")
         return rows
 
     def trade_ledger(self) -> list[dict[str, Any]]:

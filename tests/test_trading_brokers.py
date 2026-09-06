@@ -2260,11 +2260,40 @@ def test_recent_exchange_sell_uses_round_trip_entry_and_realized_result(
 
     recent = broker.recent_trades(5)
 
-    assert len(recent) == 2
-    sell = next(row for row in recent if row["action"] == "SELL")
-    assert sell["entry_price"] == pytest.approx(.40)
-    assert sell["realized_pnl"] == pytest.approx(.38)
-    assert sell["status"] == "CLOSED"
+    # The Dashboard is a trade feed, not a fill ledger: the entry and exit
+    # must appear once as their completed round trip.
+    assert len(recent) == 1
+    trade = recent[0]
+    assert trade["entry_price"] == pytest.approx(.40)
+    assert trade["realized_pnl"] == pytest.approx(.38)
+    assert trade["status"] == "CLOSED"
+
+
+def test_recent_exchange_trades_collapse_partial_fills_into_one_round_trip(
+    tmp_path: Path,
+) -> None:
+    db = make_db(tmp_path)
+    broker = KalshiBroker("LIVE", db, FakeTradingClient())  # type: ignore[arg-type]
+    db.execute(
+        """
+        INSERT INTO broker_fills(
+          mode,fill_id,ticker,side,action,contracts,price,fee,strategy,source,filled_at,raw_json
+        ) VALUES
+          ('LIVE','entry','PARTIAL','YES','BUY',5,.37,.01,'TEXAS_HOLDEM_2_0','automatic',
+           '2026-09-04T10:00:00Z','{}'),
+          ('LIVE','exit-a','PARTIAL','YES','SELL',3.43,.16,.01,'TEXAS_HOLDEM_2_0','texas_thesis_failure',
+           '2026-09-04T10:05:00Z','{}'),
+          ('LIVE','exit-b','PARTIAL','YES','SELL',1.57,.16,.01,'TEXAS_HOLDEM_2_0','texas_thesis_failure',
+           '2026-09-04T10:05:00Z','{}')
+        """
+    )
+
+    recent = broker.recent_trades(5)
+
+    assert len(recent) == 1
+    assert recent[0]["ticker"] == "PARTIAL"
+    assert recent[0]["contracts"] == pytest.approx(5)
+    assert recent[0]["status"] == "CLOSED"
 
 
 def test_broker_cash_migration_preserves_history_and_backfills_nearby_snapshot(
