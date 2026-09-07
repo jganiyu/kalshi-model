@@ -17,11 +17,11 @@ A local macOS research and trading app for Kalshi's 15-minute Bitcoin Up or Down
 
 ## Features
 
-- **Dashboard:** Live BTC proxy, outcome forecast, Open Trades, Standard Edge HUD, dual order books, and recent trades.
+- **Dashboard:** Live BTC proxy, outcome forecast, Open Trades, Standard Edge HUD, dual order books, recent economic trades, and connection/protection health.
 - **BTC proxy:** Median Coinbase, Kraken, and Bitstamp price with learned BRTI uncertainty.
 - **Three modes:** Paper, isolated Kalshi Demo, and deliberately armed Kalshi Live.
 - **Mobile Monitor:** Read-only HUD, market metrics, and recent trades on iPhone through Tailscale.
-- **Strategies:** Standard Edge probability-and-value entries, plus an optional Texas Hold’em opening play with Flop, Turn, and River exits.
+- **Strategies:** Standard Edge probability-and-value entries, plus an optional Texas Hold’em 2.0 opening play with Flop, Turn, and River exits.
 - **Protective exits:** Configurable profit take, stop-loss, and Threshold Breach Exit rules.
 - **Calibration:** Tune Standard Edge, exits, risk controls, and review probability, volatility, and volume evidence.
 - **Trade review:** Expand a settled trade to replay its BTC, probability, MVI, readiness, and execution history.
@@ -62,7 +62,20 @@ When Texas Hold’em is enabled, this card becomes a three-street strategy HUD. 
 - Results show settled samples, Brier score, and calibration in 10-point probability ranges.
 - Margin Volatility has one maximum setting; `0` leaves the gate off while evidence accumulates.
 - Automatic entries still require a valid price, positive Buy EV, confirmation, liquidity, and risk approval.
-- The Texas Hold’em section controls its 50¢ opening cap, 20-second attempt window, two fresh-market-state retries, phase targets, and River stop. It is off by default.
+- The Texas Hold’em section controls its entry cap, opening window, additional retries, phase targets/stops, and Texas 2.0 allocation. The saved opening window and retry count—not hard-coded copy—control execution. It is off by default.
+
+## Execution and connection resilience
+
+The app treats new entries differently from exits. Incomplete account reconciliation blocks new exposure, but a confirmed existing position remains eligible for protective monitoring and a reduce-only exit when safe quantity evidence and an authenticated Kalshi path are available.
+
+- **Direct protection lane:** Valid Kalshi book updates feed a per-environment protective evaluator directly. It does not wait for charts, Dashboard rendering, historical trade review, or a full account refresh.
+- **Bounded quote handling:** The evaluator retains recent executable extremes by market phase, so a short target/stop crossing is not silently lost during a burst of newer quotes.
+- **Safe execution transport:** Entry, targeted recovery, and background reconciliation use separate bounded admission/deadline policies. Stable client IDs, reduce-only IOC exits, reservations for uncertain exits, and targeted same-ID recovery prevent duplicate or excess sells.
+- **Reconciliation ordering:** Newer locally observed private fills, positions, and order acknowledgements are guarded from older in-flight REST snapshots. Account progress advances only after the relevant data is applied.
+- **Single execution owner:** Only one local app process may own exchange execution for the configured data directory. A second instance refuses to start rather than competing for the same account.
+- **Visible health:** The API and Dashboard expose stream, protection, quote-age, watchdog, and recovery state. `Reconciled` is shown only after a successful reconciliation.
+
+These controls reduce app-originated delay and stale-state risk; they cannot guarantee a Kalshi response, an available buyer, or an exchange fill. Keep the Mac awake, the app running, and monitor an open Live position.
 
 ## Kalshi credentials
 
@@ -106,7 +119,9 @@ Standard Edge looks for a sustained pricing advantage and confirms it against th
 
 Every entry must clear probability, EV, spread, liquidity, data, confidence, threshold distance, BTC directional momentum, volatility, confirmation, allocation, and risk checks. By default, a 15-second BTC-proxy regression must move at least $1 upward for Up or downward for Down. The HUD shows these checks live so it is clear what the model is waiting on.
 
-Texas Hold’em is an alternative automatic strategy. Once the official market opens and To Beat is known, it buys the contract opposite BTC’s opening position versus the threshold—Down when BTC is above it, Up when BTC is below it—only when the all-in executable price is 50¢ or less. It sends one IOC attempt and up to two remaining-quantity retries on genuinely new market state during the first 20 seconds; otherwise it folds until the next market. Standard Edge entries are disabled while this strategy is on.
+Texas Hold’em is an alternative automatic strategy. Once the official market opens and To Beat is known, it buys the contract opposite BTC’s opening position versus the threshold—Down when BTC is above it, Up when BTC is below it—only when the all-in executable price is at or below the configured entry cap. It sends an aggressive IOC attempt plus the configured number of remaining-quantity retries, each using genuinely fresh market state, during the configured opening window; otherwise it folds until the next market. Standard Edge entries are disabled while this strategy is on.
+
+Texas Hold’em 2.0 records its own strategy version. Its per-environment MVI gate defaults to 4; MVI at or above 8 applies the built-in 1.5× allocation boost to the configured Texas 2.0 base allocation before normal position, risk, and execution caps. Its five-minute thesis check can reduce risk when no breach occurred and BTC has moved sufficiently farther from the threshold. Hard caps always remain ceilings.
 
 ### How it protects a trade
 
@@ -114,7 +129,7 @@ Margin Volatility measures how choppily BTC is moving around To Beat. It can blo
 
 Profit take exits at a configured executable bid—99¢ by default—and stop-losses remain optional. Threshold Breach Exit is the model's fold: its signed buffer can trigger before To Beat or tolerate a configured adverse move beyond it before closing. These are safeguards, not guarantees of an exit price or fill.
 
-Texas Hold’em positions use their own market-state exits: 60¢ during the Flop, 50¢ during the Turn, and 95¢ during the River by default. A 60¢ River stop becomes active only in the final five minutes. Texas positions deliberately ignore Threshold Breach Exit and the ordinary stop because the opening play begins contrarian; phase exits use aggressive reduce-only IOC sells and never reverse the position.
+Texas Hold’em positions use their own phase exits: by default, Flop target/stop are 60¢/60¢, Turn 50¢/60¢, and River 95¢/60¢. A stop set to 0 is disabled for that phase. Texas positions deliberately ignore Threshold Breach Exit and the ordinary stop because the opening play begins contrarian; phase exits use aggressive reduce-only IOC sells and never reverse the position.
 
 ### How it improves
 
@@ -148,7 +163,7 @@ Demo and Live default to a 100% eligible-funds cap, but strategy sizing and hard
 
 All exchange orders are price-limited and may fill partially. A kill switch blocks new submissions and attempts to cancel resting orders. After a restart or disconnect, the app reconciles with Kalshi and requires rearming.
 
-Stop-losses and the global profit take are app-managed in Demo and Live. They work only while the app is running, connected, authenticated, reconciled, and armed; execution is not guaranteed.
+Stop-losses and the global profit take are app-managed in Demo and Live. New entries require a reconciled, armed session. Protective monitoring requires the app to remain running; it can operate in degraded mode while full reconciliation recovers, but still needs safe confirmed exposure, a fresh executable quote, and an authenticated exchange path. Execution is not guaranteed.
 
 ## Historical trade review
 
