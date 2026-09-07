@@ -56,6 +56,7 @@ from app.services.market_data import (
     live_composite_quote,
 )
 from app.services.margin_volatility import MarginVolatilityService, quotes_are_fresh_and_qualified
+from app.services.historical_realized_volatility import CoinbaseRealizedVolatilityService
 from app.services.paper import PaperTradingService
 from app.services.texas_breach import breach_features
 from app.services.streaming import BitcoinWebSocketFeeds, KalshiWebSocketFeed
@@ -107,6 +108,7 @@ class AnalysisEngine:
         self.kalshi_demo: KalshiPublicClient | None = None
         self.paper = PaperTradingService(db)
         self.margin_volatility = MarginVolatilityService(db)
+        self.historical_realized_volatility: CoinbaseRealizedVolatilityService | None = None
         self.trade_reviews = TradeReviewService(db)
         self.volume_signals = VolumeSignalService(db)
         self.trading = TradingCoordinator(config, db, self.paper)
@@ -155,6 +157,7 @@ class AnalysisEngine:
         self._trading_summary_task: asyncio.Task[None] | None = None
         self._volume_history_task: asyncio.Task[None] | None = None
         self._volume_flush_task: asyncio.Task[None] | None = None
+        self._historical_realized_volatility_task: asyncio.Task[None] | None = None
         self._trading_summary: dict[str, Any] = {
             "selected_mode": "PAPER", "selected": {}, "modes": {}
         }
@@ -196,6 +199,11 @@ class AnalysisEngine:
             limits=KALSHI_HTTP_LIMITS,
         )
         self.bitcoin = BitcoinCompositeFeed(self.http)
+        # This public, low-priority worker is intentionally not part of market
+        # collection. Its failure can never delay arming, quotes, or exits.
+        self.historical_realized_volatility = CoinbaseRealizedVolatilityService(
+            self.db
+        )
         self.kalshi = KalshiPublicClient(
             self.http, self.config.kalshi_api_base, self.config.kalshi_series
         )
@@ -208,6 +216,9 @@ class AnalysisEngine:
         # A large trading archive is cold state.  Feature hydration is bounded
         # and off-loop; quote handling starts immediately without it.
         self._volume_history_task = asyncio.create_task(self._load_volume_history())
+        self._historical_realized_volatility_task = asyncio.create_task(
+            self.historical_realized_volatility.run()
+        )
         bitcoin_streams = BitcoinWebSocketFeeds(
             self._handle_stream_quote, self._handle_stream_status,
             self._handle_stream_trade,
@@ -245,6 +256,7 @@ class AnalysisEngine:
             self._trading_summary_task,
             self._volume_history_task,
             self._volume_flush_task,
+            self._historical_realized_volatility_task,
             self._kalshi_stream_task,
             self._kalshi_book_fallback_task,
             self._book_persist_task,
@@ -254,6 +266,9 @@ class AnalysisEngine:
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
+        if self.historical_realized_volatility:
+            self.historical_realized_volatility.stop()
+            await self.historical_realized_volatility.close()
         await self.trading.stop()
         if self.http:
             await self.http.aclose()
@@ -456,7 +471,11 @@ class AnalysisEngine:
         self.dashboard = {
             **self.dashboard,
             "system": self._system_state(reliability, observed_at),
-            "btc": btc_state,
+            "btc": {
+                **btc_state,
+                "history": self.historical_realized_volatility.dashboard_state()
+                if self.historical_realized_volatility else None,
+            },
             "current": current_payload,
             "next": self._market_summary(next_market) if next_market else None,
             "next_threshold_forecast": self._next_threshold_forecast_state(),
@@ -1186,7 +1205,11 @@ class AnalysisEngine:
         self.dashboard = {
             **self.dashboard,
             "system": self._system_state(reliable, observed_at),
-            "btc": self._latest_btc,
+            "btc": {
+                **self._latest_btc,
+                "history": self.historical_realized_volatility.dashboard_state()
+                if self.historical_realized_volatility else None,
+            },
             "current": current,
             "next": self._market_summary(self._next_market) if self._next_market else None,
             "notification": notification,

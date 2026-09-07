@@ -111,6 +111,33 @@ function renderNextThresholdForecast(data) {
   container.hidden = false;
 }
 
+function renderHistoricalRealizedVolatility(btc) {
+  const history = btc?.history || {};
+  const row = history.horizons?.["15"] || {};
+  const value = numberOrNull(row.rv_pct);
+  const percentileValue = numberOrNull(row.percentile);
+  const detail = $("#historical-realized-volatility-detail");
+  const output = $("#historical-realized-volatility-value");
+  if (!output || !detail) return;
+  const unavailable = history.status === "error" || history.status === "stale" || history.current_stale;
+  output.textContent = unavailable || value === null ? "--" : `${value.toFixed(2)}%`;
+  if (history.status === "error") {
+    detail.textContent = "Coinbase · history unavailable";
+  } else if (history.status === "loading") {
+    detail.textContent = "Coinbase · 90-day baseline loading";
+  } else if (unavailable) {
+    detail.textContent = "Coinbase · stale candle data";
+  } else if (value !== null && percentileValue !== null) {
+    const coverageDays = numberOrNull(history.coverage_days);
+    const baseline = coverageDays !== null && coverageDays < 89.9
+      ? `${Math.floor(coverageDays)}-day / 90-day baseline`
+      : "90-day baseline";
+    detail.textContent = `Coinbase · ${Math.round(percentileValue)}th percentile · ${baseline}`;
+  } else {
+    detail.textContent = "Coinbase · 90-day baseline loading";
+  }
+}
+
 function numberOrNull(value) {
   if (value === null || value === undefined || value === "") return null;
   const number = Number(value);
@@ -825,6 +852,7 @@ function renderDashboard(data) {
   const distance = referencePrice !== null && threshold !== null ? referencePrice - threshold : null;
   $("#chart-to-beat").textContent = money(threshold);
   renderNextThresholdForecast(data);
+  renderHistoricalRealizedVolatility(btc);
   $("#btc-price").textContent = money(referencePrice);
   syncPriceMovement();
   $("#chart-now-distance").textContent = threshold === null
@@ -1900,6 +1928,7 @@ function renderLiveMarketUpdate(data) {
   $("#btc-price").textContent = money(referencePrice);
   $("#chart-to-beat").textContent = money(threshold);
   renderNextThresholdForecast(dashboard);
+  renderHistoricalRealizedVolatility(btc);
   $("#chart-now-distance").textContent = threshold === null
     ? "Waiting for threshold"
     : distance === null ? "Waiting for proxy price"

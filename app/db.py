@@ -1109,6 +1109,43 @@ MIGRATIONS: list[tuple[int, str]] = [
             ADD COLUMN source_reliable INTEGER NOT NULL DEFAULT 0;
         """,
     ),
+    (
+        28,
+        """
+        -- Coinbase candle history is a read-only volatility context.  It is
+        -- deliberately isolated from the live composite, MVI, and execution
+        -- tables so a public-history outage cannot affect trading.
+        CREATE TABLE coinbase_realized_volatility_candles (
+            source TEXT NOT NULL,
+            product TEXT NOT NULL,
+            granularity_seconds INTEGER NOT NULL,
+            minute_epoch INTEGER NOT NULL,
+            close REAL NOT NULL,
+            fetched_at TEXT NOT NULL,
+            PRIMARY KEY(source, product, granularity_seconds, minute_epoch)
+        );
+        CREATE INDEX idx_coinbase_rv_candles_range
+            ON coinbase_realized_volatility_candles(source, product, granularity_seconds, minute_epoch);
+        CREATE TABLE coinbase_realized_volatility_state (
+            version TEXT PRIMARY KEY,
+            status TEXT NOT NULL,
+            reason TEXT,
+            oldest_minute_epoch INTEGER,
+            newest_minute_epoch INTEGER,
+            target_oldest_minute_epoch INTEGER,
+            updated_at TEXT NOT NULL
+        );
+        """,
+    ),
+    (
+        29,
+        """
+        -- Durable requested-range progress prevents an empty Coinbase page
+        -- from making the historical worker retry the same range forever.
+        ALTER TABLE coinbase_realized_volatility_state ADD COLUMN backfill_cursor_epoch INTEGER;
+        ALTER TABLE coinbase_realized_volatility_state ADD COLUMN gap_json TEXT NOT NULL DEFAULT '{}';
+        """,
+    ),
 ]
 
 
