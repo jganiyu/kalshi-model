@@ -1100,6 +1100,15 @@ MIGRATIONS: list[tuple[int, str]] = [
             )
         ),
     ),
+    (
+        27,
+        """
+        -- mvi-2 writes a source-quality bit for every raw observation.  Older
+        -- mvi-1 readings remain intact and are not relabelled or recomputed.
+        ALTER TABLE margin_volatility_observations
+            ADD COLUMN source_reliable INTEGER NOT NULL DEFAULT 0;
+        """,
+    ),
 ]
 
 

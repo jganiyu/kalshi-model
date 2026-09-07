@@ -55,8 +55,9 @@ from app.services.market_data import (
     ExchangeQuote,
     live_composite_quote,
 )
-from app.services.margin_volatility import MarginVolatilityService
+from app.services.margin_volatility import MarginVolatilityService, quotes_are_fresh_and_qualified
 from app.services.paper import PaperTradingService
+from app.services.texas_breach import breach_features
 from app.services.streaming import BitcoinWebSocketFeeds, KalshiWebSocketFeed
 from app.services.training import ModelManager
 from app.services.trading import TradingCoordinator
@@ -94,6 +95,7 @@ PUBLIC_MARKET_HTTP_TIMEOUT = httpx.Timeout(
     pool=1.0,
 )
 
+
 class AnalysisEngine:
     def __init__(self, config: AppConfig, db: Database):
         self.config = config
@@ -120,6 +122,10 @@ class AnalysisEngine:
         # placeholder or a synchronous historical retraining scan.
         self._calibration_summary: dict[str, Any] = self.models.latest_calibration_summary()
         self._recent_btc_samples: list[tuple[float, float]] = []
+        # This separate in-process buffer is the only BTC history eligible for
+        # the fresh Texas breach direction diagnostic. Charts/settlement keep
+        # their broader histories; MVI persists its own source-qualified rows.
+        self._recent_qualified_btc_samples: list[tuple[float, float]] = []
         self._recent_btc_volume_points: list[tuple[float, float]] = []
         self._btc_samples_loaded = False
         self._next_threshold_forecast = NextThresholdForecast()
@@ -1255,13 +1261,15 @@ class AnalysisEngine:
                         quote.volume, quote.latency_ms,
                     ),
                 )
-        now_epoch = datetime.now(UTC).timestamp()
+        observed_time = parse_time(observed_at) or datetime.now(UTC)
+        now_epoch = observed_time.timestamp()
         recent: list[dict[str, Any]] = []
         if not self._btc_samples_loaded:
             recent = await asyncio.to_thread(
                 self.db.fetch_all,
                 """
-                SELECT observed_at, composite_price, source_json FROM btc_ticks
+                SELECT observed_at, composite_price, source_json,exchange_count,dispersion_pct
+                FROM btc_ticks
                 WHERE observed_at >= ? ORDER BY observed_at ASC
                 """,
                 ((datetime.now(UTC) - timedelta(minutes=65)).isoformat(),),
@@ -1271,6 +1279,11 @@ class AnalysisEngine:
                 for row in recent
                 if parse_time(row["observed_at"])
             ]
+            # Persisted ticks retain source-count/dispersion but not the
+            # per-venue receipt timestamps needed to certify a fresh
+            # directional window after restart.  Start that diagnostic buffer
+            # empty; live_composite_quote below admits only fresh stream data.
+            self._recent_qualified_btc_samples = []
             for row in recent:
                 try:
                     timestamp = parse_time(row["observed_at"])
@@ -1294,7 +1307,20 @@ class AnalysisEngine:
         self._recent_btc_samples = [
             (timestamp, price)
             for timestamp, price in samples
-            if latest_timestamp - timestamp <= SETTLEMENT_WINDOW_SECONDS + 5
+            if latest_timestamp - timestamp <= 65 * 60
+        ]
+        settings = self.db.settings()
+        qualified = (
+            float(composite.dispersion_pct or 0)
+            <= float(settings.get("max_exchange_dispersion_pct", 0.40))
+            and quotes_are_fresh_and_qualified(composite.quotes, observed_time, settings)
+        )
+        if qualified:
+            self._recent_qualified_btc_samples.append((now_epoch, composite.price))
+        self._recent_qualified_btc_samples = [
+            (timestamp, price)
+            for timestamp, price in self._recent_qualified_btc_samples
+            if now_epoch - timestamp <= 65 * 60
         ]
         vol_5m = realized_volatility(samples, 300)
         vol_15m = realized_volatility(samples, 900)
@@ -1720,6 +1746,9 @@ class AnalysisEngine:
             and btc_observed is not None
             and (datetime.now(UTC) - btc_observed).total_seconds()
             <= float(settings.get("max_data_age_seconds", 20))
+            and quotes_are_fresh_and_qualified(
+                list(btc.get("quotes") or []), btc_observed, settings
+            )
         )
         margin_volatility = self.margin_volatility.observe(
             observed_at=observed_at,
@@ -1728,6 +1757,18 @@ class AnalysisEngine:
             btc_proxy=float(btc["price"]),
             seconds_remaining=seconds_remaining,
             source_reliable=mvi_source_reliable,
+        )
+        texas_breach = breach_features(
+            now_timestamp=(parse_time(observed_at) or datetime.now(UTC)).timestamp(),
+            ticker=str(market["ticker"]),
+            btc_price=btc.get("price"),
+            threshold=strike,
+            seconds_remaining=seconds_remaining,
+            margin_volatility=margin_volatility,
+            source_reliable=mvi_source_reliable,
+            price_timestamp=(parse_time(btc.get("observed_at")) or datetime.now(UTC)).timestamp(),
+            max_age_seconds=float(settings.get("max_data_age_seconds", 20)),
+            samples=self._recent_qualified_btc_samples,
         )
         directional_momentum = regression_momentum(
             self._recent_btc_samples,
@@ -1789,6 +1830,7 @@ class AnalysisEngine:
             assessment["decision_confidence"] = decisions[side].confidence
             assessment["exchange_index"] = market.get("exchange_index")
             assessment["margin_volatility"] = margin_volatility
+            assessment["texas_breach_reference"] = texas_breach
         decision = decisions.get(selected_side, decisions["YES"])
         previous = self.db.fetch_one(
             "SELECT * FROM signal_snapshots WHERE ticker=? ORDER BY id DESC LIMIT 1",
@@ -1859,7 +1901,7 @@ class AnalysisEngine:
                     ticker=str(market["ticker"]),
                     assessment=assessments[side],
                     bankroll_fraction=(
-                        float(settings.get("max_risk_per_trade_pct", 0.05)) * texas_boost
+                        self.paper._texas_v2_base_allocation(settings, trading_mode) * texas_boost
                         if texas_enabled else float(decisions[side].suggested_fraction or 0.0)
                     ),
                     model_version=model_version,
@@ -1975,6 +2017,7 @@ class AnalysisEngine:
                 "trade_assessments": assessments,
                 "threshold_state": threshold_state,
                 "margin_volatility": margin_volatility,
+                "texas_breach_reference": texas_breach,
                 "directional_momentum": directional_momentum,
                 "volume_signals": volume_signals,
                 "automatic_entry": automatic_entry,
@@ -2089,7 +2132,13 @@ class AnalysisEngine:
                 decision.market_probability, decision.edge, decision.expected_value,
                 decision.suggested_fraction, decision.suggested_dollars,
                 decision.suggested_contracts, model_version,
-                json.dumps({"features": features, "selected_side": selected_side}),
+                json.dumps({
+                    "features": features,
+                    "selected_side": selected_side,
+                    "margin_volatility_version": (margin_volatility or {}).get(
+                        "calculation_version"
+                    ),
+                }),
                 json.dumps(btc), json.dumps(market), reason,
                 forecast.signal, forecast.explanation,
                 (margin_volatility or {}).get("mvi"),

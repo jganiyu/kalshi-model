@@ -598,6 +598,20 @@ class PaperTradingService:
                                 "margin_volatility_index": mvi_value,
                                 "margin_volatility_reliable": mvi_reliable,
                                 "margin_volatility_observed_at": mvi_observed_at,
+                                "margin_volatility_version": mvi_state.get("calculation_version"),
+                                "margin_cushion_ratio": mvi_state.get("cushion_ratio"),
+                                "margin_expected_remaining_move": mvi_state.get("expected_remaining_move"),
+                                "margin_raw_realized_volatility": mvi_state.get("raw_realized_volatility"),
+                                "margin_movement_intensity": mvi_state.get("movement_intensity"),
+                                "margin_reversal_component": mvi_state.get("reversal_component"),
+                                "margin_coverage": mvi_state.get("coverage"),
+                                "margin_source_reliable": bool(mvi_state.get("source_reliable")),
+                                # Diagnostic-only crossing reference.  This is
+                                # persisted with the attempt but never gates,
+                                # sizes, or authorizes a Texas entry.
+                                "texas_breach_reference": dict(
+                                    assessment.get("texas_breach_reference") or {}
+                                ),
                                 "thesis_checkpoint_seconds": TEXAS_V2_THESIS_CHECKPOINT_SECONDS,
                                 "thesis_unfavorable_distance": TEXAS_V2_THESIS_UNFAVORABLE_DISTANCE,
                                 "pre_boost_bankroll_fraction": base_allocation,

@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import asyncio
+import json
+import math
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -9,13 +12,16 @@ from app.config import AppConfig, DEFAULT_SETTINGS
 from app.db import MIGRATIONS, Database
 from app.domain import iso_now
 from app.engine import AnalysisEngine
+from app.services.market_data import CompositeQuote, ExchangeQuote
 from app.services.decision import Decision
 from app.services.forecast import make_forecast
 from app.services.margin_volatility import (
     CALCULATION_VERSION,
     MarginVolatilityService,
     cushion_metrics,
+    historical_source_reliable,
     historical_percentile_index,
+    in_mvi_bucket,
     volatility_components,
 )
 from app.services.paper import PaperTradingService
@@ -70,6 +76,164 @@ def test_contract_rollover_does_not_create_false_spike() -> None:
     )
     assert rollover["raw_score"] == pytest.approx(steady["raw_score"], rel=0.02)
     assert int(rollover["change_count"] or 0) == int(steady["change_count"] or 0) - 1
+
+
+def test_mvi_uses_qualified_contiguous_samples_and_actual_intervals() -> None:
+    start = datetime(2026, 8, 28, 12, tzinfo=UTC)
+    def points(intervals: list[float], deltas: list[float]) -> list[dict]:
+        timestamp, margin = start, 0.0
+        result = [{"observed_at": timestamp.isoformat(), "ticker": "A", "margin": margin,
+                   "source_reliable": True}]
+        for elapsed, delta in zip(intervals, deltas):
+            timestamp += timedelta(seconds=elapsed)
+            margin += delta
+            result.append({"observed_at": timestamp.isoformat(), "ticker": "A", "margin": margin,
+                           "source_reliable": True})
+        return result
+
+    # Constant velocity at irregular receipt intervals has no residual
+    # volatility after drift is estimated in dollars/second.
+    irregular = [2.0, 8.0, 3.0, 7.0] * 20
+    constant_velocity = volatility_components(points(irregular, [4.0 * dt for dt in irregular]))
+    assert float(constant_velocity["raw_realized_volatility"] or 0) < 1e-10
+    assert constant_velocity["reversal_component"] == 0
+
+    # Zero-drift ±sqrt(dt) shocks have the same innovation scale regardless
+    # of irregular spacing; this is not the vacuous zero-vs-zero case.
+    regular_intervals = [5.0] * 160
+    regular_deltas = [sign * math.sqrt(5.0) for sign in [1.0, 1.0, -1.0, -1.0] * 40]
+    irregular_intervals = [2.0, 8.0, 2.0, 8.0] * 40
+    irregular_deltas = [
+        sign * math.sqrt(dt)
+        for dt, sign in zip(irregular_intervals, [1.0, 1.0, -1.0, -1.0] * 40)
+    ]
+    regular = volatility_components(points(regular_intervals, regular_deltas))
+    sparse = volatility_components(points(irregular_intervals, irregular_deltas))
+    assert float(regular["raw_realized_volatility"] or 0) > .1
+    assert sparse["raw_realized_volatility"] == pytest.approx(
+        regular["raw_realized_volatility"], rel=.02
+    )
+
+    full = volatility_components(points([5.0] * 360, [1.0, -1.0] * 180))
+    dropout = points([5.0] * 360, [1.0, -1.0] * 180)
+    for point in dropout[100:160]:
+        point["source_reliable"] = False
+    dropped = volatility_components(dropout)
+    assert float(dropped["coverage"] or 0) < float(full["coverage"] or 0)
+    assert int(dropped["change_count"] or 0) < int(full["change_count"] or 0)
+
+    # A source gap is a hard segment boundary: do not count the sign on either
+    # side as an invented reversal.
+    a = math.sqrt(5.0)
+    segmented = points([5.0, 5.0, 20.0, 5.0, 5.0], [a, -a, 0.0, -a, a])
+    components = volatility_components(segmented)
+    assert components["reversal_comparisons"] == 2
+    assert components["reversal_count"] == 2
+
+
+def test_mvi_preserves_actual_receipt_time_and_invalidates_same_bucket_cache(
+    tmp_path: Path,
+) -> None:
+    db = make_db(tmp_path)
+    service = MarginVolatilityService(db)
+    # Simulate a previously safe result admitted in the current five-second bucket.
+    db.execute(
+        """INSERT INTO margin_volatility_observations(
+            observed_at,ticker,threshold,btc_proxy,margin,coverage,source_reliable,
+            reliable,reliability_state,calculation_version
+        ) VALUES ('2026-09-01T12:00:00.100000+00:00','A',100,101,1,1,1,1,
+                  'RELIABLE',?)""",
+        (CALCULATION_VERSION,),
+    )
+    # A later persisted row must never leak into an earlier as-of calculation.
+    db.execute(
+        """INSERT INTO margin_volatility_observations(
+            observed_at,ticker,threshold,btc_proxy,margin,coverage,source_reliable,
+            reliable,reliability_state,calculation_version
+        ) VALUES ('2026-09-01T12:01:00+00:00','FUTURE',100,101,1,1,1,1,
+                  'RELIABLE',?)""",
+        (CALCULATION_VERSION,),
+    )
+    as_of = service.observe(
+        observed_at="2026-09-01T12:00:01.500000+00:00", ticker="A", threshold=100,
+        btc_proxy=101, seconds_remaining=899, source_reliable=False,
+    )
+    assert as_of["ticker"] == "A"
+    assert as_of["reliable"] is False
+    assert service.current(as_of="2026-09-01T12:00:02+00:00") == as_of
+    service._last_observation_key = (  # type: ignore[attr-defined]
+        int(datetime(2026, 9, 1, 12, tzinfo=UTC).timestamp() // 5), "A", 100.0, True
+    )
+    degraded = service.observe(
+        observed_at="2026-09-01T12:00:01.900000+00:00", ticker="A", threshold=100,
+        btc_proxy=101, seconds_remaining=899, source_reliable=False,
+    )
+    assert degraded["reliable"] is False
+    stored = db.fetch_one(
+        "SELECT observed_at,source_reliable,reliable FROM margin_volatility_observations "
+        "WHERE calculation_version=? AND ticker='A' ORDER BY observed_at DESC LIMIT 1", (CALCULATION_VERSION,)
+    ) or {}
+    assert stored["observed_at"] == "2026-09-01T12:00:01.900000+00:00"
+    assert stored["source_reliable"] == stored["reliable"] == 0
+    # A changed market identity in that same bucket also cannot reuse A's state.
+    service.observe(
+        observed_at="2026-09-01T12:00:02.100000+00:00", ticker="B", threshold=102,
+        btc_proxy=101, seconds_remaining=898, source_reliable=True,
+    )
+    current = db.fetch_one(
+        "SELECT ticker,threshold FROM margin_volatility_observations "
+        "WHERE calculation_version=? AND ticker='B' ORDER BY observed_at DESC LIMIT 1", (CALCULATION_VERSION,)
+    )
+    assert current == {"ticker": "B", "threshold": 102.0}
+
+
+def test_mvi_same_bucket_cache_never_leaks_later_observation_to_replay(tmp_path: Path) -> None:
+    service = MarginVolatilityService(make_db(tmp_path))
+    later = service.observe(
+        observed_at="2026-09-01T12:00:04+00:00", ticker="A", threshold=100,
+        btc_proxy=101, seconds_remaining=896, source_reliable=True,
+    )
+    assert later["observed_at"] == "2026-09-01T12:00:04+00:00"
+
+    replay = service.observe(
+        observed_at="2026-09-01T12:00:02+00:00", ticker="A", threshold=100,
+        btc_proxy=101, seconds_remaining=898, source_reliable=True,
+    )
+    assert replay["observed_at"] == "2026-09-01T12:00:02+00:00"
+
+
+def test_engine_retains_real_5m_15m_and_60m_windows_after_quiet_minute(tmp_path: Path) -> None:
+    db = make_db(tmp_path)
+    engine = AnalysisEngine(AppConfig(database_path=db.path), db)
+    now = datetime.now(UTC).replace(microsecond=0)
+    engine._btc_samples_loaded = True
+    # Turbulence ended two minutes ago; a one-minute-only buffer would erase it
+    # and make every displayed horizon collapse to the quiet reading.
+    engine._recent_btc_samples = []
+    for index in range(0, 690):
+        timestamp = now - timedelta(minutes=60) + timedelta(seconds=index * 5)
+        amplitude = 200.0 if timestamp < now - timedelta(minutes=15) else 20.0
+        engine._recent_btc_samples.append(
+            (timestamp.timestamp(), 100_000.0 + (amplitude if index % 2 else -amplitude))
+        )
+    quiet_start = now - timedelta(minutes=2)
+    engine._recent_btc_samples.extend(
+        ((quiet_start + timedelta(seconds=index * 5)).timestamp(), 100_000.0)
+        for index in range(25)
+    )
+    quote = CompositeQuote(
+        price=100_000.0,
+        dispersion_pct=.01,
+        quotes=[
+            ExchangeQuote("Coinbase", 100_000.0, None, None, None, 1),
+            ExchangeQuote("Kraken", 100_000.0, None, None, None, 1),
+        ],
+        errors={},
+    )
+    state = asyncio.run(engine._save_bitcoin(quote, now.isoformat(), persist=False))
+    assert state["volatility_5m"] != state["volatility_15m"]
+    assert state["volatility_15m"] != state["volatility_60m"]
+    assert len(engine._recent_btc_samples) > 600
 
 
 def test_cushion_uses_raw_volatility_and_square_root_of_time() -> None:
@@ -180,7 +344,147 @@ def test_additive_migration_preserves_history_and_settings(tmp_path: Path) -> No
 
 def test_default_gate_is_off() -> None:
     assert DEFAULT_SETTINGS["maximum_margin_volatility"] == pytest.approx(0.0)
-    assert CALCULATION_VERSION == "mvi-1"
+    assert CALCULATION_VERSION == "mvi-2"
+
+
+def test_corrected_mvi_version_preserves_prior_readings(tmp_path: Path) -> None:
+    db = make_db(tmp_path)
+    stamp = "2026-09-01T12:00:00+00:00"
+    db.execute(
+        """INSERT INTO margin_volatility_observations(
+            observed_at,ticker,threshold,btc_proxy,margin,coverage,reliable,
+            reliability_state,calculation_version
+        ) VALUES (?, 'OLD',100,101,1,1,1,'RELIABLE','mvi-1')""",
+        (stamp,),
+    )
+    MarginVolatilityService(db).observe(
+        observed_at="2026-09-01T12:00:05+00:00", ticker="NEW", threshold=100,
+        btc_proxy=101, seconds_remaining=895, source_reliable=True,
+    )
+    preserved = db.fetch_one(
+        "SELECT ticker,calculation_version FROM margin_volatility_observations "
+        "WHERE calculation_version='mvi-1'"
+    )
+    corrected = db.fetch_one(
+        "SELECT calculation_version FROM margin_volatility_observations "
+        "WHERE calculation_version=?", (CALCULATION_VERSION,)
+    )
+    assert preserved == {"ticker": "OLD", "calculation_version": "mvi-1"}
+    assert corrected == {"calculation_version": "mvi-2"}
+
+
+def test_mvi2_backfill_rejects_persisted_ticks_without_fresh_quote_provenance(
+    tmp_path: Path,
+) -> None:
+    db = make_db(tmp_path)
+    now = datetime.now(UTC).replace(microsecond=0)
+    tick_time = now - timedelta(seconds=5)
+    db.execute(
+        """INSERT INTO markets(
+            ticker,status,strike,open_time,close_time,raw_json,first_seen_at,updated_at
+        ) VALUES ('PROVENANCE','active',100,?,?, '{}',?,?)""",
+        (
+            (now - timedelta(minutes=10)).isoformat(),
+            (now + timedelta(minutes=5)).isoformat(), now.isoformat(), now.isoformat(),
+        ),
+    )
+    stale_source = json.dumps({"quotes": [
+        {"price": 101.0, "observed_at": (tick_time - timedelta(seconds=30)).isoformat()},
+        {"price": 101.0, "observed_at": (tick_time - timedelta(seconds=30)).isoformat()},
+    ]})
+    db.execute(
+        """INSERT INTO btc_ticks(
+            observed_at,composite_price,dispersion_pct,exchange_count,source_json
+        ) VALUES (?,?,?,?,?)""",
+        (tick_time.isoformat(), 101.0, .01, 2, stale_source),
+    )
+    assert not historical_source_reliable(
+        db.fetch_one("SELECT * FROM btc_ticks") or {}, tick_time, db.settings()
+    )
+    assert MarginVolatilityService(db).backfill_recent(hours=1) == 1
+    row = db.fetch_one(
+        "SELECT source_reliable,reliable FROM margin_volatility_observations "
+        "WHERE calculation_version=?", (CALCULATION_VERSION,)
+    )
+    assert row == {"source_reliable": 0, "reliable": 0}
+
+
+def test_mvi_9_to_10_bucket_has_no_lower_score_leakage_and_counts_round_trips(
+    tmp_path: Path,
+) -> None:
+    assert in_mvi_bucket(8.99, 8)
+    assert not in_mvi_bucket(8.99, 9)
+    assert in_mvi_bucket(9.0, 9)
+    assert in_mvi_bucket(10.0, 9)
+    assert not in_mvi_bucket(0.1, 9)
+
+    db = make_db(tmp_path)
+    stamp = "2026-09-01T12:00:00+00:00"
+    # A canceled partial-fill plus retry is one completed round trip, not two.
+    for client_order_id, mvi in (("entry-a", 9.5), ("entry-retry", 1.0)):
+        db.execute(
+            """INSERT INTO broker_order_intents(
+                mode,client_order_id,ticker,side,action,requested_contracts,limit_price,
+                    status,strategy,source,created_at,updated_at,margin_volatility_index,
+                    decision_snapshot_json
+                ) VALUES ('LIVE',?,'ROUND','YES','BUY',1,.5,?,
+                          'TEXAS_HOLDEM_2_0','automatic',?,?,?,
+                          '{"margin_volatility_version":"mvi-2"}')""",
+            (client_order_id, "CANCELED" if client_order_id == "entry-a" else "FILLED", stamp, stamp, mvi),
+        )
+    db.execute(
+        """INSERT INTO broker_fills(
+            mode,fill_id,client_order_id,ticker,side,action,contracts,price,strategy,source,filled_at
+        ) VALUES ('LIVE','fill-a','entry-a','ROUND','YES','BUY',1,.5,
+                  'TEXAS_HOLDEM_2_0','automatic',?)""",
+        (stamp,),
+    )
+    db.execute(
+        """INSERT INTO broker_fills(
+            mode,fill_id,client_order_id,ticker,side,action,contracts,price,strategy,source,filled_at
+        ) VALUES ('LIVE','exit-a','exit-a','ROUND','YES','SELL',1,.7,
+                  'TEXAS_HOLDEM_2_0','texas_phase_exit',?)""",
+        (stamp,),
+    )
+    # Same ticker/side alone is not enough: this manual round has no matching
+    # automatic client/exchange order and must never borrow MVI evidence.
+    db.execute(
+        """INSERT INTO broker_fills(
+            mode,fill_id,ticker,side,action,contracts,price,strategy,source,filled_at
+        ) VALUES
+          ('LIVE','manual-buy','MANUAL','YES','BUY',1,.5,'MANUAL','manual',?),
+          ('LIVE','manual-sell','MANUAL','YES','SELL',1,.7,'MANUAL','manual',?)""",
+        (stamp, stamp),
+    )
+    # A complete old-version automatic trade remains durable history but is
+    # excluded from mvi-2 readiness rather than inflating the new estimator.
+    db.execute(
+        """INSERT INTO broker_order_intents(
+            mode,client_order_id,ticker,side,action,requested_contracts,limit_price,
+            status,strategy,source,created_at,updated_at,margin_volatility_index,
+            decision_snapshot_json
+        ) VALUES ('LIVE','old-entry','OLD','YES','BUY',1,.5,'FILLED',
+                  'TEXAS_HOLDEM','automatic',?,?,8.0,
+                  '{"margin_volatility_version":"mvi-1"}')""",
+        (stamp, stamp),
+    )
+    db.execute(
+        """INSERT INTO broker_fills(
+            mode,fill_id,client_order_id,ticker,side,action,contracts,price,strategy,source,filled_at
+        ) VALUES
+          ('LIVE','old-buy','old-entry','OLD','YES','BUY',1,.5,'TEXAS_HOLDEM','automatic',?),
+          ('LIVE','old-sell','old-exit','OLD','YES','SELL',1,.7,'TEXAS_HOLDEM','texas_phase_exit',?)""",
+        (stamp, stamp),
+    )
+    report = MarginVolatilityService(db).report("LIVE")
+    assert report["entries"] == report["completed_round_trips"] == 1
+    assert report["settled_entries"] == 0
+    assert report["buckets"][9]["entries"] == 1
+    assert report["buckets"][9]["net_profitable_round_trips"] == 1
+    assert report["buckets"][9]["settled"] == 0
+    assert report["buckets"][1]["entries"] == 0
+    assert report["buckets"][9]["realized_pnl"] == pytest.approx(.2)
+    assert "Texas Hold’em 2.0's separate lower MVI gate" in report["guidance"]
 
 
 @pytest.mark.parametrize("mode", ["PAPER", "DEMO", "LIVE"])

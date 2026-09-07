@@ -263,7 +263,11 @@ def test_texas_v2_requires_reliable_mvi_on_each_entry_attempt(tmp_path: Path) ->
     assert unavailable["attempt_count"] == 0
     assert "fresh reliable MVI" in unavailable["blocker"]
     quotes["NO"]["margin_volatility"] = {
-        "mvi": 8.0, "reliable": True, "observed_at": "2026-09-01T12:00:00+00:00"
+        "mvi": 8.0, "reliable": True, "observed_at": "2026-09-01T12:00:00+00:00",
+        "calculation_version": "mvi-2", "cushion_ratio": 1.25,
+        "expected_remaining_move": 20.0, "raw_realized_volatility": 2.0,
+        "movement_intensity": 2.0, "reversal_component": .5, "coverage": .9,
+        "source_reliable": True,
     }
     admitted = run_strategy(
         service, quotes, margin=25.0, observed_at="2026-09-01T12:00:03+00:00"
@@ -271,6 +275,8 @@ def test_texas_v2_requires_reliable_mvi_on_each_entry_attempt(tmp_path: Path) ->
     assert admitted["attempt_count"] == 1
     evidence = db.fetch_one("SELECT evidence_json FROM texas_holdem_attempts WHERE attempt_number=1")
     assert '"mvi_minimum": 4.0' in str(evidence["evidence_json"])
+    assert '"margin_cushion_ratio": 1.25' in str(evidence["evidence_json"])
+    assert '"margin_volatility_version": "mvi-2"' in str(evidence["evidence_json"])
 
 
 def test_texas_v2_mvi_gate_boost_and_mode_isolation(tmp_path: Path) -> None:
