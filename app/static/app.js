@@ -2692,10 +2692,14 @@ async function loadPaper() {
     ? "Paper is ready. No exchange order is placed."
     : readiness.connection_diagnostic
       ? `${readiness.connection_diagnostic} · retrying safely.`
-    : protectiveExit.degraded && protectiveExit.ready
+    : protectiveExit.degraded && protectiveExit.ready && data.protection_monitor?.healthy
       ? "Entries paused for reconciliation; confirmed reduce-only protective exits remain active."
       : readiness.blocker || `${modeLabel(mode)} is reconciled and ${readiness.session_armed ? "armed" : "disarmed"}.`;
   $("#trading-command-status").classList.toggle("blocked", mode !== "PAPER" && !readiness.ready_for_manual);
+  if (mode !== "PAPER" && data.protection_monitor?.open_positions) {
+    $("#trading-command-status").textContent += ` · ${data.protection_monitor.status}.`;
+    $("#trading-command-status").classList.toggle("blocked", !data.protection_monitor.healthy || !readiness.ready_for_manual);
+  }
   if (readiness.session_armed || state.trading.armConfirmation.mode !== mode) {
     clearTimeout(state.trading.armConfirmation.timer);
     state.trading.armConfirmation.mode = null;

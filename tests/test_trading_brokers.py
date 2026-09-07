@@ -2498,7 +2498,7 @@ async def test_fresh_live_book_exit_lane_is_coalesced_and_mode_isolated(
     seen: list[tuple[str, str]] = []
 
     async def slow_exits(broker, current: dict[str, object]) -> None:
-        seen.append((broker.mode, str(current["ticker"])))
+        seen.append((broker.mode, str(current["frame"])))
         started.set()
         await release.wait()
 
@@ -2506,10 +2506,10 @@ async def test_fresh_live_book_exit_lane_is_coalesced_and_mode_isolated(
     # The fallback has a Live book.  Paper is intentionally ignored rather
     # than leaking that quote into a different execution environment.
     coordinator.schedule_protective_exits("PAPER", {"ticker": "never"})
-    coordinator.schedule_protective_exits("LIVE", {"ticker": "first"})
+    coordinator.schedule_protective_exits("LIVE", {"ticker": "HELD", "frame": "first"})
     await started.wait()
-    coordinator.schedule_protective_exits("LIVE", {"ticker": "stale"})
-    coordinator.schedule_protective_exits("LIVE", {"ticker": "latest"})
+    coordinator.schedule_protective_exits("LIVE", {"ticker": "HELD", "frame": "stale"})
+    coordinator.schedule_protective_exits("LIVE", {"ticker": "HELD", "frame": "latest"})
     release.set()
     task = coordinator._protective_exit_tasks["LIVE"]
     await task

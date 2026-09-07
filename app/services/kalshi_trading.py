@@ -30,6 +30,22 @@ ACCOUNT_READ_TIMEOUT = httpx.Timeout(15.0, connect=5.0, write=8.0, pool=5.0)
 
 
 @dataclass(frozen=True)
+class RequestBudget:
+    admission: float
+    total: float
+
+
+EXECUTION_BUDGET = RequestBudget(admission=0.5, total=5.0)
+RECOVERY_BUDGET = RequestBudget(admission=1.0, total=8.0)
+BACKGROUND_BUDGET = RequestBudget(admission=2.0, total=20.0)
+FAST_RECOVERY_BUDGET = RequestBudget(admission=0.25, total=1.75)
+
+
+class _AdmissionTimeout(TimeoutError):
+    """The request never acquired a slot and cannot have been sent."""
+
+
+@dataclass(frozen=True)
 class _QueuedRequest:
     priority: int
     sequence: int
@@ -38,8 +54,8 @@ class _QueuedRequest:
 class AuthenticatedRequestController:
     """Small per-account traffic controller for authenticated Kalshi REST.
 
-    It deliberately limits background account scans to one in flight while
-    reserving a second connection for an order or targeted recovery.  This
+    It limits background account scans to one in flight and reserves one
+    slot exclusively for execution, even during targeted recovery bursts. This
     prevents a reconciliation burst from consuming every fresh HTTPS
     connection when the network is degraded.
     """
@@ -48,36 +64,54 @@ class AuthenticatedRequestController:
     RECOVERY = 1
     BACKGROUND = 10
 
-    def __init__(self, *, max_in_flight: int = 2) -> None:
+    def __init__(self, *, max_in_flight: int = 3) -> None:
         self._max_in_flight = max(1, max_in_flight)
         self._condition = asyncio.Condition()
         self._queued: list[_QueuedRequest] = []
         self._sequence = 0
         self._in_flight = 0
         self._background_in_flight = 0
+        self._nonexecution_in_flight = 0
+
+    def budget(self, priority: int) -> RequestBudget:
+        if priority == self.EXECUTION:
+            return EXECUTION_BUDGET
+        return RECOVERY_BUDGET if priority < self.BACKGROUND else BACKGROUND_BUDGET
 
     async def run(
         self,
         priority: int,
         operation: Callable[[], Awaitable[Any]],
+        *,
+        admission_timeout: float | None = None,
     ) -> Any:
         async with self._condition:
             ticket = _QueuedRequest(priority, self._sequence)
             self._sequence += 1
             self._queued.append(ticket)
             try:
-                while not self._may_start(ticket):
-                    await self._condition.wait()
-            except asyncio.CancelledError:
+                async with asyncio.timeout(
+                    self.budget(priority).admission
+                    if admission_timeout is None else admission_timeout
+                ):
+                    while not self._may_start(ticket):
+                        await self._condition.wait()
+            except BaseException as exc:
                 # A canceled reconciliation page must not remain at the head
                 # of the queue and block the next protective request.
                 self._queued.remove(ticket)
                 self._condition.notify_all()
+                if isinstance(exc, TimeoutError):
+                    raise _AdmissionTimeout("Authenticated request queue expired.") from exc
                 raise
             self._queued.remove(ticket)
             self._in_flight += 1
             if priority >= self.BACKGROUND:
                 self._background_in_flight += 1
+            if priority != self.EXECUTION:
+                self._nonexecution_in_flight += 1
+            # Other eligible tickets may use a different lane immediately.
+            self._condition.notify_all()
         try:
             return await operation()
         finally:
@@ -85,6 +119,8 @@ class AuthenticatedRequestController:
                 self._in_flight -= 1
                 if priority >= self.BACKGROUND:
                     self._background_in_flight -= 1
+                if priority != self.EXECUTION:
+                    self._nonexecution_in_flight -= 1
                 self._condition.notify_all()
 
     def _may_start(self, ticket: _QueuedRequest) -> bool:
@@ -94,7 +130,12 @@ class AuthenticatedRequestController:
             return False
         if self._in_flight >= self._max_in_flight:
             return False
-        # Keep one connection available for an execution or targeted recovery.
+        # A single-slot controller is explicitly serial. Otherwise recovery
+        # and background together must leave one slot for execution.
+        if ticket.priority != self.EXECUTION and self._nonexecution_in_flight >= max(
+            1, self._max_in_flight - 1
+        ):
+            return False
         return ticket.priority < self.BACKGROUND or self._background_in_flight == 0
 
 
@@ -292,6 +333,7 @@ class KalshiTradingClient:
         submission: bool = False,
         priority: int | None = None,
         timeout: httpx.Timeout | None = None,
+        budget: RequestBudget | None = None,
     ) -> dict[str, Any]:
         signing_path = f"{self.api_prefix}{path}"
         started_at = time.monotonic()
@@ -305,10 +347,22 @@ class KalshiTradingClient:
             if submission
             else self._requests.BACKGROUND if priority is None else priority
         )
+        request_budget = budget or self._requests.budget(request_priority)
+        deadline = asyncio.get_running_loop().time() + request_budget.total
+
+        async def retry_pause(delay: float) -> None:
+            # Retry backoff and Retry-After consume the same end-to-end budget
+            # as queueing and wire time; they never start another full budget.
+            remaining = max(0.0, deadline - asyncio.get_running_loop().time())
+            await asyncio.sleep(min(delay, remaining))
+
         for attempt in range(retries + 1):
+            attempt_started_at = time.monotonic()
+            slot_acquired_at: float | None = None
+            dispatched_at: float | None = None
             try:
-                slot_acquired_at: float | None = None
-                dispatched_at: float | None = None
+                if asyncio.get_running_loop().time() >= deadline:
+                    raise TimeoutError("Authenticated request deadline expired.")
                 request_args: dict[str, Any] = {
                     "params": params,
                     "json": json,
@@ -325,6 +379,8 @@ class KalshiTradingClient:
                     request_args["headers"] = signed_headers(
                         self.key_id, self.private_key_path, method, signing_path
                     )
+                    if asyncio.get_running_loop().time() >= deadline:
+                        raise TimeoutError("Authenticated request deadline expired before dispatch.")
                     dispatched_at = time.monotonic()
                     return await self.client.request(
                         method,
@@ -332,16 +388,25 @@ class KalshiTradingClient:
                         **request_args,
                     )
 
-                response = await self._requests.run(request_priority, send)
-            except (httpx.TimeoutException, httpx.NetworkError) as exc:
-                failure_kind = _transport_failure_kind(exc)
+                async with asyncio.timeout_at(deadline):
+                    response = await self._requests.run(
+                        request_priority, send,
+                        admission_timeout=request_budget.admission,
+                    )
+            except (httpx.TransportError, TimeoutError) as exc:
+                deadline_expired = isinstance(exc, TimeoutError)
+                failure_kind = (
+                    "admission_timeout" if isinstance(exc, _AdmissionTimeout)
+                    else "deadline_exceeded" if deadline_expired
+                    else _transport_failure_kind(exc)
+                )
                 request_detail = {
                     "failure_kind": failure_kind,
                     "transport_error_type": type(exc).__name__,
                     "method": method,
                     "path": path,
                     "attempts": attempt + 1,
-                    "queue_wait_ms": round(((slot_acquired_at or time.monotonic()) - started_at) * 1000),
+                    "queue_wait_ms": round(((slot_acquired_at or time.monotonic()) - attempt_started_at) * 1000),
                     "signing_ms": (
                         round((dispatched_at - slot_acquired_at) * 1000)
                         if dispatched_at is not None and slot_acquired_at is not None else None
@@ -353,20 +418,21 @@ class KalshiTradingClient:
                     "connection_reuse": connection_reuse,
                     "elapsed_ms": round((time.monotonic() - started_at) * 1000),
                 }
-                if submission:
+                if submission and dispatched_at is not None:
                     raise AmbiguousSubmissionError(
                         "Order submission timed out; checking its exchange state before retrying.",
                         details=request_detail,
                         transport=True,
                     ) from exc
-                if attempt >= retries:
+                if deadline_expired or attempt >= retries:
                     raise KalshiTradingError(
-                        f"Kalshi {failure_kind} while reading {path}.",
+                        f"Kalshi {failure_kind} while {'reading' if method == 'GET' else 'requesting'} {path}.",
+                        code=failure_kind if deadline_expired else None,
                         details=request_detail,
-                        transport=True,
+                        transport=dispatched_at is not None,
                     ) from exc
                 base_delay = min(4.0, 0.5 * (2**attempt))
-                await asyncio.sleep(base_delay + random.uniform(0, base_delay * 0.2))
+                await retry_pause(base_delay + random.uniform(0, base_delay * 0.2))
                 continue
             if response.status_code == 429 and attempt < retries:
                 retry_after = response.headers.get("Retry-After")
@@ -374,17 +440,27 @@ class KalshiTradingClient:
                     delay = min(10.0, max(0.25, float(retry_after or 0)))
                 except ValueError:
                     delay = min(4.0, 0.5 * (2**attempt))
-                await asyncio.sleep(delay + random.uniform(0, delay * 0.2))
+                await retry_pause(delay + random.uniform(0, delay * 0.2))
                 continue
             if response.is_success:
-                return response.json() if response.content else {}
+                try:
+                    payload = response.json() if response.content else {}
+                    if submission and not isinstance(payload, dict):
+                        raise ValueError("Submission response must be an object.")
+                    return payload
+                except ValueError as exc:
+                    if submission:
+                        raise AmbiguousSubmissionError(
+                            "Kalshi accepted the request but returned an unreadable submission result; reconciliation is required."
+                        ) from exc
+                    raise
             try:
                 payload = response.json()
             except ValueError:
                 payload = {}
             error_payload = payload.get("error") if isinstance(payload, dict) else None
             if not isinstance(error_payload, dict):
-                error_payload = payload
+                error_payload = payload if isinstance(payload, dict) else {}
             code = str(error_payload.get("code") or "") or None
             remote_message = str(error_payload.get("message") or "")
             details = error_payload.get("details")
@@ -482,7 +558,7 @@ class KalshiTradingClient:
             params["cursor"] = cursor
         return await self._all_pages(
             "/portfolio/orders", "orders", params=params,
-            priority=self._requests.RECOVERY if (ticker or status) else None,
+            priority=self._requests.RECOVERY if ticker else None,
         )
 
     async def fills(self, *, cursor: str | None = None) -> dict[str, Any]:
@@ -526,10 +602,11 @@ class KalshiTradingClient:
                 retries=0 if fast else 2,
                 timeout=(httpx.Timeout(1.25, connect=0.5, write=0.75, pool=0.5)
                          if fast else None),
+                budget=FAST_RECOVERY_BUDGET if fast else None,
             )
         else:
             payload = await self._all_pages(
-                "/portfolio/orders", "orders", priority=self._requests.RECOVERY
+                "/portfolio/orders", "orders"
             )
         for order in payload.get("orders", []):
             if str(order.get("client_order_id") or "") == client_order_id:
@@ -543,6 +620,7 @@ class KalshiTradingClient:
             priority=self._requests.RECOVERY, retries=0 if fast else 2,
             timeout=(httpx.Timeout(1.25, connect=0.5, write=0.75, pool=0.5)
                      if fast else None),
+            budget=FAST_RECOVERY_BUDGET if fast else None,
         )
 
     async def order(self, order_id: str) -> dict[str, Any] | None:

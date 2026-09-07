@@ -354,10 +354,9 @@ class KalshiWebSocketFeed:
                     }
                 )
             )
-            await self.on_status("Kalshi", True, None)
             book = KalshiOrderBook()
             last_sequence: int | None = None
-            last_book_emit = 0.0
+            has_snapshot = False
             last_message_at = time.monotonic()
             while self.ticker() == ticker:
                 try:
@@ -374,7 +373,11 @@ class KalshiWebSocketFeed:
                 last_message_at = time.monotonic()
                 message = json.loads(raw)
                 message_type = message.get("type")
+                if message_type == "error":
+                    raise RuntimeError("Kalshi market subscription rejected")
                 if message_type in {"orderbook_snapshot", "orderbook_delta"}:
+                    if message_type == "orderbook_delta" and not has_snapshot:
+                        raise RuntimeError("Kalshi book delta arrived before its initial snapshot")
                     sequence = message.get("seq")
                     if (
                         message_type == "orderbook_delta"
@@ -385,10 +388,14 @@ class KalshiWebSocketFeed:
                     if isinstance(sequence, int):
                         last_sequence = sequence
                     book.apply(message, calculate_metrics=False)
-                    now = time.monotonic()
-                    if message_type == "orderbook_snapshot" or now - last_book_emit >= 0.1:
-                        await self.on_message(message, book.metrics())
-                        last_book_emit = now
+                    if message_type == "orderbook_snapshot" and not has_snapshot:
+                        has_snapshot = True
+                        await self.on_status("Kalshi", True, None)
+                    # Evaluate every executable book change. Rendering is
+                    # coalesced downstream; suppressing this event could hide
+                    # a brief target crossing or the final update of a burst.
+                    await self.on_message(message, book.metrics())
+                    await asyncio.sleep(0)
                 elif message_type == "ticker":
                     await self.on_message(message, None)
                 elif message_type in {"market_lifecycle", "market_lifecycle_v2"}:

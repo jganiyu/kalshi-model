@@ -138,6 +138,8 @@ class AnalysisEngine:
         self._stream_tasks: list[asyncio.Task[None]] = []
         self._kalshi_stream_task: asyncio.Task[None] | None = None
         self._kalshi_book_fallback_task: asyncio.Task[None] | None = None
+        self._position_book_tasks: list[asyncio.Task[None]] = []
+        self._book_persist_task: asyncio.Task[None] | None = None
         self._subscribers: set[asyncio.Queue[None]] = set()
         self._publish_task: asyncio.Task[None] | None = None
         self._trade_review_task: asyncio.Task[None] | None = None
@@ -214,6 +216,10 @@ class AnalysisEngine:
         self._kalshi_book_fallback_task = asyncio.create_task(
             self._run_kalshi_book_fallback()
         )
+        self._position_book_tasks = [
+            asyncio.create_task(self._run_position_book_recovery(mode))
+            for mode in ("DEMO", "LIVE")
+        ]
         # Historical bootstrap can read a large local archive.  It is manual
         # work, never a startup prerequisite for live connectivity.
         self.dashboard["bootstrap"] = {
@@ -235,6 +241,8 @@ class AnalysisEngine:
             self._volume_flush_task,
             self._kalshi_stream_task,
             self._kalshi_book_fallback_task,
+            self._book_persist_task,
+            *self._position_book_tasks,
             *self._stream_tasks,
         ) if task]
         for task in tasks:
@@ -359,7 +367,8 @@ class AnalysisEngine:
         current_payload = None
         notification = None
 
-        if current_market and btc_state.get("price") and market_strike(current_market):
+        if (current_market and btc_state.get("price") and market_strike(current_market)
+                and parse_time(current_market.get("close_time"))):
             ticker = str(current_market["ticker"])
             self._save_market(current_market, observed_at)
             self._record_threshold_observation(
@@ -412,6 +421,8 @@ class AnalysisEngine:
             reason = (
                 "The contract threshold is missing from the Kalshi response."
                 if not market_strike(current_market)
+                else "The contract clock is missing from the Kalshi response."
+                if not parse_time(current_market.get("close_time"))
                 else "Fewer than two reliable BTC exchange feeds are available."
             )
             current_payload = self._unreliable_current(
@@ -623,6 +634,7 @@ class AnalysisEngine:
             "poll_seconds": self.config.poll_seconds,
             "live_update_seconds": self.config.live_update_seconds,
             "read_only": True,
+            "protection": self.trading.protection_health(),
             "streams": {
                 "bitcoin": {
                     "connected": bool(bitcoin_sources),
@@ -746,40 +758,108 @@ class AnalysisEngine:
         payload = message.get("msg") or {}
         if payload.get("market_ticker") != self._current_market.get("ticker"):
             return
-        async with self._update_lock:
-            for key in (
-                "yes_bid_dollars",
-                "yes_ask_dollars",
-                "yes_bid_size_fp",
-                "yes_ask_size_fp",
-                "volume_fp",
-                "open_interest_fp",
-            ):
-                if payload.get(key) is not None:
-                    self._current_market[key] = payload[key]
-            if book_metrics is not None:
-                self._last_kalshi_ws_book = time.monotonic()
-                now = time.monotonic()
-                persist = now - self._last_kalshi_persist >= 1.0
-                book_payload = {
-                    "orderbook_fp": {
-                        "yes_dollars": book_metrics["yes_bids"],
-                        "no_dollars": book_metrics["no_bids"],
-                    }
-                }
-                self._market_state = self._save_kalshi_snapshot(
-                    self._current_market,
-                    book_payload,
-                    iso_now(),
-                    persist=persist,
+        received_at = iso_now()
+        if book_metrics is not None:
+            # Protection receives a real book before awaiting the analysis/UI
+            # lock or any archive write. Summary ticker messages aren't books.
+            book_payload = {"orderbook_fp": {
+                "yes_dollars": book_metrics["yes_bids"],
+                "no_dollars": book_metrics["no_bids"],
+            }}
+            state = self._save_kalshi_snapshot(
+                self._current_market, book_payload, received_at,
+                persist=False, allow_summary_fallback=False,
+            )
+            self._schedule_book_protection("LIVE", self._current_market, state)
+        # These assignments contain no await and run on the owning loop. Do
+        # not queue socket reception behind a BTC/history/UI lock.
+        for key in ("yes_bid_dollars", "yes_ask_dollars", "yes_bid_size_fp",
+                    "yes_ask_size_fp", "volume_fp", "open_interest_fp"):
+            if payload.get(key) is not None:
+                self._current_market[key] = payload[key]
+        if book_metrics is not None:
+            self._last_kalshi_ws_book = time.monotonic()
+            self._market_state = state
+            now = time.monotonic()
+            persist_task = getattr(self, "_book_persist_task", None)
+            if now - self._last_kalshi_persist >= 1.0 and (not persist_task or persist_task.done()):
+                self._last_kalshi_persist = now
+                self._book_persist_task = asyncio.create_task(
+                    self._persist_received_book(dict(self._current_market), book_payload, received_at)
                 )
-                if persist:
-                    self._last_kalshi_persist = now
-            elif message.get("type") == "ticker":
-                self._market_state = self._ticker_market_state(
-                    self._current_market, self._market_state
-                )
+        elif message_type == "ticker":
+            self._market_state = self._ticker_market_state(self._current_market, self._market_state)
         self._schedule_live_refresh()
+
+    async def _persist_received_book(
+        self, market: dict[str, Any], payload: dict[str, Any], received_at: str
+    ) -> None:
+        try:
+            await asyncio.to_thread(
+                self._save_kalshi_snapshot, market, payload, received_at,
+                allow_summary_fallback=False,
+            )
+        except Exception:
+            logger.exception("Kalshi book archive write failed")
+
+    def _schedule_book_protection(
+        self, mode: str, market: dict[str, Any], state: dict[str, Any]
+    ) -> None:
+        """Build an execution frame from market facts, never from UI readiness."""
+        prior = self.dashboard.get("current") or {}
+        if prior.get("ticker") != market.get("ticker") or prior.get("execution_market_mode") != mode:
+            prior = {}
+        current = {**prior, **(self._market_summary(market) or {}), **state}
+        # During lifecycle handoff, retain a known clock for this same market.
+        close_time = market.get("close_time") or prior.get("close_time")
+        close = parse_time(close_time)
+        current.update({
+            "execution_market_mode": mode,
+            "close_time": close_time,
+            "time_remaining_seconds": max(0.0, close.timestamp() - time.time()) if close else None,
+            "status": market.get("status") or prior.get("status"),
+        })
+        btc = getattr(self, "_latest_btc", None) or {}
+        current["btc_proxy"] = btc.get("price")
+        current["btc_state"] = dict(btc)
+        current["btc_observed_at"] = btc.get("observed_at")
+        texas = current.get("texas_holdem")
+        if isinstance(texas, dict):
+            current["texas_holdem"] = {
+                **texas, "executable_bid": state.get(f"{str(texas.get('side') or '').lower()}_bid"),
+            }
+        # Price targets need only this book. BTC-triggered rules still require
+        # the separate quality/freshness evidence from analysis.
+        current.setdefault("data_quality", {"reliable": False})
+        self.trading.schedule_protective_exits(mode, current)
+
+    async def _run_position_book_recovery(self, mode: str) -> None:
+        """Keep held markets covered even when the user views another mode."""
+        while not self._stopping.is_set():
+            try:
+                broker = self.trading.brokers[mode]
+                client = self.kalshi_demo if mode == "DEMO" else self.kalshi
+                if isinstance(broker, KalshiBroker) and broker.session_armed and client:
+                    positions = await asyncio.to_thread(broker.open_positions)
+                    for ticker in dict.fromkeys(str(row["ticker"]) for row in positions):
+                        cached = self.trading.protective_snapshot(mode, ticker)
+                        quote_at = parse_time(cached.get("executable_quote_at"))
+                        if quote_at and time.time() - quote_at.timestamp() < 1.0:
+                            continue
+                        market = self._current_market
+                        if mode == "DEMO" or not market or market.get("ticker") != ticker:
+                            market = await client.market(ticker)
+                        payload = await client.fallback_orderbook(ticker)
+                        state = self._save_kalshi_snapshot(
+                            market, payload, iso_now(), persist=False,
+                            allow_summary_fallback=False,
+                        )
+                        self._schedule_book_protection(mode, market, state)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning("%s position book recovery failed: %s", mode, type(exc).__name__)
+            await asyncio.sleep(1.0)
 
     def _kalshi_book_needs_fallback(self) -> bool:
         """A connected socket is not proof that its book is still moving."""
@@ -841,6 +921,14 @@ class AnalysisEngine:
         receive_ms: float,
     ) -> None:
         """Apply a REST book only when it still belongs to the active ticker."""
+        immediate_market = self._current_market
+        if (not immediate_market or immediate_market.get("ticker") != ticker
+                or not self._kalshi_book_needs_fallback()):
+            return
+        immediate_state = self._save_kalshi_snapshot(
+            immediate_market, payload, received_at, persist=False, allow_summary_fallback=False
+        )
+        self._schedule_book_protection("LIVE", immediate_market, immediate_state)
         applied_started = time.monotonic()
         protective_current: dict[str, Any] | None = None
         async with self._update_lock:
@@ -850,7 +938,9 @@ class AnalysisEngine:
             # Do not overwrite a newer websocket book received in flight.
             if not self._kalshi_book_needs_fallback():
                 return
-            state = self._save_kalshi_snapshot(market, payload, received_at, persist=False)
+            state = self._save_kalshi_snapshot(
+                market, payload, received_at, persist=False, allow_summary_fallback=False
+            )
             state.update({
                 "quote_source": "REST_FALLBACK",
                 "received_at": received_at,
@@ -904,8 +994,8 @@ class AnalysisEngine:
             fallback.pop("error", None)
         fallback["published_at"] = iso_now()
         self._schedule_publish()
-        if protective_current is not None:
-            self.trading.schedule_protective_exits("LIVE", protective_current)
+        # Live holdings remain protected even when the Dashboard shows Demo
+        # or has not hydrated a strategy/forecast frame yet.
 
     async def _handle_market_lifecycle(self, message: dict[str, Any]) -> None:
         payload = message.get("msg") or {}
@@ -1044,6 +1134,7 @@ class AnalysisEngine:
         # the REST poll has a complete, matching market again.
         if (
             market_strike(self._current_market) is None
+            or parse_time(self._current_market.get("close_time")) is None
             or self._latest_btc.get("price") is None
             or self._market_state.get("ticker") != self._current_market.get("ticker")
         ):
@@ -1151,9 +1242,9 @@ class AnalysisEngine:
                 "errors": composite.errors,
             }
         if persist:
-            self.volume_signals.audit_cumulative(composite, observed_at)
+            await asyncio.to_thread(self.volume_signals.audit_cumulative, composite, observed_at)
             for quote in composite.quotes:
-                self.db.execute(
+                await asyncio.to_thread(self.db.execute,
                     """
                     INSERT INTO exchange_quotes(
                         observed_at,exchange,price,bid,ask,volume,latency_ms
@@ -1234,7 +1325,7 @@ class AnalysisEngine:
                 volume_acceleration = second_rate - first_rate
         source = composite.as_dict()
         if persist:
-            self.db.execute(
+            await asyncio.to_thread(self.db.execute,
                 """
                 INSERT INTO btc_ticks(
                     observed_at,composite_price,dispersion_pct,exchange_count,
@@ -1599,7 +1690,7 @@ class AnalysisEngine:
         calibration = self.calibration_summary()
         trading_mode = self.trading.selected_mode
         trade_market_state = execution_market_state or market_state
-        portfolio = self.trading.broker(trading_mode).portfolio()
+        portfolio = self.trading.broker(trading_mode).execution_portfolio()
         selected_side = str(settings.get("selected_side", "YES"))
         held_by_side = {
             side: sum(

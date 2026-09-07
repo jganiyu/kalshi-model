@@ -683,7 +683,7 @@ class PaperTradingService:
             )
         side_assessment = assessments.get(side) if side else None
         bid = ((side_assessment or {}).get("sell") or {}).get("raw_price")
-        active_target = targets[str(phase["key"]).lower()]
+        active_target = targets.get(str(phase["key"]).lower())
         scheduled_pass = self._scheduled_texas_holdem_pass(mode, ticker)
         latest_attempt = self.db.fetch_one(
             """SELECT evidence_json FROM texas_holdem_attempts

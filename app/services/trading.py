@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import math
 import random
 import secrets
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -21,6 +23,7 @@ from app.domain import (
     parse_time,
     threshold_breach_exit_state,
     texas_holdem_exit_reason,
+    texas_holdem_phase,
 )
 from app.services.broker import (
     fill_aggregate,
@@ -44,6 +47,7 @@ from app.services.streaming import KalshiPrivateWebSocketFeed
 
 
 _USE_DEFAULT_STOP = object()
+logger = logging.getLogger(__name__)
 _MARKET_STYLE_EXIT_FLOOR = 0.0001
 
 
@@ -80,7 +84,7 @@ def manual_market_quality(
 def protective_exit_reason(
     position: dict[str, Any],
     bid: float,
-    seconds_remaining: float,
+    seconds_remaining: float | None,
     settings: dict[str, Any],
     *,
     btc_proxy: float | None = None,
@@ -92,6 +96,8 @@ def protective_exit_reason(
     ):
         return "GLOBAL_PROFIT_TAKE", 0
     if _is_texas_position(position):
+        if seconds_remaining is None or not math.isfinite(seconds_remaining):
+            return None, None
         texas_reason, _ = texas_holdem_exit_reason(bid, seconds_remaining, settings)
         if texas_reason:
             return texas_reason, 0
@@ -124,6 +130,7 @@ def protective_exit_reason(
         position.get("strategy") == "SWING"
         and position.get("fallback_exit_mode") == "Exit"
         and position.get("fallback_exit_seconds") is not None
+        and seconds_remaining is not None
         and seconds_remaining <= float(position["fallback_exit_seconds"])
     ):
         return "SWING_FALLBACK", 3
@@ -171,8 +178,18 @@ class TradingCoordinator:
         # check even while the slower analysis/entry pass is busy.  Keep this
         # lane per exchange environment: the live public book must never be
         # repurposed as a Demo or Paper execution quote.
-        self._latest_protective_current: dict[str, dict[str, Any]] = {}
+        self._latest_protective_current: dict[str, dict[str, list[dict[str, Any]]]] = {}
         self._protective_exit_tasks: dict[str, asyncio.Task[None]] = {}
+        self._exit_evaluation_locks = {mode: asyncio.Lock() for mode in ("DEMO", "LIVE")}
+        self._exit_executors = {
+            mode: ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"{mode.lower()}-protection")
+            for mode in ("DEMO", "LIVE")
+        }
+        self._protective_snapshots: dict[str, dict[str, dict[str, Any]]] = {}
+        self._protection_evaluated: dict[tuple[str, str], float] = {}
+        self._protection_health: dict[str, dict[str, Any]] = {}
+        self._protection_watchdog_task: asyncio.Task[None] | None = None
+        self._protection_stopping = False
 
     @property
     def selected_mode(self) -> str:
@@ -182,6 +199,12 @@ class TradingCoordinator:
         return self.brokers[normalize_mode(mode or self.selected_mode)]
 
     async def start(self, http: httpx.AsyncClient) -> None:
+        self._protection_stopping = False
+        if not self._exit_executors:
+            self._exit_executors = {
+                mode: ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"{mode.lower()}-protection")
+                for mode in ("DEMO", "LIVE")
+            }
         self.http = http
         for mode in ("DEMO", "LIVE"):
             self._configure_broker(mode)
@@ -196,8 +219,13 @@ class TradingCoordinator:
             # server is up; it must not hold public prices or exits hostage
             # during application launch.
             self._reconciliation_wake[mode].set()
+        self._protection_watchdog_task = asyncio.create_task(self._protection_watchdog())
 
     async def stop(self) -> None:
+        self._protection_stopping = True
+        if self._protection_watchdog_task:
+            self._protection_watchdog_task.cancel()
+            await asyncio.gather(self._protection_watchdog_task, return_exceptions=True)
         await asyncio.gather(
             *(broker.stop_protective_exit_recovery()
               for broker in self.brokers.values()
@@ -230,6 +258,9 @@ class TradingCoordinator:
         self._private_status_recovery_tasks.clear()
         self._latest_protective_current.clear()
         self._protective_exit_tasks.clear()
+        for executor in self._exit_executors.values():
+            executor.shutdown(wait=True, cancel_futures=True)
+        self._exit_executors.clear()
 
     def _configure_broker(self, mode: str) -> None:
         broker = self.brokers[mode]
@@ -303,7 +334,7 @@ class TradingCoordinator:
         async def on_message(message: dict[str, Any]) -> None:
             # Apply exchange-confirmed activity immediately.  A slow full
             # account refresh must not make a confirmed fill invisible.
-            recovered = broker.adopt_private_event(message)
+            recovered = await asyncio.to_thread(broker.adopt_private_event, message)
             # A targeted read is deliberately independent of full history. It
             # verifies incomplete/out-of-order events without blocking socket
             # consumption or claiming that the account is reconciled.
@@ -555,9 +586,10 @@ class TradingCoordinator:
         for key in ("orders", "fills", "intents", "settlements"):
             selected.pop(key, None)
         if isinstance(selected_broker, KalshiBroker):
-            # This indexed five-row query restores Dashboard context without
-            # rebuilding the complete ledger/history on every live update.
+            # The revisioned economic projection avoids rebuilding complete
+            # ledger/history on every live update.
             selected["recent_trades"] = selected_broker.recent_trades(5)
+            selected["protection_monitor"] = self.protection_health()["modes"].get(selected_mode, {})
         modes = {
             mode: {
                 "mode": mode,
@@ -586,6 +618,7 @@ class TradingCoordinator:
         """
         mode = self.selected_mode
         portfolio = self.brokers[mode].portfolio()
+        portfolio["protection_monitor"] = self.protection_health()["modes"].get(mode, {})
         self._annotate_threshold_breach_exits(mode, portfolio, current)
         # These raw activity streams are used internally to build the ledger,
         # but the Trading page renders the already-aggregated ledger instead.
@@ -1734,7 +1767,10 @@ class TradingCoordinator:
                     await broker.cancel(str(row["exchange_order_id"]))
                 except (KalshiTradingError, ValueError):
                     pass
-            await self._process_exits(broker, current)
+            # Real production frames are explicitly scoped to their exchange.
+            # Legacy callers without a mode still use their supplied frame.
+            if current.get("execution_market_mode") in (None, mode):
+                await self._process_exits(broker, current)
 
     def schedule_process(self, current: dict[str, Any] | None) -> None:
         if not current:
@@ -1750,8 +1786,11 @@ class TradingCoordinator:
                 self._latest_process_current = None
                 try:
                     await self.process(snapshot)
-                except Exception:
-                    # One failed background pass must not kill later updates.
+                except Exception as exc:
+                    logger.exception("Order maintenance pass failed")
+                    await self._record_protection_event(
+                        "LIVE", "ORDER_MAINTENANCE_ERROR", {"error_type": type(exc).__name__}
+                    )
                     continue
 
         task = asyncio.create_task(coalesced_process())
@@ -1774,21 +1813,59 @@ class TradingCoordinator:
         normalized = normalize_mode(mode)
         if normalized not in {"DEMO", "LIVE"} or not current:
             return
-        self._latest_protective_current[normalized] = current
+        if current.get("execution_market_mode") not in (None, normalized):
+            return
+        ticker = str(current.get("ticker") or "")
+        if not ticker:
+            return
+        self._protective_snapshots.setdefault(normalized, {})[ticker] = dict(current)
+        pending = self._latest_protective_current.setdefault(normalized, {})
+        frames = [*pending.get(ticker, []), {**current, "protection_evaluation_at": time.time()}]
+        # A brief target/stop crossing must survive a busy durable evaluator.
+        # Keep price extrema and the newest frame, bounded independently of
+        # feed rate, rather than overwriting a crossing with the next quote.
+        keep = {len(frames) - 1}
+        phases: dict[str, list[int]] = {}
+        for i, frame in enumerate(frames):
+            close = parse_time(frame.get("close_time"))
+            remaining = (close.timestamp() - frame["protection_evaluation_at"]
+                         if close else frame.get("time_remaining_seconds"))
+            phases.setdefault(str(texas_holdem_phase(remaining)["key"]), []).append(i)
+        for indices in phases.values():
+            keep.add(indices[-1])
+            for field in ("yes_bid", "no_bid", "btc_proxy"):
+                valid = [i for i in indices
+                         if isinstance(frames[i].get(field), (int, float))
+                         and math.isfinite(frames[i][field])]
+                if valid:
+                    keep.add(min(valid, key=lambda i: (frames[i][field], -i)))
+                    keep.add(max(valid, key=lambda i: (frames[i][field], i)))
+        pending[ticker] = [frames[i] for i in sorted(keep)]
         existing = self._protective_exit_tasks.get(normalized)
         if existing and not existing.done():
             return
 
         async def coalesced_exits() -> None:
-            while (snapshot := self._latest_protective_current.pop(normalized, None)):
+            while self._latest_protective_current.get(normalized):
+                pending = self._latest_protective_current[normalized]
+                ticker = next(iter(pending))
+                snapshot = pending[ticker].pop(0)
+                if not pending[ticker]:
+                    pending.pop(ticker)
                 try:
                     broker = self.broker(normalized)
                     if isinstance(broker, KalshiBroker):
                         await self._process_exits(broker, snapshot)
                 except asyncio.CancelledError:
                     raise
-                except Exception:
-                    # A failed exit pass must not strand the next fresh quote.
+                except Exception as exc:
+                    logger.exception("%s protective evaluation failed", normalized)
+                    self._protection_health.setdefault(normalized, {}).update(
+                        {"status": "Evaluation failed", "error_type": type(exc).__name__}
+                    )
+                    await self._record_protection_event(normalized, "PROTECTIVE_EVALUATION_ERROR", {
+                        "ticker": snapshot.get("ticker"), "error_type": type(exc).__name__,
+                    })
                     continue
 
         task = asyncio.create_task(coalesced_exits())
@@ -1798,7 +1875,157 @@ class TradingCoordinator:
             if self._protective_exit_tasks.get(normalized) is done else None
         )
 
+    async def _record_protection_event(
+        self, mode: str, event: str, detail: dict[str, Any]
+    ) -> None:
+        try:
+            broker = self.brokers[mode]
+            if isinstance(broker, KalshiBroker):
+                await asyncio.to_thread(broker._audit, event, detail)
+        except Exception:
+            logger.exception("Could not persist protection diagnostic %s", event)
+
+    def protection_health(self) -> dict[str, Any]:
+        return {
+            "watchdog_running": bool(
+                self._protection_watchdog_task and not self._protection_watchdog_task.done()
+            ),
+            "modes": {
+                mode: {key: value for key, value in state.items() if not key.endswith("_monotonic")}
+                for mode, state in self._protection_health.items()
+            },
+        }
+
+    def protective_snapshot(self, mode: str, ticker: str) -> dict[str, Any]:
+        return dict(self._protective_snapshots.get(mode, {}).get(ticker) or {})
+
+    async def _protection_watchdog_once(self, loop_lag_ms: float = 0.0) -> None:
+        settings = await asyncio.to_thread(self.db.settings)
+        maximum_age = float(settings.get("max_data_age_seconds", 20))
+        for mode in ("DEMO", "LIVE"):
+            broker = self.brokers[mode]
+            if not isinstance(broker, KalshiBroker):
+                continue
+            positions = await asyncio.to_thread(broker.open_positions)
+            snapshots = self._protective_snapshots.get(mode) or {}
+            tickers = list(dict.fromkeys(str(row["ticker"]) for row in positions))
+            # Keep only managed markets and the newest incoming market frame.
+            # This is bounded by open exposure, not the lifetime trade archive.
+            newest = next(reversed(snapshots), None) if snapshots else None
+            for old in list(snapshots):
+                if old not in tickers and old != newest:
+                    snapshots.pop(old, None)
+                    self._protection_evaluated.pop((mode, old), None)
+            ages: dict[str, float | None] = {}
+            for ticker in tickers:
+                snapshot = snapshots.get(ticker) or {}
+                quote_at = parse_time(snapshot.get("executable_quote_at") or snapshot.get("observed_at"))
+                ages[ticker] = time.time() - quote_at.timestamp() if quote_at else None
+            quote_age = max((value for value in ages.values() if value is not None), default=None)
+            state = self._protection_health.setdefault(mode, {})
+            if tickers:
+                state.setdefault("coverage_started_monotonic", time.monotonic())
+            else:
+                state.pop("coverage_started_monotonic", None)
+            previous = state.get("status")
+            covered = bool(tickers) and all(ticker in snapshots for ticker in tickers)
+            recent_evaluation = bool(tickers) and all(
+                time.monotonic() - self._protection_evaluated.get((mode, ticker), 0) < 2.0
+                for ticker in tickers
+            )
+            mode_state = await asyncio.to_thread(broker.mode_state)
+            if not positions:
+                status = "No open positions"
+            elif mode_state.get("kill_switch"):
+                status = "Protection paused: kill switch"
+            elif not broker.session_armed:
+                status = "Protection paused: session disarmed"
+            elif not covered:
+                status = "Exit blocked: position has no executable market feed"
+            elif any(age is None or age > maximum_age for age in ages.values()):
+                status = "Exit blocked: executable quote stale"
+            elif any((snapshots.get(str(row["ticker"])) or {}).get(
+                f"{str(row['side']).lower()}_bid") is None for row in positions):
+                status = "Exit blocked: no executable bid"
+            elif any(
+                _is_texas_position(row)
+                and not parse_time((snapshots.get(str(row["ticker"])) or {}).get("close_time"))
+                and (snapshots.get(str(row["ticker"])) or {}).get("time_remaining_seconds") is None
+                for row in positions
+            ):
+                status = "Phase exits blocked: market clock unavailable"
+            elif not recent_evaluation:
+                status = (
+                    "Protection stalled: exit evaluator not responding"
+                    if time.monotonic() - state["coverage_started_monotonic"] >= 2.0
+                    else "Checking protective exits"
+                )
+            else:
+                status = "Protective exits active"
+            state.update({
+                "status": status, "open_positions": len(positions),
+                "quote_age_seconds": round(quote_age, 3) if quote_age is not None else None,
+                "last_checked_at": datetime_now(), "loop_lag_ms": round(loop_lag_ms, 1),
+                "healthy": not positions or status == "Protective exits active",
+            })
+            if previous != status:
+                await self._record_protection_event(mode, "PROTECTION_COVERAGE_CHANGED", {
+                    key: value for key, value in state.items() if not key.endswith("_monotonic")
+                })
+            # The timer supplies phase-boundary checks and recovers an escaped
+            # evaluator failure even when there is no subsequent quote event.
+            # It never makes the cached quote younger or re-arms the session.
+            if broker.session_armed and not mode_state.get("kill_switch"):
+                for ticker, age in ages.items():
+                    if age is not None and age <= maximum_age:
+                        self.schedule_protective_exits(mode, snapshots[ticker])
+
+    async def _protection_watchdog(self) -> None:
+        while not self._protection_stopping:
+            expected = time.monotonic() + 0.5
+            await asyncio.sleep(0.5)
+            try:
+                await self._protection_watchdog_once(max(0.0, time.monotonic() - expected) * 1000)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.exception("Protection watchdog pass failed")
+                await self._record_protection_event("LIVE", "PROTECTION_WATCHDOG_ERROR", {
+                    "error_type": type(exc).__name__,
+                })
+
     async def _process_exits(self, broker: KalshiBroker, current: dict[str, Any]) -> None:
+        # A slow SQLite commit must not hold socket reception or request
+        # deadlines hostage. Serialize each environment's durable planning,
+        # then schedule submissions on the owning event loop.
+        async with self._exit_evaluation_locks[broker.mode]:
+            worker = asyncio.get_running_loop().run_in_executor(
+                self._exit_executors[broker.mode], self._plan_protective_exits, broker, current
+            )
+            try:
+                plans = await asyncio.shield(worker)
+            except asyncio.CancelledError:
+                # SQLite work cannot be canceled once its thread began.
+                # Drain it before releasing the execution-owner lifetime.
+                await worker
+                raise
+            self._protection_evaluated[(broker.mode, str(current.get("ticker") or ""))] = time.monotonic()
+            self._protection_health.setdefault(broker.mode, {}).update({
+                "last_evaluated_at": datetime_now(),
+                "last_evaluated_monotonic": time.monotonic(),
+                "ticker": current.get("ticker"),
+            })
+            for intent, pending_key in plans:
+                if pending_key in self._pending_exit_keys:
+                    continue
+                self._pending_exit_keys.add(pending_key)
+                task = asyncio.create_task(self._submit_exit(intent, pending_key))
+                self._track_task(task)
+
+    def _plan_protective_exits(
+        self, broker: KalshiBroker, current: dict[str, Any]
+    ) -> list[tuple[OrderIntent, tuple[str, str, str]]]:
+        plans: list[tuple[OrderIntent, tuple[str, str, str]]] = []
         ticker = str(current.get("ticker") or "")
         # BTC ticks may refresh the dashboard while Kalshi's executable book is
         # frozen.  Protective orders must never be based on that older quote.
@@ -1819,10 +2046,15 @@ class TradingCoordinator:
         )
         market_open = str(current.get("status") or "").lower() in {"active", "open"}
         if not ticker or not broker.session_armed or not market_open:
-            return
+            return plans
         settings = self.db.settings()
         slippage = float(settings.get("slippage_cents", 0.5)) / 100
-        seconds_remaining = float(current.get("time_remaining_seconds") or 0)
+        close = parse_time(current.get("close_time"))
+        remaining = current.get("time_remaining_seconds")
+        seconds_remaining = (
+            max(0.0, close.timestamp() - float(current.get("protection_evaluation_at") or time.time())) if close
+            else float(remaining) if remaining is not None else None
+        )
         btc_proxy = current.get("btc_proxy")
         threshold = current.get("strike")
         quality = current.get("data_quality") or {}
@@ -1977,7 +2209,7 @@ class TradingCoordinator:
             existing = self.db.fetch_one(
                 """
                 SELECT id FROM broker_order_intents WHERE mode=? AND ticker=? AND side=?
-                  AND action='SELL' AND status NOT IN ('CANCELED','REJECTED','EXPIRED','SETTLED','RESOLVED_EXTERNALLY')
+                  AND action='SELL' AND status NOT IN ('FILLED','CANCELED','REJECTED','EXPIRED','SETTLED','RESOLVED_EXTERNALLY','RESOLVED_AFTER_SETTLEMENT')
                 LIMIT 1
                 """,
                 (broker.mode, ticker, side),
@@ -1993,8 +2225,12 @@ class TradingCoordinator:
                 continue
             decision_snapshot: dict[str, Any] = {
                 "trigger": reason,
+                "triggered_at": datetime_now(),
                 "protective_exit": True,
                 "executable_bid": bid,
+                "executable_quote_at": quote_timestamp,
+                "quote_age_ms": round(max(0.0, time.time() - observed.timestamp()) * 1000) if observed else None,
+                "market_close_time": current.get("close_time"),
                 "priority": priority,
                 "market_style_ioc": market_style_exit,
                 "submitted_limit_floor": candidate_limit
@@ -2004,6 +2240,8 @@ class TradingCoordinator:
                 texas_position and reason == "GLOBAL_PROFIT_TAKE"
             ):
                 _, texas_state = texas_holdem_exit_reason(bid, seconds_remaining, settings)
+                if seconds_remaining is None:
+                    texas_state = {"key": "UNKNOWN", "label": "Market clock unavailable", "bid": bid}
                 decision_snapshot["texas_holdem"] = texas_state
                 if thesis_state:
                     decision_snapshot["texas_thesis"] = thesis_state
@@ -2061,9 +2299,8 @@ class TradingCoordinator:
                     triggered=True,
                     executable_bid=bid,
                 )
-            self._pending_exit_keys.add(pending_key)
-            task = asyncio.create_task(self._submit_exit(intent, pending_key))
-            self._track_task(task)
+            plans.append((intent, pending_key))
+        return plans
 
     async def _submit_exit(
         self, intent: OrderIntent, pending_key: tuple[str, str, str]
@@ -2123,7 +2360,14 @@ class TradingCoordinator:
 
     def _track_task(self, task: asyncio.Task[Any]) -> None:
         self._submission_tasks.add(task)
-        task.add_done_callback(self._submission_tasks.discard)
+        def finished(done: asyncio.Task[Any]) -> None:
+            self._submission_tasks.discard(done)
+            if not done.cancelled():
+                error = done.exception()
+                if error is not None:
+                    logger.error("Trading background task failed: %s", type(error).__name__,
+                                 exc_info=(type(error), error, error.__traceback__))
+        task.add_done_callback(finished)
 
 
 def datetime_now() -> str:

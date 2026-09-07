@@ -631,6 +631,10 @@ def texas_unfavorable_distance(side: object, btc_proxy: object, threshold: objec
 
 def texas_holdem_phase(seconds_remaining: float | None) -> dict[str, object]:
     """Return the authoritative five-minute Texas Hold'em market phase."""
+    if seconds_remaining is None or not math.isfinite(float(seconds_remaining)):
+        return {"key": "UNKNOWN", "label": "Market clock unavailable",
+                "elapsed_seconds": None, "phase_elapsed_seconds": None,
+                "progress": 0.0, "market_progress": 0.0}
     remaining = max(0.0, min(900.0, float(seconds_remaining or 0.0)))
     elapsed = 900.0 - remaining
     if elapsed < 300.0:
@@ -657,6 +661,8 @@ def texas_holdem_exit_reason(
     """Evaluate the phase target and River stop for a Texas position."""
     phase = texas_holdem_phase(seconds_remaining)
     key = str(phase["key"])
+    if key == "UNKNOWN":
+        return None, {**phase, "target": None, "stop": None, "bid": bid}
     target_key = f"texas_holdem_{key.lower()}_target"
     stop_key = f"texas_holdem_{key.lower()}_stop"
     default_target = {"FLOP": 0.60, "TURN": 0.50, "RIVER": 0.95}[key]

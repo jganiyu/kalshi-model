@@ -1066,6 +1066,40 @@ MIGRATIONS: list[tuple[int, str]] = [
             ON texas_holdem_rounds(environment,strategy,status,updated_at);
         """,
     ),
+    (
+        26,
+        """
+        CREATE TABLE broker_ledger_revisions (
+            mode TEXT PRIMARY KEY CHECK(mode IN ('DEMO','LIVE')),
+            revision INTEGER NOT NULL DEFAULT 0
+        );
+        INSERT INTO broker_ledger_revisions(mode) VALUES ('DEMO'),('LIVE');
+        """ + "\n".join(
+            f"""
+            CREATE TRIGGER {table}_ledger_{operation.lower()}
+            AFTER {operation} ON {table}
+            {('WHEN ' + ' OR '.join(f'OLD.{column} IS NOT NEW.{column}' for column in columns)) if operation == 'UPDATE' else ''}
+            BEGIN
+                UPDATE broker_ledger_revisions SET revision=revision+1
+                WHERE mode IN ({modes});
+            END;
+            """
+            for table, columns in (
+                ("broker_fills", (
+                    "id", "mode", "ticker", "side", "action", "contracts", "price",
+                    "fee", "strategy", "source", "filled_at", "available_cash_after",
+                )),
+                ("broker_settlements", (
+                    "mode", "ticker", "market_result", "settled_at", "available_cash_after",
+                )),
+            )
+            for operation, modes in (
+                ("INSERT", "NEW.mode"),
+                ("UPDATE", "OLD.mode,NEW.mode"),
+                ("DELETE", "OLD.mode"),
+            )
+        ),
+    ),
 ]
 
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 from contextlib import asynccontextmanager
@@ -24,6 +25,7 @@ from app.services.credentials import (
 )
 from app.services.broker import KalshiBroker, normalize_mode
 from app.services.kalshi_trading import KalshiTradingError
+from app.services.execution_owner import ExecutionOwnerLock
 from app.services.training import report_rows
 from app.services.trade_review import review_metadata
 from app.mobile import create_mobile_app, mobile_status
@@ -53,10 +55,15 @@ def set_mobile_runtime_port(port: int) -> None:
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    db.initialize()
-    await engine.start()
-    yield
-    await engine.stop()
+    # Acquire before any database initialization or execution startup. This
+    # also protects direct ASGI launches that bypass the desktop launcher.
+    with ExecutionOwnerLock(config.database_path):
+        db.initialize()
+        try:
+            await engine.start()
+            yield
+        finally:
+            await engine.stop()
 
 
 app = FastAPI(
@@ -85,7 +92,12 @@ async def favicon() -> FileResponse:
 
 @app.get("/api/health")
 async def health() -> dict[str, Any]:
-    return {"ok": True, "database": str(config.database_path), "system": engine.dashboard["system"]}
+    protection = engine.trading.protection_health()
+    return {"ok": True, "database": str(config.database_path),
+            "system": engine.dashboard["system"], "protection": protection,
+            "execution_healthy": protection["watchdog_running"] and all(
+                state.get("healthy", False) for state in protection["modes"].values()
+            )}
 
 
 @app.get("/api/dashboard")
@@ -207,13 +219,13 @@ async def reset_paper_round() -> dict[str, Any]:
 
 @app.get("/api/trading")
 async def trading() -> dict[str, Any]:
-    return engine.trading.summary(engine.dashboard.get("current"))
+    return await asyncio.to_thread(engine.trading.summary, engine.dashboard.get("current"))
 
 
 @app.get("/api/trading/selected")
 async def selected_trading() -> dict[str, Any]:
     """Read the selected account for the Trading page without other modes."""
-    return engine.trading.selected_summary(engine.dashboard.get("current"))
+    return await asyncio.to_thread(engine.trading.selected_summary, engine.dashboard.get("current"))
 
 
 def _disable_financial_caching(response: Response) -> None:

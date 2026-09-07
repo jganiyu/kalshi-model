@@ -10,6 +10,7 @@ import uvicorn
 
 from app.config import FROZEN, AppConfig
 from app.services.credentials import credential_directory
+from app.services.execution_owner import ExecutionOwnerError, ExecutionOwnerLock
 
 
 NATIVE_WINDOW_WIDTH = 1440
@@ -171,6 +172,14 @@ def run_browser_app(config: AppConfig, port: int) -> None:
 
 def main() -> None:
     config = AppConfig()
+    try:
+        # Give ordinary duplicate launches a clear error before searching for
+        # another port. The ASGI lifespan acquires the definitive lock again
+        # atomically, protecting both this launcher and direct uvicorn starts.
+        with ExecutionOwnerLock(config.database_path):
+            pass
+    except ExecutionOwnerError as exc:
+        raise SystemExit(str(exc)) from exc
     port = find_available_port(config.host, config.port)
     if port != config.port:
         print(

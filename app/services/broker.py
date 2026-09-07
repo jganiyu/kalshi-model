@@ -6,8 +6,10 @@ import json
 import math
 import random
 import time
+import threading
 import uuid
 from collections import defaultdict, deque
+from contextlib import closing
 from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -116,6 +118,10 @@ class Broker(abc.ABC):
 
     @abc.abstractmethod
     def portfolio(self, *, include_ledger: bool = True) -> dict[str, Any]: ...
+
+    def execution_portfolio(self) -> dict[str, Any]:
+        """Preserve the paper account's risk model for execution consumers."""
+        return self.portfolio(include_ledger=False)
 
     @abc.abstractmethod
     async def submit(self, intent: OrderIntent) -> dict[str, Any]: ...
@@ -259,6 +265,12 @@ class KalshiBroker(Broker):
         self._reconcile_lock = asyncio.Lock()
         self._reconcile_generation = 0
         self._reconciliation_paused = False
+        # Only economic rows are cached; display/review/protection metadata is
+        # read afresh. Durable mode-scoped revisions also catch direct writers.
+        self._ledger_cache: tuple[int, list[dict[str, Any]]] | None = None
+        self._position_fact_lock = threading.RLock()
+        self._position_fact_generations: dict[str, int] = {}
+        self._reconcile_worker_context = threading.local()
         # A private stream is independent evidence that the authenticated
         # Kalshi connection is alive. A single slow REST reconciliation
         # endpoint must not falsely label that healthy stream "unreachable".
@@ -505,6 +517,29 @@ class KalshiBroker(Broker):
             return "Verifying timed-out order · entries resume next round."
         return "Reconciling Kalshi account activity."
 
+    def execution_portfolio(self) -> dict[str, Any]:
+        """Fresh entry-sizing/readiness inputs without account-history work.
+
+        Strategy evaluation runs on every price frame. Its account inputs are
+        cash, equity, held exposure, and the same entry readiness used by the
+        full portfolio. Detailed risk checks still run at order submission.
+        """
+        account = self._latest_account_snapshot()
+        available = _number(account.get("available_balance"))
+        positions = self.open_positions()
+        for position in positions:
+            position["display_status"] = "UNSETTLED"
+        readiness = self.readiness()
+        return {
+            "mode": self.mode,
+            "available_cash": available,
+            "current_bankroll": max(available, _number(account.get("portfolio_value"))),
+            "positions": positions,
+            "automatic_trade_allowed": readiness["ready_for_automatic"],
+            "automatic_trade_block_reason": readiness["automatic_blocker"],
+            "readiness": readiness,
+        }
+
     def portfolio(self, *, include_ledger: bool = True) -> dict[str, Any]:
         account = self._latest_account_snapshot()
         positions = self.db.fetch_all(
@@ -625,8 +660,9 @@ class KalshiBroker(Broker):
                 ),
                 "managed_positions": len(managed_positions),
                 "warning": (
-                    "Profit taking requires the app to remain running, connected, "
-                    "authenticated, reconciled, and armed."
+                    "Profit taking requires the app to remain running, an armed "
+                    "session, and reachable Kalshi order execution. Confirmed "
+                    "positions can use protective exits during account reconciliation."
                 ),
             },
             "threshold_breach_exit_state": {
@@ -664,7 +700,7 @@ class KalshiBroker(Broker):
         mistake those fragments (or a buy and its sell) for separate trades.
         Its compact feed therefore uses the durable FIFO round-trip ledger.
         """
-        rows = self.trade_ledger()[: max(1, min(int(limit), 8))]
+        rows = self._trade_ledger(max(1, min(int(limit), 8)))
         for row in rows:
             # Imported fills occasionally predate the first account snapshot.
             # A snapshot is useful only when it is demonstrably adjacent to
@@ -702,31 +738,30 @@ class KalshiBroker(Broker):
         return rows
 
     def trade_ledger(self) -> list[dict[str, Any]]:
-        fills = self.db.fetch_all(
-            "SELECT * FROM broker_fills WHERE mode=? ORDER BY filled_at ASC,id ASC",
-            (self.mode,),
-        )
-        settlements = {
-            str(row.get("ticker")): row
-            for row in self.db.fetch_all(
-                "SELECT * FROM broker_settlements WHERE mode=?", (self.mode,)
-            )
-        }
+        return self._trade_ledger(100)
+
+    def _trade_ledger(self, limit: int) -> list[dict[str, Any]]:
+        rows = [dict(row) for row in self._economic_trade_ledger()[:limit]]
+        if not rows:
+            return rows
+        tickers = list(dict.fromkeys(str(row["ticker"]) for row in rows))
+        placeholders = ",".join("?" for _ in tickers)
         entry_evidence_rows = self.db.fetch_all(
-            """
+            f"""
             SELECT ticker,side,margin_volatility_index,margin_cushion_ratio
             FROM broker_order_intents
             WHERE mode=? AND action='BUY' AND source='automatic'
+              AND ticker IN ({placeholders})
             ORDER BY created_at ASC,id ASC
             """,
-            (self.mode,),
+            (self.mode, *tickers),
         )
         entry_evidence = {
             (str(row.get("ticker")), str(row.get("side"))): row
             for row in entry_evidence_rows
         }
         settlement_margin_rows = self.db.fetch_all(
-            """
+            f"""
             SELECT s.ticker,
                    COALESCE(
                      json_extract(s.raw_json,'$.expiration_value'),
@@ -734,26 +769,64 @@ class KalshiBroker(Broker):
                    ) AS settlement_price,
                    m.strike
             FROM settlements s LEFT JOIN markets m ON m.ticker=s.ticker
-            """
+            WHERE s.ticker IN ({placeholders})
+            """,
+            tuple(tickers),
         )
-        settlement_margins: dict[str, float] = {}
-        for row in settlement_margin_rows:
-            margin = settlement_margin(
+        settlement_margins = {
+            str(row["ticker"]): settlement_margin(
                 row.get("settlement_price"), row.get("strike")
             )
-            if margin is not None:
-                settlement_margins[str(row["ticker"])] = margin
+            for row in settlement_margin_rows
+        }
         protection_rows = self.db.fetch_all(
-            """
+            f"""
             SELECT * FROM broker_positions
             WHERE mode=? AND threshold_breach_enabled IS NOT NULL
+              AND ticker IN ({placeholders})
             """,
-            (self.mode,),
+            (self.mode, *tickers),
         )
         protections = {
             (str(row.get("ticker")), str(row.get("side"))): _threshold_exit_record(row)
             for row in protection_rows
         }
+        for row in rows:
+            key = (str(row["ticker"]), str(row["side"]))
+            evidence = entry_evidence.get(key) or {}
+            row.update(
+                settlement_margin=settlement_margins.get(key[0]),
+                margin_volatility_index=evidence.get("margin_volatility_index"),
+                margin_cushion_ratio=evidence.get("margin_cushion_ratio"),
+                threshold_breach_exit=protections.get(key),
+            )
+            row.update(review_metadata(
+                self.db, self.mode, broker_trade_ref(self.mode, *key), row["status"]
+            ))
+        return rows
+
+    def _economic_trade_ledger(self) -> list[dict[str, Any]]:
+        # One SQLite read snapshot keeps the revision, fills and settlements
+        # coherent even when another connection commits an account correction.
+        with closing(self.db.connect()) as connection:
+            connection.execute("BEGIN")
+            revision = int(connection.execute(
+                "SELECT revision FROM broker_ledger_revisions WHERE mode=?",
+                (self.mode,),
+            ).fetchone()["revision"])
+            cached = self._ledger_cache
+            if cached is not None and revision == cached[0]:
+                return cached[1]
+            fills = [dict(row) for row in connection.execute(
+                "SELECT * FROM broker_fills WHERE mode=? ORDER BY filled_at ASC,id ASC",
+                (self.mode,),
+            )]
+            settlements = {
+                str(row["ticker"]): dict(row)
+                for row in connection.execute(
+                    "SELECT * FROM broker_settlements WHERE mode=?", (self.mode,)
+                )
+            }
         grouped: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
         for fill in fills:
             grouped[(str(fill.get("ticker")), str(fill.get("side")))].append(fill)
@@ -851,7 +924,6 @@ class KalshiBroker(Broker):
                 next(iter(sources)) if len(sources) == 1
                 else "mixed" if sources else "external"
             )
-            trade_ref = broker_trade_ref(self.mode, key[0], key[1])
             ledger.append(
                 {
                     "ticker": key[0],
@@ -870,24 +942,17 @@ class KalshiBroker(Broker):
                     "display_status": "UNSETTLED" if status == "OPEN" else status,
                     "realized_pnl": realized_pnl,
                     "available_cash_after": available_after,
-                    "settlement_margin": settlement_margins.get(key[0]),
                     "market_result": (settlement or {}).get("market_result"),
                     "position_won": position_won,
-                    "margin_volatility_index": (
-                        entry_evidence.get(key) or {}
-                    ).get("margin_volatility_index"),
-                    "margin_cushion_ratio": (
-                        entry_evidence.get(key) or {}
-                    ).get("margin_cushion_ratio"),
-                    "threshold_breach_exit": protections.get(key),
-                    **review_metadata(self.db, self.mode, trade_ref, status),
                 }
             )
-        return sorted(
+        rows = sorted(
             ledger,
             key=lambda row: str(row.get("activity_at") or row.get("opened_at") or ""),
             reverse=True,
         )[:100]
+        self._ledger_cache = (revision, rows)
+        return rows
 
     def risk_state(self) -> dict[str, Any]:
         settings = self.db.settings()
@@ -1645,7 +1710,18 @@ class KalshiBroker(Broker):
         async with self._reconcile_lock:
             if requested_generation != self._reconcile_generation:
                 return self.portfolio()
-            result = await self._reconcile_once(full_audit=full_audit)
+            try:
+                result = await self._reconcile_once(full_audit=full_audit)
+            except (Exception, asyncio.CancelledError) as exc:
+                # Projection/application failures are as incomplete as failed
+                # REST reads. Never leave new exposure enabled on partial data.
+                self._update_mode_state(
+                    reconciled=False,
+                    reconciliation_required=True,
+                    last_error=str(exc) or "Account reconciliation was canceled.",
+                )
+                self._reconciliation_paused = True
+                raise
             self._reconcile_generation += 1
             if self.session_armed:
                 self.resume_protective_exit_recovery()
@@ -1708,6 +1784,7 @@ class KalshiBroker(Broker):
             calls.append(("position", self.client.positions(ticker=ticker)))
         if not calls:
             return
+        position_generation = self._position_fact_generations.get(ticker or "", 0)
         results = await asyncio.gather(*(call for _, call in calls), return_exceptions=True)
         for (name, _), result in zip(calls, results):
             if isinstance(result, Exception):
@@ -1716,11 +1793,14 @@ class KalshiBroker(Broker):
                 }, exchange_order_id=order_id, ticker=ticker)
                 continue
             if name == "order" and isinstance(result, dict):
-                self._upsert_order(result)
+                advanced = self._upsert_order(result)
+                if str(result.get("ticker") or result.get("market_ticker") or "") == ticker:
+                    position_generation += advanced
             elif name == "position" and isinstance(result, dict):
                 for position in result.get("market_positions") or result.get("positions") or []:
-                    if isinstance(position, dict):
-                        self._upsert_position(position)
+                    if isinstance(position, dict) and str(position.get("ticker") or position.get("market_ticker") or "") == ticker:
+                        if self._upsert_position(position, expected_generation=position_generation):
+                            position_generation += 1
 
     async def recover_ambiguous_protective_exit(
         self, client_order_id: str
@@ -1766,6 +1846,7 @@ class KalshiBroker(Broker):
             targeted_position(ticker, fast=True)
             if callable(targeted_position) else self.client.positions(ticker=ticker)
         )
+        position_generation = self._position_fact_generations.get(ticker, 0)
         order_result, position_result = await asyncio.gather(
             order_call, position_call, return_exceptions=True
         )
@@ -1787,7 +1868,9 @@ class KalshiBroker(Broker):
                     "ticker": str(order_result.get("ticker") or ticker),
                 }
                 order_status = self._order_status(order_result)
-                self._upsert_order(order_result)
+                advanced = self._upsert_order(order_result)
+                if str(order_result.get("ticker") or "") == ticker:
+                    position_generation += advanced
                 self._set_intent(
                     client_order_id, order_status,
                     exchange_order_id=str(order_result.get("order_id") or order_result.get("exchange_order_id") or "") or None,
@@ -1801,10 +1884,14 @@ class KalshiBroker(Broker):
             ]
             if rows:
                 for row in rows:
-                    self._upsert_position(row)
+                    accepted = self._upsert_position(row, expected_generation=position_generation)
+                    position_ok = position_ok and accepted
+                    position_generation += int(accepted)
             else:
                 # A successful ticker-scoped result without a row is a zero.
-                self._upsert_position({"ticker": ticker, "position_fp": "0"})
+                position_ok = self._upsert_position(
+                    {"ticker": ticker, "position_fp": "0"}, expected_generation=position_generation,
+                )
         latest = self.db.fetch_one(
             "SELECT status FROM broker_order_intents WHERE mode=? AND client_order_id=?",
             (self.mode, client_order_id),
@@ -1996,20 +2083,25 @@ class KalshiBroker(Broker):
             )
 
         order_call = lookup(intent.client_order_id) if callable(lookup) else fallback_order_lookup()
+        position_generation = self._position_fact_generations.get(intent.ticker, 0)
         order_result, position_result = await asyncio.gather(
             order_call, self.client.positions(ticker=intent.ticker), return_exceptions=True
         )
         order_ok = not isinstance(order_result, Exception)
         position_ok = not isinstance(position_result, Exception)
         if isinstance(order_result, dict):
-            self._upsert_order(order_result)
+            advanced = self._upsert_order(order_result)
+            if str(order_result.get("ticker") or order_result.get("market_ticker") or "") == intent.ticker:
+                position_generation += advanced
             filled = _number(
                 order_result.get("filled_contracts")
                 or order_result.get("fill_count_fp")
                 or order_result.get("fill_count")
             )
             if is_texas_holdem_strategy(intent.strategy) and filled > 0:
-                self._adopt_texas_acknowledged_fill(intent, filled)
+                with self._position_fact_lock:
+                    if self._position_fact_generations.get(intent.ticker, 0) == position_generation:
+                        position_generation += self._adopt_texas_acknowledged_fill(intent, filled)
         position_rows: list[dict[str, Any]] = []
         if isinstance(position_result, dict):
             position_rows = [
@@ -2018,7 +2110,9 @@ class KalshiBroker(Broker):
                 and str(row.get("ticker") or row.get("market_ticker") or "") == intent.ticker
             ]
             for row in position_rows:
-                self._upsert_position(row)
+                accepted = self._upsert_position(row, expected_generation=position_generation)
+                position_ok = position_ok and accepted
+                position_generation += int(accepted)
         latest = self.db.fetch_one(
             "SELECT status FROM broker_order_intents WHERE mode=? AND client_order_id=?",
             (self.mode, intent.client_order_id),
@@ -2070,14 +2164,113 @@ class KalshiBroker(Broker):
                 self.client.positions, settlements_call,
             )
         ]
+        responses: dict[int, dict[str, Any]] = {}
+        with self._position_fact_lock:
+            position_generations = dict(self._position_fact_generations)
+        applied: set[int] = set()
+        incremental_fill_ids: set[str] = set()
+        incremental_settlement_tickers: set[str] = set()
+
+        async def apply_in_worker(callback, **kwargs):
+            # Cancellation cannot stop a SQLite worker. Keep the reconcile
+            # lock until it finishes, including repeated cancellation, so a
+            # newer reconciliation cannot race an abandoned writer.
+            def run():
+                self._reconcile_worker_context.applying = True
+                try:
+                    return callback(**kwargs)
+                finally:
+                    self._reconcile_worker_context.applying = False
+
+            worker = asyncio.create_task(asyncio.to_thread(run))
+            cancelled = False
+            while True:
+                try:
+                    result = await asyncio.shield(worker)
+                    break
+                except asyncio.CancelledError:
+                    cancelled = True
+                except Exception:
+                    if cancelled:
+                        raise asyncio.CancelledError() from None
+                    raise
+            if cancelled:
+                raise asyncio.CancelledError()
+            return result
+
+        def apply_available(*, failed: bool = False) -> None:
+            # Preserve positive evidence even if a sibling endpoint stalls or
+            # fails. Absence/flat-position inference remains below, after all
+            # five authoritative responses have succeeded. Orders provide fill
+            # semantics and positions provide settlement attribution.
+            for index in (0, 1, 3, 2, 4):
+                if index in applied or index not in responses:
+                    continue
+                dependencies = {2: (1,), 4: (3, 2)}.get(index, ())
+                if any(dependency not in applied for dependency in dependencies) and not failed:
+                    continue
+                payload = responses[index]
+                if index == 0:
+                    self.db.execute(
+                        """INSERT INTO broker_account_snapshots(
+                            mode,observed_at,available_balance,portfolio_value,allocated_capital,raw_json
+                        ) VALUES (?,?,?,?,?,?)""",
+                        (self.mode, iso_now(), _dollars(payload, "balance_dollars", "balance"),
+                         _number(payload.get("portfolio_value")) / 100.0,
+                         self.allocated_capital(), _safe_json(payload)),
+                    )
+                elif index == 1:
+                    for order in payload.get("orders") or []:
+                        self._upsert_order(order)
+                elif index == 3:
+                    for position in payload.get("market_positions") or payload.get("positions") or []:
+                        # A zero may represent settlement rather than a filled
+                        # protective exit. Resolve it with settlement evidence
+                        # in the authoritative replacement below.
+                        if abs(_number(position.get("position_fp") or position.get("position"))) >= 1e-9:
+                            ticker = str(position.get("ticker") or position.get("market_ticker") or "")
+                            with self._position_fact_lock:
+                                if self._position_fact_generations.get(ticker, 0) == position_generations.get(ticker, 0):
+                                    self._upsert_position(position)
+                elif index == 2:
+                    for fill in payload.get("fills") or []:
+                        fill_id = str(fill.get("fill_id") or fill.get("trade_id") or "")
+                        if fill_id and not self.db.fetch_one(
+                            "SELECT 1 FROM broker_fills WHERE mode=? AND fill_id=?",
+                            (self.mode, fill_id),
+                        ):
+                            incremental_fill_ids.add(fill_id)
+                        self._upsert_fill(fill)
+                else:
+                    for settlement in payload.get("settlements") or []:
+                        ticker = str(settlement.get("ticker") or settlement.get("market_ticker") or "")
+                        if ticker and not self.db.fetch_one(
+                            "SELECT 1 FROM broker_settlements WHERE mode=? AND ticker=?",
+                            (self.mode, ticker),
+                        ):
+                            incremental_settlement_tickers.add(ticker)
+                        self._upsert_settlement(settlement)
+                applied.add(index)
+
         try:
-            balance, orders, fills, positions, settlements = await asyncio.gather(
-                *requests
-            )
+            pending = set(requests)
+            while pending:
+                done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+                failures: list[BaseException] = []
+                for request in done:
+                    try:
+                        responses[requests.index(request)] = request.result()
+                    except BaseException as exc:
+                        failures.append(exc)
+                await apply_in_worker(apply_available, failed=bool(failures))
+                if failures:
+                    raise failures[0]
+            balance, orders, fills, positions, settlements = (responses[index] for index in range(5))
         except asyncio.CancelledError:
             for request in requests:
                 request.cancel()
             await asyncio.gather(*requests, return_exceptions=True)
+            await apply_in_worker(apply_available, failed=True)
             raise
         except Exception as exc:
             # asyncio.gather does not cancel sibling requests when one fails.
@@ -2122,92 +2315,42 @@ class KalshiBroker(Broker):
             self._reconciliation_paused = True
             raise
         observed_at = iso_now()
-        self.db.execute(
-            """
-            INSERT INTO broker_reconciliation_watermarks(mode,last_full_at,last_activity_at,updated_at)
-            VALUES (?,?,?,?)
-            ON CONFLICT(mode) DO UPDATE SET
-                last_full_at=CASE WHEN excluded.last_full_at IS NULL
-                    THEN broker_reconciliation_watermarks.last_full_at ELSE excluded.last_full_at END,
-                last_activity_at=excluded.last_activity_at, updated_at=excluded.updated_at
-            """,
-            (self.mode, observed_at if full_audit else None, observed_at, observed_at),
-        )
         available = _dollars(balance, "balance_dollars", "balance")
-        portfolio_value = _number(balance.get("portfolio_value")) / 100.0
-        self.db.execute(
-            """
-            INSERT INTO broker_account_snapshots(
-                mode,observed_at,available_balance,portfolio_value,allocated_capital,raw_json
-            ) VALUES (?,?,?,?,?,?)
-            """,
-            (self.mode, observed_at, available, portfolio_value, self.allocated_capital(), _safe_json(balance)),
-        )
         remote_orders = list(orders.get("orders") or [])
         remote_fills = list(fills.get("fills") or [])
         remote_positions = list(positions.get("market_positions") or positions.get("positions") or [])
         remote_settlements = list(settlements.get("settlements") or [])
-        new_fill_ids = {
-            str(fill.get("fill_id") or fill.get("trade_id") or "")
-            for fill in remote_fills
-            if (fill.get("fill_id") or fill.get("trade_id"))
-            and not self.db.fetch_one(
-                "SELECT 1 FROM broker_fills WHERE mode=? AND fill_id=?",
-                (self.mode, str(fill.get("fill_id") or fill.get("trade_id"))),
+        def apply_authoritative_positions() -> None:
+            # Incremental ingestion already identified new economic rows; do
+            # not repeat a historical per-fill SQL existence scan here.
+            single_new_transaction = len(incremental_fill_ids) + len(incremental_settlement_tickers) == 1
+            if single_new_transaction and incremental_fill_ids:
+                self.db.execute(
+                    """UPDATE broker_fills SET available_cash_after=?
+                       WHERE mode=? AND fill_id=?""",
+                    (available, self.mode, next(iter(incremental_fill_ids))),
+                )
+            settlement_tickers = {
+                str(row.get("ticker") or "") for row in self.db.fetch_all(
+                    "SELECT ticker FROM broker_settlements WHERE mode=?", (self.mode,)
+                )
+            }
+            self._replace_positions(
+                remote_positions, settlement_tickers,
+                expected_generations=position_generations,
             )
-        }
-        new_settlement_tickers = {
-            str(settlement.get("ticker") or settlement.get("market_ticker") or "")
-            for settlement in remote_settlements
-            if (settlement.get("ticker") or settlement.get("market_ticker"))
-            and not self.db.fetch_one(
-                "SELECT 1 FROM broker_settlements WHERE mode=? AND ticker=?",
-                (
-                    self.mode,
-                    str(settlement.get("ticker") or settlement.get("market_ticker")),
-                ),
-            )
-        }
-        single_new_transaction = len(new_fill_ids) + len(new_settlement_tickers) == 1
-        for order in remote_orders:
-            self._upsert_order(order)
-        for fill in remote_fills:
-            fill_id = str(fill.get("fill_id") or fill.get("trade_id") or "")
-            self._upsert_fill(
-                fill,
-                available_cash_after=(
-                    available
-                    if single_new_transaction and fill_id in new_fill_ids
-                    else None
-                ),
-            )
-        # A settlement is terminal market evidence, not evidence that an
-        # earlier protective order filled.  Keep that distinction when an
-        # account snapshot no longer lists the position.
-        settlement_tickers = {
-            str(item.get("ticker") or item.get("market_ticker") or "")
-            for item in remote_settlements
-        }
-        # A restart may have persisted the settlement on an earlier account
-        # snapshot while Kalshi's next response no longer includes it.
-        settlement_tickers.update(
-            str(row.get("ticker") or "") for row in self.db.fetch_all(
-                "SELECT ticker FROM broker_settlements WHERE mode=?", (self.mode,)
-            )
-        )
-        self._replace_positions(remote_positions, settlement_tickers)
-        for settlement in remote_settlements:
-            ticker = str(
-                settlement.get("ticker") or settlement.get("market_ticker") or ""
-            )
-            self._upsert_settlement(
-                settlement,
-                available_cash_after=(
-                    available
-                    if single_new_transaction and ticker in new_settlement_tickers
-                    else None
-                ),
-            )
+            # Replacement can refresh a position already known to be settled;
+            # reapply terminal facts after that authoritative position pass.
+            for settlement in remote_settlements:
+                ticker = str(settlement.get("ticker") or settlement.get("market_ticker") or "")
+                self._upsert_settlement(
+                    settlement,
+                    available_cash_after=(
+                        available if single_new_transaction and ticker in incremental_settlement_tickers else None
+                    ),
+                )
+
+        await apply_in_worker(apply_authoritative_positions)
         # Resolve crash-interrupted and ambiguous submissions by persistent client ID.
         interrupted = self.db.fetch_all(
             "SELECT * FROM broker_order_intents WHERE mode=? AND status='INTENT_CREATED'",
@@ -2321,7 +2464,21 @@ class KalshiBroker(Broker):
                     "automatic_resumed": self.automatic_armed,
                 },
             )
-        return self.portfolio()
+        result = await apply_in_worker(self.portfolio)
+        # A full-audit watermark promises that every authoritative response
+        # was applied. Failed/canceled applications must be retried in full.
+        self.db.execute(
+            """
+            INSERT INTO broker_reconciliation_watermarks(mode,last_full_at,last_activity_at,updated_at)
+            VALUES (?,?,?,?)
+            ON CONFLICT(mode) DO UPDATE SET
+                last_full_at=CASE WHEN excluded.last_full_at IS NULL
+                    THEN broker_reconciliation_watermarks.last_full_at ELSE excluded.last_full_at END,
+                last_activity_at=excluded.last_activity_at, updated_at=excluded.updated_at
+            """,
+            (self.mode, observed_at if full_audit else None, observed_at, observed_at),
+        )
+        return result
 
     async def _closed_without_matching_fill(self, intent: dict[str, Any]) -> bool:
         """Resolve an ambiguous request once its market can no longer trade.
@@ -2636,7 +2793,22 @@ class KalshiBroker(Broker):
         )
         return book_to_outcome(book_side, book_price, reduce_only=bool(order.get("reduce_only")))
 
-    def _upsert_order(self, order: dict[str, Any]) -> None:
+    def _upsert_order(self, order: dict[str, Any]) -> int:
+        # Return this write's generation increment so a targeted recovery can
+        # account for its own sibling order response while still detecting
+        # any independently received facts during its network request.
+        with self._position_fact_lock:
+            self._apply_order(order)
+            ticker = str(order.get("ticker") or order.get("market_ticker") or "")
+            filled = _number(
+                order.get("filled_contracts") or order.get("fill_count_fp") or order.get("fill_count")
+            )
+            if ticker and filled > 0 and not getattr(self._reconcile_worker_context, "applying", False):
+                self._position_fact_generations[ticker] = self._position_fact_generations.get(ticker, 0) + 1
+                return 1
+            return 0
+
+    def _apply_order(self, order: dict[str, Any]) -> None:
         exchange_id = str(order.get("order_id") or order.get("exchange_order_id") or "")
         if not exchange_id:
             return
@@ -2735,8 +2907,18 @@ class KalshiBroker(Broker):
 
     def _adopt_texas_acknowledged_fill(
         self, intent: OrderIntent, fill_count: float
-    ) -> None:
+    ) -> int:
         """Make a confirmed Texas entry protectable before full sync succeeds."""
+        with self._position_fact_lock:
+            self._apply_texas_acknowledged_fill(intent, fill_count)
+            self._position_fact_generations[intent.ticker] = (
+                self._position_fact_generations.get(intent.ticker, 0) + 1
+            )
+            return 1
+
+    def _apply_texas_acknowledged_fill(
+        self, intent: OrderIntent, fill_count: float
+    ) -> None:
         rows = self.db.fetch_all(
             """
             SELECT filled_contracts,average_fill_price,limit_price FROM broker_orders
@@ -2815,6 +2997,22 @@ class KalshiBroker(Broker):
         ) is not None
 
     def _upsert_fill(
+        self, fill: dict[str, Any], *, available_cash_after: float | None = None
+    ) -> None:
+        with self._position_fact_lock:
+            self._apply_fill(fill, available_cash_after=available_cash_after)
+            if not getattr(self._reconcile_worker_context, "applying", False):
+                ticker = str(fill.get("ticker") or fill.get("market_ticker") or "")
+                if not ticker:
+                    row = self.db.fetch_one(
+                        "SELECT ticker FROM broker_fills WHERE mode=? AND fill_id=?",
+                        (self.mode, str(fill.get("fill_id") or fill.get("trade_id") or "")),
+                    ) or {}
+                    ticker = str(row.get("ticker") or "")
+                if ticker:
+                    self._position_fact_generations[ticker] = self._position_fact_generations.get(ticker, 0) + 1
+
+    def _apply_fill(
         self, fill: dict[str, Any], *, available_cash_after: float | None = None
     ) -> None:
         fill_id = str(fill.get("fill_id") or fill.get("trade_id") or "")
@@ -2992,8 +3190,21 @@ class KalshiBroker(Broker):
                 ticker=str(fill.get("ticker") or (order or {}).get("ticker") or ""),
             )
 
-    def _upsert_position(self, position: dict[str, Any]) -> None:
+    def _upsert_position(
+        self, position: dict[str, Any], *, expected_generation: int | None = None,
+    ) -> bool:
         """Apply one position event without closing unrelated positions."""
+        with self._position_fact_lock:
+            ticker = str(position.get("ticker") or position.get("market_ticker") or "")
+            if expected_generation is not None and self._position_fact_generations.get(ticker, 0) != expected_generation:
+                self._audit("TARGETED_POSITION_SUPERSEDED", {"ticker": ticker})
+                return False
+            self._apply_position(position)
+            if ticker and not getattr(self._reconcile_worker_context, "applying", False):
+                self._position_fact_generations[ticker] = self._position_fact_generations.get(ticker, 0) + 1
+            return True
+
+    def _apply_position(self, position: dict[str, Any]) -> None:
         signed = _number(position.get("position_fp") or position.get("position"))
         ticker = str(position.get("ticker") or position.get("market_ticker") or "")
         if not ticker:
@@ -3113,12 +3324,40 @@ class KalshiBroker(Broker):
         self,
         positions: list[dict[str, Any]],
         settlement_tickers: set[str] | None = None,
+        *,
+        expected_generations: dict[str, int] | None = None,
+    ) -> None:
+        # Check and write under the same lock used by private fills, targeted
+        # position recovery and entry acknowledgements. A slow REST snapshot
+        # cannot erase a fact learned after its request began, including by
+        # interpreting an omitted ticker as a flat position.
+        with self._position_fact_lock:
+            self._apply_position_snapshot(
+                positions, settlement_tickers,
+                expected_generations=expected_generations,
+            )
+
+    def _apply_position_snapshot(
+        self,
+        positions: list[dict[str, Any]],
+        settlement_tickers: set[str] | None = None,
+        *,
+        expected_generations: dict[str, int] | None = None,
     ) -> None:
         settlement_tickers = settlement_tickers or set()
+        superseded = {
+            ticker for ticker, generation in self._position_fact_generations.items()
+            if expected_generations is not None
+            and generation != expected_generations.get(ticker, 0)
+        }
+        if superseded:
+            self._audit("POSITION_SNAPSHOT_SUPERSEDED", {"tickers": sorted(superseded)})
         active: set[tuple[str, str]] = set()
         for position in positions:
             signed = _number(position.get("position_fp") or position.get("position"))
             ticker = str(position.get("ticker") or position.get("market_ticker") or "")
+            if ticker in superseded:
+                continue
             if abs(signed) < 1e-9:
                 if ticker:
                     self.db.execute(
@@ -3160,7 +3399,7 @@ class KalshiBroker(Broker):
         )
         for row in existing_rows:
             key = (str(row["ticker"]), str(row["side"]))
-            if key not in active:
+            if key not in active and key[0] not in superseded:
                 self.db.execute(
                     """UPDATE broker_positions SET status='closed',contracts=0,updated_at=?,
                         threshold_exit_status=CASE WHEN EXISTS (
