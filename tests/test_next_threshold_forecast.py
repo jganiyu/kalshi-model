@@ -52,6 +52,17 @@ def test_final_minute_uses_one_equal_weighted_proxy_sample_per_second() -> None:
     assert "not official" in str(state["qualifier"])
 
 
+def test_final_minute_can_label_authenticated_brti_source_without_extra_weight() -> None:
+    forecast = NextThresholdForecast()
+    opens = datetime(2026, 9, 4, 12, 15, tzinfo=UTC)
+    state, _ = forecast.observe(
+        next_market=market("NEXT", opens), known_markets=(None, None), proxy_price=100,
+        observed_at=stamp(opens - timedelta(seconds=20)),
+        source_label="CF Benchmarks BRTI estimate · official source ticks",
+    )
+    assert state and state["qualifier"].startswith("CF Benchmarks BRTI")
+
+
 def test_forecast_freezes_then_compares_to_the_published_threshold() -> None:
     forecast = NextThresholdForecast()
     opens = datetime(2026, 9, 4, 12, 15, tzinfo=UTC)

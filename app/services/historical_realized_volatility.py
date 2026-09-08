@@ -191,7 +191,18 @@ class CoinbaseRealizedVolatilityService:
                 refreshed_at = time.monotonic()
                 pages_since_summary = 0
                 while not self._stopped:
-                    complete = await self._backfill_page()
+                    # Historical repair is deliberately a separate failure lane.
+                    # A delayed/failed old page must never erase a fresh 16-candle
+                    # reading or blank the live volatility chart.
+                    try:
+                        complete = await self._backfill_page()
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        await self._record_backfill_failure(self._failure_detail(exc))
+                        await asyncio.sleep(min(30.0, retry_delay) * (.8 + random.random() * .4))
+                        retry_delay = min(60.0, retry_delay * 2.0)
+                        continue
                     pages_since_summary += 1
                     if time.monotonic() - refreshed_at >= 45:
                         await self._refresh_recent()
@@ -211,12 +222,21 @@ class CoinbaseRealizedVolatilityService:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                logger.warning("Coinbase realized-volatility worker failed: %s", exc, exc_info=True)
-                await self._record_failure(str(exc))
+                detail = self._failure_detail(exc)
+                logger.warning("Coinbase realized-volatility current-candle worker failed: %s", detail, exc_info=True)
+                await self._record_failure(detail)
                 # A history failure is informational. Retry in the background
                 # with a bounded, jittered delay rather than leaving a dead task.
                 await asyncio.sleep(retry_delay * (.8 + random.random() * .4))
                 retry_delay = min(60.0, retry_delay * 2.0)
+
+    @staticmethod
+    def _failure_detail(exc: BaseException) -> str:
+        """Never persist an opaque blank exception as an operational reason."""
+        message = str(exc).strip()
+        if not message:
+            message = repr(exc).strip() or "no exception detail supplied"
+        return f"{type(exc).__name__}: {message}"[:240]
 
     async def _refresh_recent(self) -> None:
         end = completed_minute_epoch()
@@ -520,6 +540,21 @@ class CoinbaseRealizedVolatilityService:
             # supervisor; memory is already fail-closed and retries continue.
             logger.warning("Could not persist Coinbase RV worker failure", exc_info=True)
 
+    async def _record_backfill_failure(self, detail: str) -> None:
+        """Persist cold-history trouble without invalidating current volatility."""
+        occurred_at = iso_now()
+        self._state = {
+            **self._state,
+            "historical_status": "partial",
+            "historical_note": "Historical repair delayed; current volatility remains live.",
+            "last_backfill_failure": detail,
+            "last_backfill_failure_at": occurred_at,
+        }
+        try:
+            await asyncio.to_thread(self._set_backfill_failure, detail, occurred_at)
+        except Exception:
+            logger.warning("Could not persist Coinbase RV backfill failure", exc_info=True)
+
     def _set_failure(self, detail: str) -> None:
         # Worker errors are visible but must never poison public-feed health,
         # arming, entry gates, or protective exits.
@@ -535,6 +570,23 @@ class CoinbaseRealizedVolatilityService:
                VALUES (?,?,?,?) ON CONFLICT(version) DO UPDATE SET status=excluded.status,
                reason=excluded.reason,updated_at=excluded.updated_at""",
                 (VERSION, "error", self._state["reason"], iso_now()),
+            )
+            connection.commit()
+
+    def _set_backfill_failure(self, detail: str, occurred_at: str) -> None:
+        with self.db.connect() as connection:
+            connection.execute(
+                """INSERT INTO coinbase_realized_volatility_events(version,kind,detail,occurred_at)
+                   VALUES (?,?,?,?)""",
+                (VERSION, "BACKFILL_FAILURE", detail, occurred_at),
+            )
+            # ``reason`` remains a concise durable diagnostic even when the
+            # memory cache is later refreshed with a current value.
+            connection.execute(
+                """INSERT INTO coinbase_realized_volatility_state(version,status,reason,updated_at)
+                   VALUES (?,?,?,?) ON CONFLICT(version) DO UPDATE SET
+                     status='partial',reason=excluded.reason,updated_at=excluded.updated_at""",
+                (VERSION, "partial", f"Historical repair delayed: {detail}", occurred_at),
             )
             connection.commit()
 

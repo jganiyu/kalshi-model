@@ -1146,6 +1146,22 @@ MIGRATIONS: list[tuple[int, str]] = [
         ALTER TABLE coinbase_realized_volatility_state ADD COLUMN gap_json TEXT NOT NULL DEFAULT '{}';
         """,
     ),
+    (
+        30,
+        """
+        -- Cold Coinbase-history repairs must be diagnosable without making a
+        -- fresh live volatility reading look unavailable.
+        CREATE TABLE coinbase_realized_volatility_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            version TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            detail TEXT NOT NULL,
+            occurred_at TEXT NOT NULL
+        );
+        CREATE INDEX idx_coinbase_rv_events_time
+            ON coinbase_realized_volatility_events(version,occurred_at DESC);
+        """,
+    ),
 ]
 
 

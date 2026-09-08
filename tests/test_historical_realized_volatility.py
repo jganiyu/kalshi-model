@@ -114,6 +114,29 @@ def test_failure_persistence_error_does_not_kill_supervisor_state(tmp_path) -> N
     assert service.dashboard_state()["horizons"]["15"]["rv_pct"] is None
 
 
+def test_backfill_failure_keeps_a_fresh_current_reading_visible_and_auditable(tmp_path) -> None:
+    db = Database(tmp_path / "rv.sqlite")
+    db.initialize()
+    service = CoinbaseRealizedVolatilityService(db)
+    service._state = {
+        **service._state, "status": "ready", "current_stale": False,
+        "as_of": datetime.now(UTC).isoformat(),
+        "horizons": {"15": {"rv_pct": .20, "percentile": 80, "sample_count": 99,
+                              "current_valid": True}},
+    }
+    asyncio.run(service._record_backfill_failure("RuntimeError: empty upstream page"))
+    state = service.dashboard_state()
+    assert state["status"] == "ready"
+    assert state["horizons"]["15"]["rv_pct"] == .20
+    assert state["historical_note"].startswith("Historical repair delayed")
+    event = db.fetch_one("SELECT kind,detail FROM coinbase_realized_volatility_events")
+    assert event == {"kind": "BACKFILL_FAILURE", "detail": "RuntimeError: empty upstream page"}
+
+
+def test_blank_exception_gets_a_useful_diagnostic() -> None:
+    assert CoinbaseRealizedVolatilityService._failure_detail(RuntimeError()) == "RuntimeError: RuntimeError()"
+
+
 def test_stale_cached_state_never_advertises_old_value(tmp_path) -> None:
     db = Database(tmp_path / "rv.sqlite")
     db.initialize()

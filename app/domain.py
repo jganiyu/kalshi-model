@@ -32,6 +32,7 @@ class NextThresholdForecast:
         self._frozen: dict[str, Any] | None = None
         self._comparison_until: float | None = None
         self._last_persisted_key: tuple[str, str] | None = None
+        self._source_label = "Proxy estimate · not official CF Benchmarks BRTI"
 
     @staticmethod
     def _market_identity(market: dict[str, Any] | None) -> tuple[str, str, float] | None:
@@ -71,7 +72,7 @@ class NextThresholdForecast:
             "coverage": min(1.0, len(values) / expected),
             "sample_dispersion_dollars": dispersion,
             "uncertainty_dollars": dispersion,
-            "qualifier": "Proxy estimate · not official CF Benchmarks BRTI",
+            "qualifier": self._source_label,
             "observed_at": observed.isoformat(),
         }
 
@@ -102,9 +103,12 @@ class NextThresholdForecast:
         proxy_price: float | None,
         observed_at: str,
         official_threshold: Callable[[dict[str, Any]], float | None] | None = None,
+        source_label: str | None = None,
     ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
         """Return (display_state, evidence_to_persist) for this clock tick."""
         observed = parse_time(observed_at) or utc_now()
+        if source_label:
+            self._source_label = source_label
         now = observed.timestamp()
         evidence: dict[str, Any] | None = None
 

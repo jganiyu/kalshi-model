@@ -56,7 +56,7 @@ from app.services.market_data import (
 from app.services.margin_volatility import MarginVolatilityService, quotes_are_fresh_and_qualified
 from app.services.historical_realized_volatility import CoinbaseRealizedVolatilityService, texas_readiness
 from app.services.paper import PaperTradingService
-from app.services.streaming import BitcoinWebSocketFeeds, KalshiWebSocketFeed
+from app.services.streaming import BitcoinWebSocketFeeds, CFBenchmarksWebSocketFeed, KalshiWebSocketFeed
 from app.services.training import ModelManager
 from app.services.trading import TradingCoordinator
 from app.services.trade_review import TradeReviewService
@@ -133,6 +133,7 @@ class AnalysisEngine:
             "current": None,
             "next": None,
             "next_threshold_forecast": None,
+            "cf_benchmarks": {"connected": False, "index_id": "BRTI"},
             "btc": None,
             "notification": None,
             "strategy": {"texas_holdem": self._texas_recovery_state()},
@@ -142,6 +143,7 @@ class AnalysisEngine:
         self._bootstrap_task: asyncio.Task[None] | None = None
         self._stream_tasks: list[asyncio.Task[None]] = []
         self._kalshi_stream_task: asyncio.Task[None] | None = None
+        self._cfbenchmarks_stream_task: asyncio.Task[None] | None = None
         self._kalshi_book_fallback_task: asyncio.Task[None] | None = None
         self._position_book_tasks: list[asyncio.Task[None]] = []
         self._book_persist_task: asyncio.Task[None] | None = None
@@ -169,6 +171,7 @@ class AnalysisEngine:
         self._last_kalshi_ws_book = 0.0
         self._latest_quotes: dict[str, ExchangeQuote] = {}
         self._latest_btc: dict[str, Any] | None = None
+        self._cfbenchmarks: dict[str, Any] = {"connected": False, "index_id": "BRTI"}
         self._current_market: dict[str, Any] | None = None
         self._next_market: dict[str, Any] | None = None
         self._market_state: dict[str, Any] | None = None
@@ -227,6 +230,7 @@ class AnalysisEngine:
             ]
         )
         self._start_kalshi_stream()
+        self._start_cfbenchmarks_stream()
         self._kalshi_book_fallback_task = asyncio.create_task(
             self._run_kalshi_book_fallback()
         )
@@ -255,6 +259,7 @@ class AnalysisEngine:
             self._volume_flush_task,
             self._historical_realized_volatility_task,
             self._kalshi_stream_task,
+            self._cfbenchmarks_stream_task,
             self._kalshi_book_fallback_task,
             self._book_persist_task,
             *self._position_book_tasks,
@@ -302,6 +307,51 @@ class AnalysisEngine:
         )
         self._kalshi_stream_task = asyncio.create_task(kalshi_stream.run())
 
+    def _start_cfbenchmarks_stream(self) -> None:
+        key_id, key_path = self.config.kalshi_api_key_id, self.config.kalshi_private_key_path
+        if not key_id or not key_path:
+            self._cfbenchmarks = {"connected": False, "index_id": "BRTI", "reason": "Kalshi authentication is not configured."}
+            return
+        stream = CFBenchmarksWebSocketFeed(
+            self.config.kalshi_ws_url, str(key_id), Path(key_path),
+            self._handle_cfbenchmarks_message, self._handle_cfbenchmarks_status,
+        )
+        self._cfbenchmarks_stream_task = asyncio.create_task(stream.run())
+
+    async def _handle_cfbenchmarks_status(self, source: str, connected: bool, error: str | None) -> None:
+        self._cfbenchmarks = {**self._cfbenchmarks, "connected": connected, "error": error}
+        self._schedule_publish()
+
+    async def _handle_cfbenchmarks_message(self, message: dict[str, Any]) -> None:
+        """Accept BRTI only; never let a vendor frame enter execution directly."""
+        payload = dict(message.get("msg") or {})
+        if str(payload.get("index_id") or "") != "BRTI":
+            return
+        kind = str(message.get("type") or "")
+        try:
+            value = float(payload.get("value_usd")) if kind.endswith("5hz") else float(json.loads(str(payload.get("data") or "{}")).get("value"))
+            source_ms = int(payload.get("source_ts_ms") or json.loads(str(payload.get("data") or "{}")).get("time"))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return
+        if not math.isfinite(value) or value <= 0 or source_ms <= 0:
+            return
+        observed_at = datetime.fromtimestamp(source_ms / 1000, UTC).isoformat()
+        self._cfbenchmarks = {**self._cfbenchmarks, "connected": True, "index_id": "BRTI",
+                              "value": value, "source_ts_ms": source_ms, "observed_at": observed_at,
+                              "channel": kind, "error": None}
+        # The 1Hz channel has one official print per second and the provider's
+        # running final-minute average.  It replaces only the *display-only*
+        # threshold forecast sample, not entry/exit or position logic.
+        if kind == "cfbenchmarks_value":
+            average = dict(payload.get("last_60s_windowed_average_15min") or {})
+            try:
+                average_value = float(average.get("value"))
+            except (TypeError, ValueError):
+                average_value = None
+            self._cfbenchmarks["final_minute_average"] = average_value if average_value and math.isfinite(average_value) else None
+            self._update_next_threshold_forecast(observed_at)
+        self._schedule_publish()
+
     async def set_kalshi_credentials(
         self,
         key_id: str | None,
@@ -312,6 +362,10 @@ class AnalysisEngine:
             self._kalshi_stream_task.cancel()
             await asyncio.gather(self._kalshi_stream_task, return_exceptions=True)
             self._kalshi_stream_task = None
+        if self._cfbenchmarks_stream_task:
+            self._cfbenchmarks_stream_task.cancel()
+            await asyncio.gather(self._cfbenchmarks_stream_task, return_exceptions=True)
+            self._cfbenchmarks_stream_task = None
         self.config = replace(
             self.config,
             kalshi_api_key_id=key_id,
@@ -319,6 +373,7 @@ class AnalysisEngine:
             kalshi_credentials_source=source,
         )
         self._start_kalshi_stream()
+        self._start_cfbenchmarks_stream()
         current = self.dashboard.get("current") or {}
         reliable = bool(
             current
@@ -476,6 +531,7 @@ class AnalysisEngine:
             "current": current_payload,
             "next": self._market_summary(next_market) if next_market else None,
             "next_threshold_forecast": self._next_threshold_forecast_state(),
+            "cf_benchmarks": dict(self._cfbenchmarks),
             "notification": notification,
             "strategy": {"texas_holdem": self._texas_recovery_state()},
             "paper": self._portfolio_summary(),
@@ -1213,6 +1269,8 @@ class AnalysisEngine:
             },
             "current": current,
             "next": self._market_summary(self._next_market) if self._next_market else None,
+            "next_threshold_forecast": self._next_threshold_forecast_state(),
+            "cf_benchmarks": dict(self._cfbenchmarks),
             "notification": notification,
             "strategy": {"texas_holdem": self._texas_recovery_state()},
             "paper": self._portfolio_summary(),
@@ -2258,12 +2316,28 @@ class AnalysisEngine:
         frozen, frozen_evidence = self._next_threshold_forecast.freeze_if_due(observed_at)
         if frozen_evidence:
             self._persist_next_threshold_forecast(frozen_evidence)
+        source_label = "Proxy estimate · not official CF Benchmarks BRTI"
+        forecast_price = (self._latest_btc or {}).get("price")
+        cf_at = parse_time(self._cfbenchmarks.get("observed_at"))
+        now = parse_time(observed_at)
+        # Do not quietly use a stale official tick.  The public composite
+        # remains the display-only fallback until BRTI is current again.
+        if cf_at and now and 0 <= (now - cf_at).total_seconds() <= 3:
+            candidate = self._cfbenchmarks.get("value")
+            try:
+                candidate = float(candidate)
+            except (TypeError, ValueError):
+                candidate = None
+            if candidate and math.isfinite(candidate) and candidate > 0:
+                forecast_price = candidate
+                source_label = "CF Benchmarks BRTI estimate · official source ticks"
         state, comparison_evidence = self._next_threshold_forecast.observe(
             next_market=self._next_market,
             known_markets=(self._current_market, self._next_market),
-            proxy_price=(self._latest_btc or {}).get("price"),
+            proxy_price=forecast_price,
             observed_at=observed_at,
             official_threshold=market_strike,
+            source_label=source_label,
         )
         if comparison_evidence:
             self._persist_next_threshold_forecast(comparison_evidence)

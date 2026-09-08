@@ -15,6 +15,7 @@ from app.services.market_data import ExchangeQuote, live_composite_quote
 from app.services.kalshi import KalshiPublicClient
 from app.services.streaming import (
     BitcoinWebSocketFeeds,
+    CFBenchmarksWebSocketFeed,
     KalshiOrderBook,
     KalshiWebSocketFeed,
     kalshi_websocket_headers,
@@ -26,6 +27,33 @@ def test_lifecycle_subscription_is_on_kalshi_not_bitcoin_stream() -> None:
     assert "market_lifecycle_v2" not in inspect.getsource(
         BitcoinWebSocketFeeds._coinbase_connection
     )
+
+
+def test_cfbenchmarks_stream_is_isolated_and_subscribes_to_both_brti_rates() -> None:
+    source = inspect.getsource(CFBenchmarksWebSocketFeed._connection)
+    assert '"cfbenchmarks_value"' in source
+    assert '"cfbenchmarks_value_5hz"' in source
+    assert '"BRTI"' in source
+
+
+def test_cfbenchmarks_per_second_tick_updates_only_display_forecast_state() -> None:
+    async def scenario() -> None:
+        engine = AnalysisEngine.__new__(AnalysisEngine)
+        engine._cfbenchmarks = {"connected": False, "index_id": "BRTI"}
+        calls: list[str] = []
+        engine._update_next_threshold_forecast = calls.append
+        engine._schedule_publish = lambda: None
+        await engine._handle_cfbenchmarks_message({
+            "type": "cfbenchmarks_value", "msg": {
+                "index_id": "BRTI", "data": '{"time":1710000000123,"value":"68000.12"}',
+                "last_60s_windowed_average_15min": {"value": "68000.23"},
+            },
+        })
+        assert engine._cfbenchmarks["value"] == pytest.approx(68000.12)
+        assert engine._cfbenchmarks["final_minute_average"] == pytest.approx(68000.23)
+        assert len(calls) == 1
+
+    asyncio.run(scenario())
 
 
 def test_public_kalshi_requests_have_a_short_independent_timeout() -> None:

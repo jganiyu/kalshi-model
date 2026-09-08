@@ -29,6 +29,7 @@ TradeHandler = Callable[[ExchangeTrade], Awaitable[None]]
 StatusHandler = Callable[[str, bool, str | None], Awaitable[None]]
 KalshiHandler = Callable[[dict[str, Any], dict[str, Any] | None], Awaitable[None]]
 PrivateKalshiHandler = Callable[[dict[str, Any]], Awaitable[None]]
+CFBenchmarksHandler = Callable[[dict[str, Any]], Awaitable[None]]
 
 
 def kalshi_websocket_headers(
@@ -400,6 +401,62 @@ class KalshiWebSocketFeed:
                     await self.on_message(message, None)
                 elif message_type in {"market_lifecycle", "market_lifecycle_v2"}:
                     await self.on_message(message, None)
+
+
+class CFBenchmarksWebSocketFeed:
+    """Dedicated authenticated BRTI stream, isolated from Kalshi order books.
+
+    The vendor-value connection is intentionally separate: a burst of 5Hz
+    reference ticks must not delay book deltas or reconnect the market-book
+    socket.  It is data-only; callers decide whether to use it for any model.
+    """
+
+    def __init__(
+        self, websocket_url: str, key_id: str, private_key_path: Path,
+        on_message: CFBenchmarksHandler, on_status: StatusHandler,
+    ):
+        self.websocket_url = websocket_url
+        self.key_id = key_id
+        self.private_key_path = private_key_path
+        self.on_message = on_message
+        self.on_status = on_status
+
+    async def run(self) -> None:
+        delay = 1.0
+        while True:
+            try:
+                await self._connection()
+                delay = 1.0
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                detail = f"{type(exc).__name__}: {str(exc) or repr(exc)}"
+                logger.warning("CF Benchmarks stream disconnected: %s", detail)
+                await self.on_status("CF Benchmarks", False, detail)
+                await asyncio.sleep(delay + random.uniform(0, delay * .2))
+                delay = min(30.0, delay * 2.0)
+
+    async def _connection(self) -> None:
+        headers = kalshi_websocket_headers(self.key_id, self.private_key_path)
+        async with connect(
+            self.websocket_url, ssl=TLS_CONTEXT, additional_headers=headers,
+            open_timeout=5, close_timeout=2, ping_interval=20, ping_timeout=20,
+            max_queue=2048,
+        ) as websocket:
+            # Per-second data carries the official running final-minute average;
+            # 5Hz BRTI ticks are retained for freshness/basis diagnostics.
+            for request_id, channel in ((1, "cfbenchmarks_value"), (2, "cfbenchmarks_value_5hz")):
+                await websocket.send(json.dumps({
+                    "id": request_id, "cmd": "subscribe",
+                    "params": {"channels": [channel], "index_ids": ["BRTI"]},
+                }))
+            await self.on_status("CF Benchmarks", True, None)
+            async for raw in websocket:
+                message = json.loads(raw)
+                if message.get("type") == "error":
+                    raise RuntimeError("CF Benchmarks subscription rejected")
+                if message.get("type") in {"cfbenchmarks_value", "cfbenchmarks_value_5hz"}:
+                    await self.on_message(message)
 
 
 class KalshiPrivateWebSocketFeed:

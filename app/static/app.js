@@ -131,7 +131,9 @@ function renderHistoricalRealizedVolatility(btc) {
     const baseline = coverageDays !== null && coverageDays < 89.9
       ? `${Math.floor(coverageDays)}-day / 90-day baseline`
       : "90-day baseline";
-    detail.textContent = `Coinbase · ${Math.round(percentileValue)}th percentile · ${baseline}`;
+    detail.textContent = history.historical_note
+      ? `Coinbase · ${Math.round(percentileValue)}th percentile · repair delayed`
+      : `Coinbase · ${Math.round(percentileValue)}th percentile · ${baseline}`;
   } else {
     detail.textContent = "Coinbase · 90-day baseline loading";
   }
