@@ -6,7 +6,10 @@ from datetime import UTC, datetime
 import pytest
 
 from app.db import Database
-from app.services.texas_rv_replay import _fill_pnl, _point_crossing, _summary, bucket, replay_texas_rv, rv15_at
+from app.services.texas_rv_replay import (
+    _fill_pnl, _point_crossing, _summary, _sweep_loss_minimization, bucket,
+    replay_texas_rv, rv15_at,
+)
 
 
 def _iso(epoch: int) -> str:
@@ -204,3 +207,35 @@ def test_crossing_is_bounded_at_market_close_and_summary_excludes_unknown_pnl() 
     }])["0.20–<0.40%"]
     assert paper["filled_rounds"] == 0
     assert paper["paper_broker_fill_unavailable_rounds"] == 1
+
+
+def test_loss_minimization_sweep_is_causal_gap_safe_and_marks_remaining_at_bid() -> None:
+    started = 1_700_400_000
+    points = [
+        {"id": index, "observed_at": _iso(started + index * 10), "data_reliable": 1,
+         "btc_proxy": 940 - index, "threshold": 1_000, "yes_bid": .35, "no_bid": .64}
+        for index in range(31)
+    ]
+    base = {
+        "round_id": 1, "side": "YES", "threshold": 1_000,
+        "first_fill_at": _iso(started), "market_close_time": _iso(started + 900),
+        "points": points,
+        "buy_fills": [{"id": 1, "filled_at": _iso(started), "contracts": 2, "price": .4, "fee": .02}],
+        "sells": [], "sell_attribution_ambiguous": False, "actual_net_pnl": -.82,
+    }
+    sweep = _sweep_loss_minimization([base], checkpoints=(300,), buffers=(0, 35, 75))
+    # At five minutes the held YES has never touched $1,000 and is $90 below it.
+    variant = sweep["variants"]["300s/$75"]
+    assert variant["qualified_rounds"] == 1
+    row = variant["rounds"][0]
+    assert row["remaining_contracts"] == 2
+    assert row["recorded_bid"] == .35
+    assert row["estimated_net_pnl"] == pytest.approx(2 * .35 - .0319 - .82)
+    assert variant["synthetic_mark_to_bid_net_pnl"] > variant["actual_net_pnl_for_same_rounds"]
+    # A threshold touch makes the rule ineligible even if the final point is far away.
+    touched = dict(base, points=[*points, {"id": 99, "observed_at": _iso(started + 150), "data_reliable": 1,
+                                   "btc_proxy": 1_000, "yes_bid": .5, "no_bid": .49}])
+    assert _sweep_loss_minimization([touched], checkpoints=(300,), buffers=(0,))["variants"]["300s/$0"]["qualified_rounds"] == 0
+    # A gap is excluded; it cannot become a synthetic no-breach result.
+    gapped = dict(base, points=[points[0], points[-1]])
+    assert _sweep_loss_minimization([gapped], checkpoints=(300,), buffers=(0,))["variants"]["300s/$0"]["excluded"]["review_gap_exceeds_20s"] == 1

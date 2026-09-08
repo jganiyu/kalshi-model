@@ -14,6 +14,7 @@ from datetime import UTC, datetime
 from typing import Any, Iterable
 
 from app.db import Database
+from app.domain import kalshi_fee, texas_threshold_breached, texas_unfavorable_distance
 from app.services.historical_realized_volatility import (
     GRANULARITY_SECONDS, PRODUCT, SOURCE, realized_volatility,
 )
@@ -21,6 +22,9 @@ from app.services.historical_realized_volatility import (
 
 BUCKETS = ("<0.20%", "0.20–<0.40%", "0.40–<0.80%", "≥0.80%")
 EPSILON = 1e-9
+SWEEP_CHECKPOINT_SECONDS = (180, 300, 420, 600)
+SWEEP_UNFAVORABLE_DISTANCE_DOLLARS = (0, 35, 50, 75)
+SWEEP_MAX_POINT_GAP_SECONDS = 20.0
 
 
 def _time_epoch(value: object) -> float | None:
@@ -296,6 +300,119 @@ def _summary(rows: list[dict[str, Any]], *, attempt_key: str = "first_attempt") 
     return result
 
 
+def _sweep_loss_minimization(
+    inputs: Iterable[dict[str, Any]],
+    *,
+    checkpoints: Iterable[int] = SWEEP_CHECKPOINT_SECONDS,
+    buffers: Iterable[int] = SWEEP_UNFAVORABLE_DISTANCE_DOLLARS,
+) -> dict[str, Any]:
+    """Causally mark the proposed no-touch, adverse-distance exits.
+
+    This intentionally reports a *mark-to-recorded-bid* counterfactual, not a
+    fill backtest.  It needs a continuous reliable review-point sequence through
+    the checkpoint, and excludes a row rather than treating missing data as a
+    no-touch.  Actual fills before the checkpoint remain actual; only the
+    conservatively established remaining position is marked at the checkpoint.
+    """
+    result: dict[str, Any] = {}
+    for checkpoint_seconds in checkpoints:
+        for buffer_dollars in buffers:
+            key = f"{checkpoint_seconds}s/${buffer_dollars}"
+            eligible: list[dict[str, Any]] = []
+            excluded: defaultdict[str, int] = defaultdict(int)
+            for item in inputs:
+                first_fill_epoch = _time_epoch(item.get("first_fill_at"))
+                close_epoch = _time_epoch(item.get("market_close_time"))
+                threshold = _number(item.get("threshold"))
+                side = str(item.get("side") or "").upper()
+                if first_fill_epoch is None or close_epoch is None or threshold is None or side not in {"YES", "NO"}:
+                    excluded["missing_round_timing_or_side"] += 1
+                    continue
+                checkpoint_epoch = first_fill_epoch + checkpoint_seconds
+                if checkpoint_epoch > close_epoch:
+                    excluded["checkpoint_after_market_close"] += 1
+                    continue
+                if item.get("sell_attribution_ambiguous"):
+                    excluded["ambiguous_sell_ownership"] += 1
+                    continue
+                points = [point for point in item.get("points", []) if (
+                    (epoch := _time_epoch(point.get("observed_at"))) is not None
+                    and first_fill_epoch <= epoch <= checkpoint_epoch
+                    and int(point.get("data_reliable") or 0)
+                    and _number(point.get("btc_proxy")) is not None
+                )]
+                if not points:
+                    excluded["no_reliable_points"] += 1
+                    continue
+                points.sort(key=lambda point: (_time_epoch(point.get("observed_at")) or -1, int(point.get("id") or 0)))
+                point_epochs = [_time_epoch(point.get("observed_at")) or 0 for point in points]
+                # A sampled 'no touch' is unsafe when observations skip a long
+                # interval.  This includes the fill-to-first and last-to-checkpoint
+                # edges rather than only gaps between stored points.
+                gaps = [point_epochs[0] - first_fill_epoch, checkpoint_epoch - point_epochs[-1]]
+                gaps.extend(right - left for left, right in zip(point_epochs, point_epochs[1:]))
+                if max(gaps) > SWEEP_MAX_POINT_GAP_SECONDS:
+                    excluded["review_gap_exceeds_20s"] += 1
+                    continue
+                if any(texas_threshold_breached(side, point.get("btc_proxy"), threshold) for point in points):
+                    excluded["recorded_threshold_touch"] += 1
+                    continue
+                latest = points[-1]
+                distance = texas_unfavorable_distance(side, latest.get("btc_proxy"), threshold)
+                if distance is None or distance + EPSILON < buffer_dollars:
+                    excluded["distance_below_buffer"] += 1
+                    continue
+                bid = _number(latest.get("yes_bid") if side == "YES" else latest.get("no_bid"))
+                if bid is None or bid <= 0:
+                    excluded["missing_executable_bid"] += 1
+                    continue
+                before_buys = [fill for fill in item["buy_fills"] if (_time_epoch(fill.get("filled_at")) or float("inf")) <= checkpoint_epoch]
+                before_sells = [fill for fill in item["sells"] if (_time_epoch(fill.get("filled_at")) or float("inf")) <= checkpoint_epoch]
+                before = _fill_pnl(before_buys, before_sells, None, side)
+                remaining = float(before.get("remaining_contracts") or 0)
+                if before.get("accounting_ambiguous") or before.get("unmatched_sell_contracts", 0) > EPSILON:
+                    excluded["ambiguous_checkpoint_position"] += 1
+                    continue
+                if remaining <= EPSILON:
+                    excluded["already_closed_at_checkpoint"] += 1
+                    continue
+                estimated_exit_fee = kalshi_fee(bid, remaining)
+                estimated_net = float(before.get("realized_pnl") or 0) + remaining * bid - estimated_exit_fee - float(before.get("open_cost_basis") or 0)
+                eligible.append({
+                    "round_id": item["round_id"], "checkpoint_at": latest.get("observed_at"),
+                    "remaining_contracts": remaining, "unfavorable_distance": distance,
+                    "recorded_bid": bid, "estimated_exit_fee": estimated_exit_fee,
+                    "estimated_net_pnl": estimated_net, "actual_net_pnl": item.get("actual_net_pnl"),
+                })
+            comparable = [row for row in eligible if row["actual_net_pnl"] is not None]
+            result[key] = {
+                "checkpoint_seconds": checkpoint_seconds,
+                "unfavorable_distance_at_least_dollars": buffer_dollars,
+                "qualified_rounds": len(eligible),
+                "comparable_resolved_rounds": len(comparable),
+                "synthetic_mark_to_bid_net_pnl": sum(row["estimated_net_pnl"] for row in comparable),
+                "actual_net_pnl_for_same_rounds": sum(float(row["actual_net_pnl"]) for row in comparable),
+                "synthetic_minus_actual_net_pnl": sum(row["estimated_net_pnl"] - float(row["actual_net_pnl"]) for row in comparable),
+                "excluded": dict(sorted(excluded.items())),
+                "rounds": eligible,
+            }
+    return {
+        "kind": "read_only_texas_no_touch_loss_minimization_sweep",
+        "method": {
+            "trigger": "At checkpoint: no recorded threshold touch since first fill, adverse-side distance at least buffer, and a reliable point sequence with no gap above 20 seconds.",
+            "price": "Latest recorded executable bid at or before checkpoint; hypothetical full IOC fill is not inferred.",
+            "fees": "Current Kalshi taker-fee formula at the recorded bid; actual pre-checkpoint fills retain their recorded fees.",
+            "zero_buffer": "0 means no extra adverse-distance buffer beyond no recorded touch.",
+        },
+        "limitations": [
+            "This is a mark-to-recorded-bid counterfactual, not evidence that the displayed bid had enough size for a full fill.",
+            "No recorded touch is not proof of no intragap or intrasecond threshold touch.",
+            "Only rounds with complete enough stored review points are included; exclusions are reported rather than guessed.",
+        ],
+        "variants": result,
+    }
+
+
 def replay_texas_rv(db: Database) -> dict[str, Any]:
     """Return a frozen, JSON-serializable analysis report without DB mutation."""
     connection = db.connect()
@@ -337,6 +454,7 @@ def replay_texas_rv(db: Database) -> dict[str, Any]:
 
     report_rows: list[dict[str, Any]] = []
     attempt_rows: list[dict[str, Any]] = []
+    sweep_inputs: list[dict[str, Any]] = []
     for round_row in rounds:
         mode, ticker, side = str(round_row["environment"]), str(round_row["ticker"]), str(round_row.get("side") or "")
         unit_attempts = attempts_by_round.get(int(round_row["id"]), [])
@@ -398,6 +516,13 @@ def replay_texas_rv(db: Database) -> dict[str, Any]:
             "crossing": crossing, "review": {"available": bool(session), "coverage": session.get("coverage") if session else None,
                 "gap_count": session.get("gap_count") if session else None, "status": session.get("status") if session else "UNAVAILABLE"},
         })
+        sweep_inputs.append({
+            "round_id": round_row["id"], "side": side, "threshold": round_row.get("threshold"),
+            "first_fill_at": first_fill_at, "market_close_time": session.get("market_close_time") if session else None,
+            "points": points_by_session.get(int(session["id"]), []) if session else [],
+            "buy_fills": buy_fills, "sells": attributed_sells,
+            "sell_attribution_ambiguous": bool(sell_ambiguities), "actual_net_pnl": pnl.get("net_pnl"),
+        })
     # Keep chronology explicit; all per-bucket outputs have exact denominators.
     early = report_rows[:len(report_rows) // 2]
     late = report_rows[len(report_rows) // 2:]
@@ -425,6 +550,7 @@ def replay_texas_rv(db: Database) -> dict[str, Any]:
             for environment in ("PAPER", "DEMO", "LIVE")
         }, "chronological": {"early": _summary(early), "late": _summary(late)},
         "by_strategy": {version: _summary([row for row in report_rows if row["strategy_version"] == version]) for version in ("LEGACY", "V2")},
+        "loss_minimization_sweep": _sweep_loss_minimization(sweep_inputs),
     }
 
 
