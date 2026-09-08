@@ -33,6 +33,8 @@ MINIMUM_BASELINE_DAYS = 7
 MINIMUM_BASELINE_SAMPLES = MINIMUM_BASELINE_DAYS * 24 * 60
 # Coinbase permits at most 300 candles; leave a small endpoint-boundary margin.
 PAGE_MINUTES = 290
+GAP_RETRY_INITIAL_SECONDS = 30 * 60
+GAP_RETRY_MAX_SECONDS = 24 * 60 * 60
 CANDLE_URL = "https://api.exchange.coinbase.com/products/BTC-USD/candles"
 CANDLE_TIMEOUT = httpx.Timeout(connect=2.0, read=4.0, write=4.0, pool=0.5)
 CANDLE_LIMITS = httpx.Limits(max_connections=1, max_keepalive_connections=1, keepalive_expiry=15.0)
@@ -308,10 +310,14 @@ class CoinbaseRealizedVolatilityService:
         cursor = int(cursor)
         if cursor > target:
             return max(target, cursor - PAGE_MINUTES * GRANULARITY_SECONDS), cursor, False
-        # Once the main pass completes, repair only bounded, persisted holes.
+        # Once the main pass completes, repair persisted holes.  A hole that
+        # Coinbase did not return three times is retried later with a capped
+        # backoff; it is never retried in a tight loop or made permanent.
         gaps = self._gaps(state.get("gap_json"))
         for key, value in sorted(gaps.items()):
-            if int(value.get("attempts", 0)) < 3:
+            attempts = int(value.get("attempts", 0))
+            retry_after = int(value.get("retry_after_epoch", 0))
+            if attempts < 3 or now >= retry_after:
                 return int(value["start"]), int(value["end"]), True
         hole = self._first_untracked_hole(target, now, gaps)
         if hole is not None:
@@ -323,7 +329,8 @@ class CoinbaseRealizedVolatilityService:
         try:
             decoded = json.loads(str(raw or "{}"))
             return {str(key): {"start": int(value["start"]), "end": int(value["end"]),
-                               "attempts": int(value.get("attempts", 0))}
+                               "attempts": int(value.get("attempts", 0)),
+                               "retry_after_epoch": int(value.get("retry_after_epoch", 0))}
                     for key, value in decoded.items()}
         except (ValueError, TypeError, KeyError):
             return {}
@@ -359,8 +366,19 @@ class CoinbaseRealizedVolatilityService:
         key = f"{start}:{end}"
         if not complete:
             prior = gaps.get(key, {})
-            gaps[key] = {"start": start, "end": end,
-                         "attempts": min(3, int(prior.get("attempts", 0)) + 1)}
+            attempts = int(prior.get("attempts", 0)) + 1
+            # The first three repairs happen during the initial low-priority
+            # pass.  Later attempts back off independently so sparse Coinbase
+            # omissions can heal without consuming quote/execution capacity.
+            retry_after = 0
+            if attempts >= 3:
+                delay = min(
+                    GAP_RETRY_MAX_SECONDS,
+                    GAP_RETRY_INITIAL_SECONDS * 2 ** min(8, attempts - 3),
+                )
+                retry_after = int(time.time()) + delay
+            gaps[key] = {"start": start, "end": end, "attempts": attempts,
+                         "retry_after_epoch": retry_after}
         else:
             gaps.pop(key, None)
         # Bound durable diagnostic state; these records are status only and

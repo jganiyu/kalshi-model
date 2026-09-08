@@ -169,6 +169,23 @@ def test_empty_page_advances_durable_cursor_and_marks_hole(tmp_path) -> None:
     assert next_end == start and next_start < next_end
 
 
+def test_exhausted_gap_gets_a_later_retry_instead_of_becoming_permanent(tmp_path) -> None:
+    db = Database(tmp_path / "rv.sqlite")
+    db.initialize()
+    service = CoinbaseRealizedVolatilityService(db)
+    now = completed_minute_epoch()
+    start, end = now - 290 * 60, now
+    for _ in range(3):
+        service._mark_requested_range(start, end, False, True)
+    stored = db.fetch_one(
+        "SELECT gap_json FROM coinbase_realized_volatility_state WHERE version=?",
+        ("coinbase-rv-1",),
+    )
+    gap = service._gaps(stored["gap_json"])[f"{start}:{end}"]
+    assert gap["attempts"] == 3
+    assert gap["retry_after_epoch"] > 0
+
+
 def test_texas_readiness_requires_exact_current_coinbase_contract() -> None:
     now = "2026-01-01T00:01:00+00:00"
     valid = {
