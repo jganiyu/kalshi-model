@@ -1045,7 +1045,13 @@ def test_dashboard_markup_has_two_fixed_books_and_paper_trade_history() -> None:
     assert 'context.moveTo(left, levelY); context.lineTo(plotRight, levelY)' in script
     assert 'const tag = entryEvent ? "Entry" : exitEvent ? "Exit" : null;' in script
     assert 'data-chart-mode="volatility"' in markup
-    assert 'id: "maximum_margin_volatility"' in script
+    assert 'Coinbase ${horizon}m realized volatility' in script
+    assert 'texas-rv-multiplier' in markup
+    assert 'BOOSTED 1.5×' not in script
+    # MVI is retired from active calibration.  A saved legacy value remains
+    # auditable and safely blocks Standard Edge rather than posing as a live
+    # user-adjustable volatility signal.
+    assert 'id: "maximum_margin_volatility"' not in script
     assert 'id: "directional_momentum_gate_enabled"' in script
     assert 'data-tooltip="The model probability' in markup
     assert 'aria-label="About risk controls"' in markup
