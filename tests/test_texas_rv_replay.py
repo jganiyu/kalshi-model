@@ -221,7 +221,7 @@ def test_loss_minimization_sweep_is_causal_gap_safe_and_marks_remaining_at_bid()
         "first_fill_at": _iso(started), "market_close_time": _iso(started + 900),
         "points": points,
         "buy_fills": [{"id": 1, "filled_at": _iso(started), "contracts": 2, "price": .4, "fee": .02}],
-        "sells": [], "sell_attribution_ambiguous": False, "actual_net_pnl": -.82,
+        "sells": [], "sell_attribution_ambiguous": False, "actual_net_pnl": -.82, "rv15_pct": .25,
     }
     sweep = _sweep_loss_minimization([base], checkpoints=(300,), buffers=(0, 35, 75))
     # At five minutes the held YES has never touched $1,000 and is $90 below it.
@@ -239,3 +239,6 @@ def test_loss_minimization_sweep_is_causal_gap_safe_and_marks_remaining_at_bid()
     # A gap is excluded; it cannot become a synthetic no-breach result.
     gapped = dict(base, points=[points[0], points[-1]])
     assert _sweep_loss_minimization([gapped], checkpoints=(300,), buffers=(0,))["variants"]["300s/$0"]["excluded"]["review_gap_exceeds_20s"] == 1
+    gated = _sweep_loss_minimization([base], checkpoints=(300,), buffers=(0,), minimum_rv15_pct=.30)
+    assert gated["variants"]["300s/$0"]["qualified_rounds"] == 0
+    assert gated["variants"]["300s/$0"]["excluded"]["below_rv15_gate"] == 1

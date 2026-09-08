@@ -305,6 +305,7 @@ def _sweep_loss_minimization(
     *,
     checkpoints: Iterable[int] = SWEEP_CHECKPOINT_SECONDS,
     buffers: Iterable[int] = SWEEP_UNFAVORABLE_DISTANCE_DOLLARS,
+    minimum_rv15_pct: float = 0.0,
 ) -> dict[str, Any]:
     """Causally mark the proposed no-touch, adverse-distance exits.
 
@@ -321,6 +322,13 @@ def _sweep_loss_minimization(
             eligible: list[dict[str, Any]] = []
             excluded: defaultdict[str, int] = defaultdict(int)
             for item in inputs:
+                rv15_pct = _number(item.get("rv15_pct"))
+                if rv15_pct is None:
+                    excluded["missing_causal_rv15"] += 1
+                    continue
+                if rv15_pct + EPSILON < minimum_rv15_pct:
+                    excluded["below_rv15_gate"] += 1
+                    continue
                 first_fill_epoch = _time_epoch(item.get("first_fill_at"))
                 close_epoch = _time_epoch(item.get("market_close_time"))
                 threshold = _number(item.get("threshold"))
@@ -404,6 +412,7 @@ def _sweep_loss_minimization(
             "fees": "Current Kalshi taker-fee formula at the recorded bid; actual pre-checkpoint fills retain their recorded fees.",
             "zero_buffer": "0 means no extra adverse-distance buffer beyond no recorded touch.",
         },
+        "minimum_rv15_pct": minimum_rv15_pct,
         "limitations": [
             "This is a mark-to-recorded-bid counterfactual, not evidence that the displayed bid had enough size for a full fill.",
             "No recorded touch is not proof of no intragap or intrasecond threshold touch.",
@@ -522,6 +531,9 @@ def replay_texas_rv(db: Database) -> dict[str, Any]:
             "points": points_by_session.get(int(session["id"]), []) if session else [],
             "buy_fills": buy_fills, "sells": attributed_sells,
             "sell_attribution_ambiguous": bool(sell_ambiguities), "actual_net_pnl": pnl.get("net_pnl"),
+            # The exact funded order's decision-time RV is preferred.  A round
+            # that never funded cannot inform an after-fill exit variant.
+            "rv15_pct": _number((funded_records[0] if funded_records else first_record).get("rv", {}).get("rv15_pct")),
         })
     # Keep chronology explicit; all per-bucket outputs have exact denominators.
     early = report_rows[:len(report_rows) // 2]
@@ -551,6 +563,10 @@ def replay_texas_rv(db: Database) -> dict[str, Any]:
         }, "chronological": {"early": _summary(early), "late": _summary(late)},
         "by_strategy": {version: _summary([row for row in report_rows if row["strategy_version"] == version]) for version in ("LEGACY", "V2")},
         "loss_minimization_sweep": _sweep_loss_minimization(sweep_inputs),
+        "loss_minimization_by_rv15_gate": {
+            f"≥{gate:.2f}%": _sweep_loss_minimization(sweep_inputs, minimum_rv15_pct=gate)
+            for gate in (0.15, 0.20, 0.25, 0.30)
+        },
     }
 
 
