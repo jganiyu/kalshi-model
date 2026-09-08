@@ -11,8 +11,6 @@ from app.db import Database
 from app.domain import (
     TEXAS_HOLDEM_LEGACY,
     TEXAS_HOLDEM_V2,
-    TEXAS_V2_MVI_BOOST_MULTIPLIER,
-    TEXAS_V2_MVI_BOOST_THRESHOLD,
     TEXAS_V2_RULE_VERSION,
     TEXAS_V2_THESIS_CHECKPOINT_SECONDS,
     TEXAS_V2_THESIS_UNFAVORABLE_DISTANCE,
@@ -30,6 +28,7 @@ from app.domain import (
 from app.services.decision import Decision
 from app.services.directional_momentum import directional_gate
 from app.services.margin_volatility import MarginVolatilityService
+from app.services.historical_realized_volatility import texas_readiness
 from app.services.trade_review import paper_trade_ref, review_metadata
 
 
@@ -105,16 +104,52 @@ class PaperTradingService:
         )
 
     @staticmethod
-    def _texas_v2_mvi_minimum(settings: dict[str, Any], mode: str) -> float:
-        """Read the isolated gate, with a one-release fallback for old DBs."""
-        value = settings.get(
-            f"{str(mode).lower()}_texas_holdem_v2_mvi_minimum",
-            settings.get("texas_holdem_v2_mvi_minimum", 4.0),
-        )
+    def _texas_v21_realized_volatility_gate(settings: dict[str, Any], mode: str) -> float:
+        """Actual percentage points; legacy MVI settings are never a fallback."""
+        value = settings.get(f"{str(mode).lower()}_texas_holdem_v21_realized_volatility_gate_pct", .20)
         try:
-            return max(0.0, min(10.0, float(value)))
+            return max(0.0, min(100.0, float(value)))
         except (TypeError, ValueError):
-            return 4.0
+            return .20
+
+    @staticmethod
+    def _texas_v21_realized_volatility_boost(settings: dict[str, Any], mode: str) -> float:
+        try:
+            return max(0.0, min(100.0, float(settings.get(
+                f"{str(mode).lower()}_texas_holdem_v21_realized_volatility_boost_pct", .80
+            ))))
+        except (TypeError, ValueError):
+            return .80
+
+    @staticmethod
+    def _texas_v21_realized_volatility_boost_multiplier(
+        settings: dict[str, Any], mode: str,
+    ) -> float:
+        """Saved multiplier; it can increase allocation, never risk ceilings."""
+        try:
+            return max(1.0, min(5.0, float(settings.get(
+                f"{str(mode).lower()}_texas_holdem_v21_realized_volatility_boost_multiplier", 1.5
+            ))))
+        except (TypeError, ValueError):
+            return 1.5
+
+    @staticmethod
+    def _standard_volatility_gate(settings: dict[str, Any]) -> dict[str, Any]:
+        """Do not silently weaken a saved Standard Edge MVI requirement.
+
+        MVI collection is retired.  A non-zero legacy cap therefore blocks
+        Standard Edge new entries with an honest migration blocker instead of
+        pretending old MVI data is still live.  Texas never calls this gate.
+        """
+        try:
+            maximum = float(settings.get("maximum_margin_volatility", 0) or 0)
+        except (TypeError, ValueError):
+            maximum = 0.0
+        if maximum > 0:
+            return {"passed": False, "enabled": True, "value": None, "required": maximum,
+                    "detail": "Legacy MVI limit is configured, but MVI is retired; Standard Edge entries are blocked."}
+        return {"passed": True, "enabled": False, "value": None, "required": 0.0,
+                "detail": "Off"}
 
     @staticmethod
     def _texas_v2_base_allocation(settings: dict[str, Any], mode: str) -> float:
@@ -381,7 +416,9 @@ class PaperTradingService:
     ) -> dict[str, Any]:
         settings = self.db.settings()
         mode = str(execution_mode or "PAPER").upper()
-        mvi_minimum = self._texas_v2_mvi_minimum(settings, mode)
+        rv_gate = self._texas_v21_realized_volatility_gate(settings, mode)
+        rv_boost_threshold = self._texas_v21_realized_volatility_boost(settings, mode)
+        rv_boost_multiplier = self._texas_v21_realized_volatility_boost_multiplier(settings, mode)
         phase = texas_holdem_phase(seconds_remaining)
         maximum_price = float(settings.get("texas_holdem_max_entry_price", 0.50))
         entry_window = int(settings.get("texas_holdem_entry_window_seconds", 20))
@@ -489,26 +526,11 @@ class PaperTradingService:
                 buy = dict(assessment.get("buy") or {})
                 executable = buy.get("executable_price")
                 reliable = bool(assessment.get("data_reliable"))
-                mvi_state = dict(assessment.get("margin_volatility") or {})
-                mvi_value = mvi_state.get("mvi")
-                try:
-                    mvi_value = float(mvi_value) if mvi_value is not None else None
-                except (TypeError, ValueError):
-                    mvi_value = None
-                mvi_observed_at = mvi_state.get("observed_at")
-                mvi_observed = parse_time(mvi_observed_at)
-                decision_observed = parse_time(market_observed_at)
-                mvi_fresh = bool(
-                    mvi_observed and decision_observed
-                    and 0 <= (decision_observed - mvi_observed).total_seconds()
-                    <= float(settings.get("max_data_age_seconds", 20))
+                rv = texas_readiness(
+                    dict(assessment.get("coinbase_realized_volatility") or {}),
+                    observed_at=market_observed_at,
                 )
-                mvi_reliable = (
-                    bool(mvi_state.get("reliable"))
-                    and mvi_value is not None
-                    and math.isfinite(mvi_value)
-                    and mvi_fresh
-                )
+                rv_value = rv.get("rv_pct")
                 quote_marker = json.dumps(
                     {
                         "raw_ask": buy.get("raw_price"),
@@ -521,15 +543,15 @@ class PaperTradingService:
                 risk = (execution_risk_by_side or {}).get(side) or {}
                 if not reliable:
                     blocker = str(assessment.get("quality_reason") or "Market data is unreliable.")
-                elif texas_v2 and not mvi_reliable:
-                    blocker = "Texas Hold’em 2.0 requires a fresh reliable MVI reading."
+                elif texas_v2 and not rv.get("ready"):
+                    blocker = str(rv.get("reason") or "Coinbase realized volatility is unavailable.")
                 elif (
                     texas_v2
-                    and mvi_value < mvi_minimum
+                    and float(rv_value) + 1e-12 < rv_gate
                 ):
                     blocker = (
-                        f"Texas Hold’em 2.0 requires MVI ≥ {mvi_minimum:.1f} "
-                        f"(current {mvi_value:.2f})."
+                        f"Texas Hold’em 2.0 requires 15m Coinbase volatility ≥ {rv_gate:.2f}% "
+                        f"(current {float(rv_value):.2f}%)."
                     )
                 elif executable is None:
                     blocker = "No executable opening ask is available."
@@ -561,9 +583,9 @@ class PaperTradingService:
                         # No IOC was created, so this must not consume an attempt.
                     else:
                         boost_multiplier = (
-                            TEXAS_V2_MVI_BOOST_MULTIPLIER
-                            if texas_v2 and mvi_value is not None
-                            and mvi_value >= TEXAS_V2_MVI_BOOST_THRESHOLD
+                            rv_boost_multiplier
+                            if texas_v2 and rv.get("ready")
+                            and float(rv_value) + 1e-12 >= rv_boost_threshold
                             else 1.0
                         )
                         base_allocation = self._texas_v2_base_allocation(settings, mode) if texas_v2 else float(settings.get("max_risk_per_trade_pct", 0.05))
@@ -592,26 +614,17 @@ class PaperTradingService:
                         if texas_v2:
                             metadata.update({
                                 "strategy_version": TEXAS_V2_RULE_VERSION,
-                                "mvi_minimum": mvi_minimum,
-                                "mvi_boost_threshold": TEXAS_V2_MVI_BOOST_THRESHOLD,
-                                "mvi_boost_multiplier": boost_multiplier,
-                                "margin_volatility_index": mvi_value,
-                                "margin_volatility_reliable": mvi_reliable,
-                                "margin_volatility_observed_at": mvi_observed_at,
-                                "margin_volatility_version": mvi_state.get("calculation_version"),
-                                "margin_cushion_ratio": mvi_state.get("cushion_ratio"),
-                                "margin_expected_remaining_move": mvi_state.get("expected_remaining_move"),
-                                "margin_raw_realized_volatility": mvi_state.get("raw_realized_volatility"),
-                                "margin_movement_intensity": mvi_state.get("movement_intensity"),
-                                "margin_reversal_component": mvi_state.get("reversal_component"),
-                                "margin_coverage": mvi_state.get("coverage"),
-                                "margin_source_reliable": bool(mvi_state.get("source_reliable")),
-                                # Diagnostic-only crossing reference.  This is
-                                # persisted with the attempt but never gates,
-                                # sizes, or authorizes a Texas entry.
-                                "texas_breach_reference": dict(
-                                    assessment.get("texas_breach_reference") or {}
-                                ),
+                                "realized_volatility_gate_pct": rv_gate,
+                                "realized_volatility_boost_pct": rv_boost_threshold,
+                                "realized_volatility_boost_multiplier": boost_multiplier,
+                                "realized_volatility_value_pct": rv_value,
+                                "realized_volatility_version": rv.get("version"),
+                                "realized_volatility_source": rv.get("source"),
+                                "realized_volatility_product": rv.get("product"),
+                                "realized_volatility_granularity_seconds": rv.get("granularity_seconds"),
+                                "realized_volatility_window_minutes": rv.get("window_minutes"),
+                                "realized_volatility_age_seconds": rv.get("age_seconds"),
+                                "realized_volatility_current_valid": rv.get("current_valid"),
                                 "thesis_checkpoint_seconds": TEXAS_V2_THESIS_CHECKPOINT_SECONDS,
                                 "thesis_unfavorable_distance": TEXAS_V2_THESIS_UNFAVORABLE_DISTANCE,
                                 "pre_boost_bankroll_fraction": base_allocation,
@@ -734,10 +747,10 @@ class PaperTradingService:
             if texas_v2 else False,
             "rules": ({
                 "version": TEXAS_V2_RULE_VERSION,
-                "mvi_minimum": mvi_minimum,
+                "realized_volatility_gate_pct": rv_gate,
                 "base_allocation_pct": self._texas_v2_base_allocation(settings, mode),
-                "mvi_boost_threshold": TEXAS_V2_MVI_BOOST_THRESHOLD,
-                "mvi_boost_multiplier": TEXAS_V2_MVI_BOOST_MULTIPLIER,
+                "realized_volatility_boost_pct": rv_boost_threshold,
+                "realized_volatility_boost_multiplier": rv_boost_multiplier,
                 "thesis_checkpoint_seconds": TEXAS_V2_THESIS_CHECKPOINT_SECONDS,
                 "thesis_unfavorable_distance": TEXAS_V2_THESIS_UNFAVORABLE_DISTANCE,
             } if texas_v2 else {}),
@@ -2505,7 +2518,7 @@ class PaperTradingService:
         threshold_gate = self._threshold_margin_gate(
             settings, side=side, margin_dollars=threshold_margin_dollars
         )
-        volatility_gate = MarginVolatilityService.gate(settings, margin_volatility)
+        volatility_gate = self._standard_volatility_gate(settings)
         direction_gate = directional_gate(
             settings, directional_momentum, side=side
         )
@@ -3380,7 +3393,7 @@ class PaperTradingService:
             result["blocked_reason"] = "The market is not active."
             return finish(blocked_reason=result["blocked_reason"])
 
-        volatility_gate = MarginVolatilityService.gate(settings, margin_volatility)
+        volatility_gate = self._standard_volatility_gate(settings)
 
         def margin_gate(side: str) -> dict[str, Any]:
             return self._threshold_margin_gate(

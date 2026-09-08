@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 import asyncio
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 import httpx
@@ -11,11 +11,13 @@ from app.db import Database
 from app.services.historical_realized_volatility import (
     BASELINE_DAYS,
     CoinbaseRealizedVolatilityService,
+    CURRENT_READING_MAX_AGE_SECONDS,
     GRANULARITY_SECONDS,
     completed_minute_epoch,
     midrank_percentile,
     normalize_candles,
     realized_volatility,
+    texas_readiness,
 )
 
 
@@ -127,6 +129,28 @@ def test_stale_cached_state_never_advertises_old_value(tmp_path) -> None:
     assert state["horizons"]["15"]["rv_pct"] is None
 
 
+def test_dashboard_and_texas_share_the_same_current_reading_age_limit(tmp_path, monkeypatch) -> None:
+    db = Database(tmp_path / "rv.sqlite")
+    db.initialize()
+    service = CoinbaseRealizedVolatilityService(db)
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+    import app.services.historical_realized_volatility as module
+    monkeypatch.setattr(module, "utc_now", lambda: now)
+    state = {
+        "version": "coinbase-rv-1", "source": "Coinbase", "product": "BTC-USD",
+        "granularity_seconds": 60, "status": "ready", "current_stale": False,
+        "as_of": (now - timedelta(seconds=CURRENT_READING_MAX_AGE_SECONDS)).isoformat(),
+        "horizons": {"15": {"rv_pct": .20, "current_valid": True}},
+    }
+    service._state = state
+    assert service.dashboard_state()["status"] == "ready"
+    assert texas_readiness(state, observed_at=now)["ready"] is True
+    stale = {**state, "as_of": (now - timedelta(seconds=CURRENT_READING_MAX_AGE_SECONDS + 1)).isoformat()}
+    service._state = stale
+    assert service.dashboard_state()["status"] == "stale"
+    assert texas_readiness(stale, observed_at=now)["ready"] is False
+
+
 def test_empty_page_advances_durable_cursor_and_marks_hole(tmp_path) -> None:
     db = Database(tmp_path / "rv.sqlite")
     db.initialize()
@@ -143,3 +167,46 @@ def test_empty_page_advances_durable_cursor_and_marks_hole(tmp_path) -> None:
     next_start, next_end, is_gap = service._next_backfill_plan()
     assert is_gap is False
     assert next_end == start and next_start < next_end
+
+
+def test_texas_readiness_requires_exact_current_coinbase_contract() -> None:
+    now = "2026-01-01T00:01:00+00:00"
+    valid = {
+        "version": "coinbase-rv-1", "source": "Coinbase", "product": "BTC-USD",
+        "granularity_seconds": 60, "status": "ready", "current_stale": False,
+        "as_of": "2026-01-01T00:00:00+00:00",
+        "horizons": {"15": {"rv_pct": .20, "current_valid": True}},
+    }
+    assert texas_readiness(valid, observed_at=now)["ready"] is True
+    for key, value in (("version", "mvi-2"), ("source", "Other"), ("product", "ETH-USD"), ("granularity_seconds", 300)):
+        wrong = {**valid, key: value}
+        assert texas_readiness(wrong, observed_at=now)["ready"] is False
+    stale = {**valid, "as_of": "2025-12-31T23:50:00+00:00"}
+    assert texas_readiness(stale, observed_at=now)["ready"] is False
+    future = {**valid, "as_of": "2026-01-01T00:02:00+00:00"}
+    assert texas_readiness(future, observed_at=now)["ready"] is False
+    hole = {**valid, "horizons": {"15": {"rv_pct": .20, "current_valid": False}}}
+    assert texas_readiness(hole, observed_at=now)["ready"] is False
+
+
+def test_worker_summary_exposes_bounded_closed_candle_chart_cache(tmp_path) -> None:
+    db = Database(tmp_path / "rv.sqlite")
+    db.initialize()
+    service = CoinbaseRealizedVolatilityService(db, object())  # type: ignore[arg-type]
+    now = completed_minute_epoch(datetime(2026, 1, 1, tzinfo=UTC))
+    service._store(rows(now - 9 * 24 * 60 * 60, 9 * 24 * 60 + 1, ratio=1.0001))
+    import app.services.historical_realized_volatility as module
+    original = module.completed_minute_epoch
+    original_utc_now = module.utc_now
+    module.completed_minute_epoch = lambda: now
+    module.utc_now = lambda: datetime.fromtimestamp(now + 60, UTC)
+    try:
+        service._state = service._summary()
+        chart = service.chart_state()
+    finally:
+        module.completed_minute_epoch = original
+        module.utc_now = original_utc_now
+    assert chart["status"] == "ready"
+    assert set(chart["series"]) == {"5", "15", "60"}
+    assert all(len(points) <= 361 for points in chart["series"].values())
+    assert chart["series"]["15"][-1]["closed_at"] == datetime.fromtimestamp(now + 60, UTC).isoformat()

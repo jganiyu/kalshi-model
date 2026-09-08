@@ -1,9 +1,8 @@
 const state = {
   dashboard: null,
   chartPoints: [],
-  volatilityPoints: [],
+  realizedVolatility: {},
   chartMode: "btc",
-  maximumMvi: 0,
   chartWindow: 5,
   closeTime: null,
   lastNotification: null,
@@ -651,15 +650,20 @@ function renderTexasHoldemHud(texas = {}) {
       : thesis.status === "BREACHED" ? "Post-fill breach recorded"
         : "5m thesis checkpoint pending";
   $("#texas-v2-rules").textContent = isV2
-    ? `MVI ≥${Number(texas.rules?.mvi_minimum ?? 4).toFixed(1)} · 5m no-breach >$50 exit · ${thesisDetail}`
+    ? `15m Coinbase vol >=${Number(texas.rules?.realized_volatility_gate_pct ?? .20).toFixed(2)}% · ${Number(texas.rules?.realized_volatility_boost_multiplier ?? 1.5).toFixed(1)}x at >=${Number(texas.rules?.realized_volatility_boost_pct ?? .80).toFixed(2)}% · 5m no-breach >$50 exit · ${thesisDetail}`
     : "Legacy Texas rules";
-  $("#texas-mvi-gate-control").hidden = !isV2;
-  const mviInput = $("#texas-mvi-minimum");
-  if (isV2 && document.activeElement !== mviInput) {
-    mviInput.value = Number(texas.rules?.mvi_minimum ?? 4).toFixed(1);
-  }
+  $("#texas-rv-gate-control").hidden = !isV2;
+  $("#texas-rv-boost-control").hidden = !isV2;
+  $("#texas-rv-multiplier-control").hidden = !isV2;
+  const rvGateInput = $("#texas-rv-gate");
+  const rvBoostInput = $("#texas-rv-boost");
+  const rvMultiplierInput = $("#texas-rv-multiplier");
+  if (isV2 && document.activeElement !== rvGateInput) rvGateInput.value = Number(texas.rules?.realized_volatility_gate_pct ?? .20).toFixed(2);
+  if (isV2 && document.activeElement !== rvBoostInput) rvBoostInput.value = Number(texas.rules?.realized_volatility_boost_pct ?? .80).toFixed(2);
+  if (isV2 && document.activeElement !== rvMultiplierInput) rvMultiplierInput.value = Number(texas.rules?.realized_volatility_boost_multiplier ?? 1.5).toFixed(1);
   if (texas.allocation_boosted) {
-    $("#texas-holdem-status").textContent += " · BOOSTED 1.5×";
+    $("#texas-holdem-status").textContent = String(texas.status || "WAITING").replaceAll("_", " ")
+      + " · BOOSTED";
   }
   const passButton = $("#texas-pass-next-round");
   const pass = texas.pass || {};
@@ -697,11 +701,12 @@ async function updateTexasQuickSetting(event) {
     "texas-river-target": "texas_holdem_river_target",
     "texas-river-stop": "texas_holdem_river_stop",
   };
-  const isMviGate = input.id === "texas-mvi-minimum";
+  const isRvSetting = ["texas-rv-gate", "texas-rv-boost", "texas-rv-multiplier"].includes(input.id);
+  const isRvMultiplier = input.id === "texas-rv-multiplier";
   const centsValue = Number(input.value);
   const isStop = mapping[input.id]?.endsWith("_stop");
-  if (!Number.isFinite(centsValue) || (isMviGate ? centsValue < 0 || centsValue > 10 : centsValue < (isStop ? 0 : 1) || centsValue > 99)) {
-    showToast("Texas Hold’em setting not changed", isMviGate ? "Enter MVI from 0.0 through 10.0." : isStop ? "Enter 0¢ to disable, or 1¢ through 99¢." : "Enter a value from 1¢ through 99¢.");
+  if (!Number.isFinite(centsValue) || (isRvMultiplier ? centsValue < 1 || centsValue > 5 : isRvSetting ? centsValue < 0 || centsValue > 100 : centsValue < (isStop ? 0 : 1) || centsValue > 99)) {
+    showToast("Texas Hold’em setting not changed", isRvMultiplier ? "Enter a boost multiplier from 1.0× through 5.0×." : isRvSetting ? "Enter volatility from 0.00% through 100.00%." : isStop ? "Enter 0¢ to disable, or 1¢ through 99¢." : "Enter a value from 1¢ through 99¢.");
     await refreshDashboard();
     return;
   }
@@ -709,13 +714,15 @@ async function updateTexasQuickSetting(event) {
     await api("/api/settings", {
       method: "PUT",
       body: JSON.stringify({
-        [isMviGate
-          ? `${String(selectedTrading().mode || "PAPER").toLowerCase()}_texas_holdem_v2_mvi_minimum`
-          : mapping[input.id]]: isMviGate ? centsValue : centsValue / 100,
+        [isRvSetting
+          ? `${String(selectedTrading().mode || "PAPER").toLowerCase()}_texas_holdem_v21_realized_volatility_${isRvMultiplier ? "boost_multiplier" : `${input.id === "texas-rv-gate" ? "gate" : "boost"}_pct`}`
+          : mapping[input.id]]: isRvSetting ? centsValue : centsValue / 100,
       }),
     });
     await refreshDashboard();
-    showToast("Texas Hold’em updated", "The active position is using the new phase value.");
+    showToast("Texas Hold’em updated", isRvSetting
+      ? "The selected environment will use this volatility setting on its next Texas entry."
+      : "The active position is using the new phase value.");
   } catch (error) {
     showToast("Texas Hold’em setting not changed", error.message);
     await refreshDashboard();
@@ -1511,10 +1518,13 @@ function drawVolatilityChart(context, width, height, color, numberFont) {
   const liveGutterMs = Math.min(10000, windowMs * 0.025);
   const viewEnd = Date.now() + liveGutterMs;
   const viewStart = viewEnd - windowMs;
-  const points = state.volatilityPoints
-    .map((point) => ({ ...point, time: new Date(point.observed_at).getTime(), value: Number(point.mvi) }))
-    .filter((point) => Number.isFinite(point.time) && Number.isFinite(point.value)
-      && point.time >= viewStart && point.time <= viewEnd);
+  // Coinbase RV uses completed one-minute candles.  Select the closest
+  // available horizon while the existing buttons continue to select the span.
+  const horizon = state.chartWindow <= 5 ? "5" : state.chartWindow <= 15 ? "15" : "60";
+  $("#volatility-legend").textContent = `Coinbase ${horizon}m realized volatility`;
+  const points = ((state.realizedVolatility?.series || {})[horizon] || [])
+    .map((point) => ({ ...point, time: new Date(point.closed_at).getTime(), value: numberOrNull(point.rv_pct) }))
+    .filter((point) => Number.isFinite(point.time) && point.time >= viewStart && point.time <= viewEnd);
   const left = 8;
   const right = width < 430 ? 52 : 60;
   const top = 14;
@@ -1523,16 +1533,18 @@ function drawVolatilityChart(context, width, height, color, numberFont) {
   const chartHeight = height - top - bottom;
   const plotRight = width - right;
   const x = (timestamp) => left + ((timestamp - viewStart) / windowMs) * chartWidth;
-  const y = (value) => top + (1 - value / 10) * chartHeight;
+  const values = points.map((point) => point.value).filter(Number.isFinite);
+  const maxValue = Math.max(.05, ...values) * 1.15;
+  const y = (value) => top + (1 - value / maxValue) * chartHeight;
 
   context.strokeStyle = color("--chart-grid");
   context.fillStyle = color("--chart-label");
   context.font = `10px ${numberFont}`;
   context.textAlign = "left";
-  [0, 2.5, 5, 7.5, 10].forEach((value) => {
+  [0, .25, .5, .75, 1].map((fraction) => maxValue * fraction).forEach((value) => {
     const rowY = y(value);
     context.beginPath(); context.moveTo(left, rowY); context.lineTo(plotRight, rowY); context.stroke();
-    context.fillText(value.toFixed(1), plotRight + 8, rowY + 3);
+    context.fillText(`${value.toFixed(2)}%`, plotRight + 8, rowY + 3);
   });
   const timeInterval = chartTickInterval(windowMs, chartWidth);
   const firstTimeTick = Math.ceil(viewStart / timeInterval) * timeInterval;
@@ -1545,32 +1557,29 @@ function drawVolatilityChart(context, width, height, color, numberFont) {
     }
   }
 
-  if (state.maximumMvi > 0) {
-    const maximumY = y(Math.max(0, Math.min(10, state.maximumMvi)));
-    context.save();
-    context.strokeStyle = color("--red");
-    context.setLineDash([4, 4]);
-    context.beginPath(); context.moveTo(left, maximumY); context.lineTo(plotRight, maximumY); context.stroke();
-    context.restore();
-  }
-  if (!points.length) {
+  if (!values.length) {
     context.fillStyle = color("--chart-label");
     context.font = "12px -apple-system, sans-serif";
     context.textAlign = "center";
-    context.fillText("Learning reliable margin volatility", width / 2, height / 2);
+    context.fillText("Waiting for closed Coinbase volatility candles", width / 2, height / 2);
     return;
   }
   if (points.length > 1) {
+    // Explicit null values are gaps. Do not draw a fake smooth bridge.
+    let drawing = false;
     context.beginPath();
-    points.forEach((point, index) => index === 0
-      ? context.moveTo(x(point.time), y(point.value))
-      : context.lineTo(x(point.time), y(point.value)));
+    points.forEach((point) => {
+      if (!Number.isFinite(point.value)) { drawing = false; return; }
+      if (!drawing) { context.moveTo(x(point.time), y(point.value)); drawing = true; }
+      else context.lineTo(x(point.time), y(point.value));
+    });
     context.strokeStyle = color("--hud-warning");
     context.lineWidth = 2.25;
     context.lineJoin = "round";
     context.stroke();
   }
-  const last = points.at(-1);
+  const last = [...points].reverse().find((point) => Number.isFinite(point.value));
+  if (!last) return;
   context.beginPath(); context.arc(x(last.time), y(last.value), 3.25, 0, Math.PI * 2);
   context.fillStyle = color("--hud-warning"); context.fill();
 }
@@ -1598,7 +1607,7 @@ function drawChart(frameTime = performance.now()) {
   $("#price-legend").hidden = volatilityMode;
   $("#threshold-legend").hidden = volatilityMode;
   $("#volatility-legend").hidden = !volatilityMode;
-  $("#volatility-max-legend").hidden = !volatilityMode || state.maximumMvi <= 0;
+  $("#volatility-max-legend").hidden = true;
   if (volatilityMode) {
     drawVolatilityChart(context, width, height, color, numberFont);
     return;
@@ -1891,18 +1900,6 @@ function appendLiveChartPoint(data) {
   else state.chartPoints.push(point);
   const cutoff = Date.now() - state.chartWindow * 60 * 1000;
   state.chartPoints = state.chartPoints.filter((item) => new Date(item.observed_at).getTime() >= cutoff);
-  const volatility = data?.current?.margin_volatility;
-  if (volatility?.observed_at) {
-    const lastVolatility = state.volatilityPoints.at(-1);
-    if (lastVolatility?.observed_at === volatility.observed_at) {
-      state.volatilityPoints[state.volatilityPoints.length - 1] = volatility;
-    } else {
-      state.volatilityPoints.push(volatility);
-    }
-    state.volatilityPoints = state.volatilityPoints.filter(
-      (item) => new Date(item.observed_at).getTime() >= cutoff,
-    );
-  }
 }
 
 function mergeLiveMarket(data) {
@@ -2006,8 +2003,7 @@ async function refreshDashboard() {
       api("/api/dashboard"), api(`/api/chart?minutes=${state.chartWindow}`),
     ]);
     state.chartPoints = chart.points || [];
-    state.volatilityPoints = chart.volatility_points || [];
-    state.maximumMvi = Number(chart.maximum_margin_volatility || 0);
+    state.realizedVolatility = chart.realized_volatility || {};
     renderDashboard(dashboard);
   } catch (error) {
     $("#sidebar-status").textContent = "App offline";
@@ -2047,18 +2043,21 @@ const calibrationGroups = [
     { id: "directional_momentum_lookback_seconds", label: "Regression lookback", unit: "seconds", min: 5, max: 120, step: 1, integer: true, tip: "Recent BTC-proxy window used for the least-squares direction calculation. Default: 15 seconds." },
     { id: "directional_momentum_minimum_movement_dollars", label: "Minimum directional movement", unit: "dollars", min: 0, max: 100000, step: .25, tip: "Minimum fitted BTC move required across the lookback window in the entry direction. Default: $1." },
   ]],
-  ["Margin Volatility", [
-    { id: "maximum_margin_volatility", label: "Maximum Margin Volatility", unit: "MVI", min: 0, max: 10, step: .1, tip: "Maximum 30-minute Margin Volatility Index allowed for automatic confirmation in Paper, Demo, and Live. Low MVI is allowed; values above this maximum block. Use 0 to turn it off. Default: off." },
-  ]],
   ["Texas Hold’em Strategy", [
     { id: "texas_holdem_enabled", label: "Enable Texas Hold’em Strategy", type: "toggle", tip: "Runs one contrarian opening play per market and replaces Standard Edge automatic entries while enabled. Default: off." },
     { id: "texas_holdem_max_entry_price", label: "Maximum entry price", unit: "cents", min: 1, max: 99, step: 1, scale: 100, tip: "Highest all-in executable contract price allowed for the opening IOC buy. Default: 50 cents." },
-    { id: "paper_texas_holdem_v2_mvi_minimum", label: "Paper Texas 2.0 minimum MVI", unit: "MVI", min: 0, max: 10, step: .1, tip: "Fresh reliable MVI required for Paper Texas Hold’em 2.0 entry. Default: 4." },
-    { id: "demo_texas_holdem_v2_mvi_minimum", label: "Demo Texas 2.0 minimum MVI", unit: "MVI", min: 0, max: 10, step: .1, tip: "Fresh reliable MVI required for Demo Texas Hold’em 2.0 entry. Default: 4." },
-    { id: "live_texas_holdem_v2_mvi_minimum", label: "Live Texas 2.0 minimum MVI", unit: "MVI", min: 0, max: 10, step: .1, tip: "Fresh reliable MVI required for Live Texas Hold’em 2.0 entry. Default: 4." },
-    { id: "paper_texas_holdem_v2_base_allocation_pct", label: "Paper Texas 2.0 base allocation", unit: "% bankroll", min: 0, max: 100, step: .1, scale: 100, tip: "Normal Texas Hold’em 2.0 entry allocation before an MVI ≥8 1.5× boost. General risk and execution caps still apply. Default: 1%." },
-    { id: "demo_texas_holdem_v2_base_allocation_pct", label: "Demo Texas 2.0 base allocation", unit: "% bankroll", min: 0, max: 100, step: .1, scale: 100, tip: "Normal Texas Hold’em 2.0 entry allocation before an MVI ≥8 1.5× boost. General risk and execution caps still apply. Default: 1%." },
-    { id: "live_texas_holdem_v2_base_allocation_pct", label: "Live Texas 2.0 base allocation", unit: "% bankroll", min: 0, max: 100, step: .1, scale: 100, tip: "Normal Texas Hold’em 2.0 entry allocation before an MVI ≥8 1.5× boost. General risk and execution caps still apply. Default: 1%." },
+    { id: "paper_texas_holdem_v21_realized_volatility_gate_pct", label: "Paper Texas 15m volatility gate", unit: "%", min: 0, max: 100, step: .01, tip: "Closed Coinbase 15-minute realized volatility required for a Paper Texas entry. Default: 0.20%." },
+    { id: "demo_texas_holdem_v21_realized_volatility_gate_pct", label: "Demo Texas 15m volatility gate", unit: "%", min: 0, max: 100, step: .01, tip: "Closed Coinbase 15-minute realized volatility required for a Demo Texas entry. Default: 0.20%." },
+    { id: "live_texas_holdem_v21_realized_volatility_gate_pct", label: "Live Texas 15m volatility gate", unit: "%", min: 0, max: 100, step: .01, tip: "Closed Coinbase 15-minute realized volatility required for a Live Texas entry. Default: 0.20%." },
+    { id: "paper_texas_holdem_v21_realized_volatility_boost_pct", label: "Paper Texas 15m volatility boost", unit: "%", min: 0, max: 100, step: .01, tip: "At or above this closed Coinbase 15-minute volatility, Texas applies the saved Paper boost multiplier. Default: 0.80%." },
+    { id: "demo_texas_holdem_v21_realized_volatility_boost_pct", label: "Demo Texas 15m volatility boost", unit: "%", min: 0, max: 100, step: .01, tip: "At or above this closed Coinbase 15-minute volatility, Texas applies the saved Demo boost multiplier. Default: 0.80%." },
+    { id: "live_texas_holdem_v21_realized_volatility_boost_pct", label: "Live Texas 15m volatility boost", unit: "%", min: 0, max: 100, step: .01, tip: "At or above this closed Coinbase 15-minute volatility, Texas applies the saved Live boost multiplier. Default: 0.80%." },
+    { id: "paper_texas_holdem_v21_realized_volatility_boost_multiplier", label: "Paper Texas volatility boost size", unit: "× allocation", min: 1, max: 5, step: .1, tip: "Sizing multiplier applied when Paper reaches its volatility boost trigger. General risk and execution caps still apply. Default: 1.5×." },
+    { id: "demo_texas_holdem_v21_realized_volatility_boost_multiplier", label: "Demo Texas volatility boost size", unit: "× allocation", min: 1, max: 5, step: .1, tip: "Sizing multiplier applied when Demo reaches its volatility boost trigger. General risk and execution caps still apply. Default: 1.5×." },
+    { id: "live_texas_holdem_v21_realized_volatility_boost_multiplier", label: "Live Texas volatility boost size", unit: "× allocation", min: 1, max: 5, step: .1, tip: "Sizing multiplier applied when Live reaches its volatility boost trigger. General risk and execution caps still apply. Default: 1.5×." },
+    { id: "paper_texas_holdem_v2_base_allocation_pct", label: "Paper Texas 2.0 base allocation", unit: "% bankroll", min: 0, max: 100, step: .1, scale: 100, tip: "Normal Texas Hold’em 2.0 allocation before its configured volatility boost. General risk and execution caps still apply. Default: 1%." },
+    { id: "demo_texas_holdem_v2_base_allocation_pct", label: "Demo Texas 2.0 base allocation", unit: "% bankroll", min: 0, max: 100, step: .1, scale: 100, tip: "Normal Texas Hold’em 2.0 allocation before its configured volatility boost. General risk and execution caps still apply. Default: 1%." },
+    { id: "live_texas_holdem_v2_base_allocation_pct", label: "Live Texas 2.0 base allocation", unit: "% bankroll", min: 0, max: 100, step: .1, scale: 100, tip: "Normal Texas Hold’em 2.0 allocation before its configured volatility boost. General risk and execution caps still apply. Default: 1%." },
     { id: "texas_holdem_flop_target", label: "Flop target", unit: "cents", min: 1, max: 99, step: 1, scale: 100, tip: "Executable bid that closes the position during minutes 0–5. Default: 60 cents." },
     { id: "texas_holdem_flop_stop", label: "Flop stop", unit: "cents", min: 0, max: 99, step: 1, scale: 100, tip: "Executable bid that folds during minutes 0–5. Use 0 to disable. Default: 60 cents." },
     { id: "texas_holdem_turn_target", label: "Turn target", unit: "cents", min: 1, max: 99, step: 1, scale: 100, tip: "Executable bid that closes the position during minutes 5–10. Default: 50 cents." },
@@ -3176,8 +3175,7 @@ function bindEvents() {
     $$("[data-window]").forEach((item) => item.classList.toggle("active", item === button));
     const chart = await api(`/api/chart?minutes=${state.chartWindow}`);
     state.chartPoints = chart.points || [];
-    state.volatilityPoints = chart.volatility_points || [];
-    state.maximumMvi = Number(chart.maximum_margin_volatility || 0);
+    state.realizedVolatility = chart.realized_volatility || {};
     drawChart();
   }));
   $$('[data-chart-mode]').forEach((button) => button.addEventListener("click", () => {
@@ -3200,7 +3198,7 @@ function bindEvents() {
   });
   $("#run-backtest").addEventListener("click", runBacktest);
   $("#standard-edge-gate-release").addEventListener("change", toggleStandardEdgeGateRelease);
-  ["#texas-flop-target", "#texas-flop-stop", "#texas-turn-target", "#texas-turn-stop", "#texas-river-target", "#texas-river-stop", "#texas-mvi-minimum"].forEach((selector) => {
+  ["#texas-flop-target", "#texas-flop-stop", "#texas-turn-target", "#texas-turn-stop", "#texas-river-target", "#texas-river-stop", "#texas-rv-gate", "#texas-rv-boost", "#texas-rv-multiplier"].forEach((selector) => {
     $(selector).addEventListener("change", updateTexasQuickSetting);
   });
   $("#texas-pass-next-round").addEventListener("click", passTexasHoldemNextRound);

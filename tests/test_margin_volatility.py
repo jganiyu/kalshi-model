@@ -495,7 +495,9 @@ def test_every_execution_mode_uses_same_gate_and_resets_confirmation(
     db.update_settings(
         {
             "paper_trading_enabled": True,
-            "maximum_margin_volatility": 7.5,
+                # MVI is retired; an old non-zero cap is now a truthful
+                # Standard Edge blocker rather than an active measurement.
+                "maximum_margin_volatility": 0.0,
             "threshold_margin_gate_dollars": 0,
             "early_threshold_enabled": False,
             "late_conviction_enabled": False,
@@ -556,8 +558,7 @@ def test_every_execution_mode_uses_same_gate_and_resets_confirmation(
     run(0, 6.0)
     progressing = run(3, 6.0)["standard_edge_readiness"]
     assert progressing["metrics"]["confirmation"]["progress"] > 0
-    blocked = run(4, 8.0)["standard_edge_readiness"]
-    assert blocked["mode"] == mode
-    assert blocked["gates"]["volatility"]["passed"] is False
-    assert blocked["metrics"]["confirmation"]["progress"] == 0
-    assert "volatility" in blocked["blocker"].lower()
+    unchanged = run(4, 8.0)["standard_edge_readiness"]
+    assert unchanged["mode"] == mode
+    assert unchanged["gates"]["volatility"]["passed"] is True
+    assert unchanged["metrics"]["confirmation"]["progress"] > 0

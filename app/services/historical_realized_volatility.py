@@ -27,6 +27,7 @@ SOURCE = "Coinbase"
 PRODUCT = "BTC-USD"
 GRANULARITY_SECONDS = 60
 HORIZONS = (5, 15, 60)
+TEXAS_HORIZON = 15
 BASELINE_DAYS = 90
 MINIMUM_BASELINE_DAYS = 7
 MINIMUM_BASELINE_SAMPLES = MINIMUM_BASELINE_DAYS * 24 * 60
@@ -35,6 +36,30 @@ PAGE_MINUTES = 290
 CANDLE_URL = "https://api.exchange.coinbase.com/products/BTC-USD/candles"
 CANDLE_TIMEOUT = httpx.Timeout(connect=2.0, read=4.0, write=4.0, pool=0.5)
 CANDLE_LIMITS = httpx.Limits(max_connections=1, max_keepalive_connections=1, keepalive_expiry=15.0)
+# One rule for every consumer of the current 15-minute reading.  A completed
+# minute candle is no longer usable for a Texas entry or HUD once its close is
+# over two minutes old.  Never allow the display to look fresher than the gate.
+CURRENT_READING_MAX_AGE_SECONDS = 2 * GRANULARITY_SECONDS
+
+
+def utc_now() -> datetime:
+    """Small seam for deterministic tests of the wall-clock freshness rule."""
+    return datetime.now(UTC)
+
+
+def current_reading_age_seconds(
+    as_of: object, *, now: datetime | None = None,
+) -> float:
+    try:
+        timestamp = datetime.fromisoformat(str(as_of).replace("Z", "+00:00")).astimezone(UTC)
+        return ((now or utc_now()).astimezone(UTC) - timestamp).total_seconds()
+    except (TypeError, ValueError, OverflowError):
+        return float("inf")
+
+
+def current_reading_is_fresh(as_of: object, *, now: datetime | None = None) -> bool:
+    age = current_reading_age_seconds(as_of, now=now)
+    return math.isfinite(age) and -1.0 <= age <= CURRENT_READING_MAX_AGE_SECONDS
 
 
 def completed_minute_epoch(now: datetime | None = None) -> int:
@@ -103,11 +128,7 @@ class CoinbaseRealizedVolatilityService:
         state = dict(self._state)
         if state.get("as_of") is None and state.get("status") == "loading":
             return state
-        try:
-            as_of = datetime.fromisoformat(str(state.get("as_of")).replace("Z", "+00:00"))
-            stale = completed_minute_epoch() - int(as_of.timestamp()) > 3 * GRANULARITY_SECONDS
-        except (TypeError, ValueError, OverflowError):
-            stale = True
+        stale = not current_reading_is_fresh(state.get("as_of"))
         if stale and state.get("status") != "error":
             state.update({"status": "stale", "current_stale": True,
                           "reason": "Waiting for a fresh completed Coinbase candle."})
@@ -115,6 +136,27 @@ class CoinbaseRealizedVolatilityService:
                                         "current_valid": False}
                                  for key, value in (state.get("horizons") or {}).items()}
         return state
+
+    def chart_state(self) -> dict[str, Any]:
+        """Return the already-computed bounded chart cache; never query/recalculate.
+
+        The public chart endpoint is called much more frequently than the
+        minute candle worker.  Giving it a DB-backed calculation would make a
+        visual toggle compete with execution, so only the worker writes this
+        memory cache.
+        """
+        state = self.dashboard_state()
+        chart = dict(state.get("chart") or {})
+        chart["status"] = state.get("status")
+        chart["reason"] = state.get("reason")
+        if state.get("status") in {"stale", "error", "loading"}:
+            # Do not let a beautiful but stale line imply a current tradable
+            # reading.  Preserve timestamps as explicit renderer gaps.
+            chart["series"] = {
+                key: [{**point, "rv_pct": None} for point in values]
+                for key, values in (chart.get("series") or {}).items()
+            }
+        return chart
 
     def stop(self) -> None:
         self._stopped = True
@@ -229,6 +271,7 @@ class CoinbaseRealizedVolatilityService:
                 [(SOURCE, PRODUCT, GRANULARITY_SECONDS, epoch, close, iso_now()) for epoch, close in rows],
             )
             connection.commit()
+
             return max(0, int(cursor.rowcount or 0))
 
     def _bounds(self) -> tuple[int | None, int | None]:
@@ -354,7 +397,19 @@ class CoinbaseRealizedVolatilityService:
         # not a repeated full dictionary construction per candidate window.
         by_epoch = dict(candles)
         coverage = len(epochs) / max(1, BASELINE_DAYS * 24 * 60)
-        current_stale = newest is None or now - newest > 3 * GRANULARITY_SECONDS
+        # minute_epoch is the candle's opening timestamp; consumers see the
+        # close timestamp, so a fresh completed candle ages from +60 seconds.
+        current_as_of = (
+            datetime.fromtimestamp(newest + GRANULARITY_SECONDS, UTC).isoformat()
+            if newest else None
+        )
+        # Summary is evaluated against the close of its newest requested
+        # completed candle. dashboard_state() and texas_readiness() then apply
+        # the same wall-clock rule when this cached state is consumed.
+        current_stale = not current_reading_is_fresh(
+            current_as_of,
+            now=datetime.fromtimestamp(now + GRANULARITY_SECONDS, UTC),
+        )
         persisted = self.db.fetch_one(
             "SELECT gap_json FROM coinbase_realized_volatility_state WHERE version=?", (VERSION,)
         ) or {}
@@ -362,6 +417,7 @@ class CoinbaseRealizedVolatilityService:
         pending_holes = sum(int(item.get("attempts", 0)) < 3 for item in gaps.values())
         exhausted_holes = sum(int(item.get("attempts", 0)) >= 3 for item in gaps.values())
         horizons: dict[str, Any] = {}
+        chart_series: dict[str, list[dict[str, Any]]] = {}
         for horizon in HORIZONS:
             end_rows = [(now - horizon * 60 + index * 60, None) for index in range(horizon + 1)]
             latest = [(epoch, by_epoch.get(epoch)) for epoch, _ in end_rows]
@@ -385,8 +441,22 @@ class CoinbaseRealizedVolatilityService:
             ) if current is not None else None
             horizons[str(horizon)] = {
                 "rv_pct": current, "percentile": percentile, "sample_count": len(prior),
-                "current_valid": current is not None,
+                "current_valid": current is not None and not current_stale,
             }
+            # Bounded, worker-computed cache for the Dashboard. A null point
+            # is an explicit gap; the renderer must never connect across it.
+            series: list[dict[str, Any]] = []
+            chart_start = max(target + horizon * 60, now - 360 * 60)
+            for end_epoch in range(chart_start, now + 1, GRANULARITY_SECONDS):
+                window = [(end_epoch - horizon * 60 + index * 60,
+                           by_epoch.get(end_epoch - horizon * 60 + index * 60))
+                          for index in range(horizon + 1)]
+                value = None if any(close is None for _, close in window) else realized_volatility(
+                    [(epoch, float(close)) for epoch, close in window], horizon
+                )
+                series.append({"closed_at": datetime.fromtimestamp(end_epoch + GRANULARITY_SECONDS, UTC).isoformat(),
+                               "rv_pct": value})
+            chart_series[str(horizon)] = series
         status = "ready" if not current_stale else "stale"
         if current_stale and not candles:
             status = "loading"
@@ -395,7 +465,7 @@ class CoinbaseRealizedVolatilityService:
             "granularity_seconds": GRANULARITY_SECONDS, "baseline_days": BASELINE_DAYS,
             "status": status,
             "reason": None if status == "ready" else "Waiting for completed Coinbase candles.",
-            "as_of": datetime.fromtimestamp(newest, UTC).isoformat() if newest else None,
+            "as_of": current_as_of,
             "current_stale": current_stale,
             "historical_status": "partial" if exhausted_holes else ("complete" if coverage >= .999 else "backfilling"),
             "baseline_start": datetime.fromtimestamp(min(epochs), UTC).isoformat() if epochs else None,
@@ -404,6 +474,10 @@ class CoinbaseRealizedVolatilityService:
             "progress": {"completed_minutes": len(epochs), "target_minutes": BASELINE_DAYS * 24 * 60,
                          "pending_holes": pending_holes, "exhausted_holes": exhausted_holes},
             "horizons": horizons,
+            "chart": {"version": VERSION, "source": SOURCE, "product": PRODUCT,
+                      "granularity_seconds": GRANULARITY_SECONDS, "series": chart_series,
+                      "as_of": current_as_of,
+                      "status": status},
         }
         # As with candle inserts, state is cold telemetry and must not take the
         # shared execution writer lock.
@@ -445,3 +519,47 @@ class CoinbaseRealizedVolatilityService:
                 (VERSION, "error", self._state["reason"], iso_now()),
             )
             connection.commit()
+
+
+def texas_readiness(
+    state: dict[str, Any] | None, *, observed_at: str | datetime | None = None,
+) -> dict[str, Any]:
+    """Validate cached Coinbase 15m RV for a new Texas entry (no MVI fallback)."""
+    metric = dict(state or {})
+    now = observed_at if isinstance(observed_at, datetime) else None
+    if now is None and observed_at:
+        try:
+            now = datetime.fromisoformat(str(observed_at).replace("Z", "+00:00"))
+        except ValueError:
+            now = None
+    now = (now or datetime.now(UTC)).astimezone(UTC)
+    base = {"ready": False, "reason": "Coinbase realized volatility is unavailable.",
+            "version": metric.get("version"), "source": metric.get("source"),
+            "product": metric.get("product"), "granularity_seconds": metric.get("granularity_seconds"),
+            "window_minutes": TEXAS_HORIZON, "rv_pct": None, "age_seconds": None,
+            "current_valid": False}
+    if (metric.get("version") != VERSION or metric.get("source") != SOURCE
+            or metric.get("product") != PRODUCT
+            or int(metric.get("granularity_seconds") or 0) != GRANULARITY_SECONDS):
+        base["reason"] = "Coinbase realized-volatility source/version is unavailable."
+        return base
+    row = dict((metric.get("horizons") or {}).get(str(TEXAS_HORIZON)) or {})
+    try:
+        value = float(row.get("rv_pct"))
+    except (TypeError, ValueError):
+        value = float("nan")
+    age = current_reading_age_seconds(metric.get("as_of"), now=now)
+    base.update({"rv_pct": value if math.isfinite(value) and value >= 0 else None,
+                 "age_seconds": age if math.isfinite(age) else None,
+                 "current_valid": bool(row.get("current_valid"))})
+    if bool(metric.get("current_stale")) or metric.get("status") not in {"ready", "partial"}:
+        base["reason"] = str(metric.get("reason") or "Coinbase realized volatility is stale.")
+    elif not base["current_valid"] or base["rv_pct"] is None:
+        base["reason"] = "Waiting for 16 consecutive closed Coinbase candles."
+    elif age < -1:
+        base["reason"] = "Coinbase realized volatility has a future candle."
+    elif age > CURRENT_READING_MAX_AGE_SECONDS:
+        base["reason"] = "Coinbase realized volatility is stale."
+    else:
+        base.update({"ready": True, "reason": None})
+    return base

@@ -234,10 +234,12 @@ function renderTexasHud(texas = {}) {
       : thesis.status === "BREACHED" ? "Post-fill breach recorded"
         : "5m thesis checkpoint pending";
   $("#texas-mobile-rules").textContent = texas.rules?.version
-    ? `MVI ≥${Number(texas.rules?.mvi_minimum ?? 4).toFixed(1)} · 5m no-breach >$50 exit · ${detail}`
+    ? `15m Coinbase vol ≥${Number(texas.rules?.realized_volatility_gate_pct ?? .20).toFixed(2)}% · ${Number(texas.rules?.realized_volatility_boost_multiplier ?? 1.5).toFixed(1)}× at ≥${Number(texas.rules?.realized_volatility_boost_pct ?? .80).toFixed(2)}% · 5m no-breach >$50 exit · ${detail}`
     : "Legacy Texas rules";
   if (texas.allocation_boosted) {
-    $("#texas-mobile-status").textContent += " · BOOSTED 1.5×";
+    // The filled position may predate a calibration change, so do not attach
+    // today's setting to a historical allocation decision.
+    $("#texas-mobile-status").textContent += " · BOOSTED";
   }
   if (!texasAnimation) texasAnimation = window.requestAnimationFrame(animateTexasHud);
 }

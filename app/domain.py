@@ -588,13 +588,19 @@ def threshold_breach_exit_state(
 TEXAS_HOLDEM_LEGACY = "TEXAS_HOLDEM"
 TEXAS_HOLDEM_V2 = "TEXAS_HOLDEM_2_0"
 TEXAS_HOLDEM_STRATEGIES = frozenset({TEXAS_HOLDEM_LEGACY, TEXAS_HOLDEM_V2})
-# The entry gate is a saved, per-environment setting.  These two values are
-# deliberately versioned strategy rules rather than calibration knobs.
-TEXAS_V2_MVI_BOOST_THRESHOLD = 8.0
-TEXAS_V2_MVI_BOOST_MULTIPLIER = 1.5
+# The entry gate and volatility boost are saved, per-environment settings.
+# Historical MVI values remain read-only evidence; no active MVI rule lives
+# here.
 TEXAS_V2_THESIS_CHECKPOINT_SECONDS = 300.0
 TEXAS_V2_THESIS_UNFAVORABLE_DISTANCE = 50.0
-TEXAS_V2_RULE_VERSION = "texas-holdem-2.0.0"
+# Keep the existing user-facing Texas Hold'em 2.0 name.  The persisted rules
+# version distinguishes its Coinbase realized-volatility successor.
+TEXAS_V2_RULE_VERSION = "texas-holdem-2.1.0"
+TEXAS_RV_VERSION = "coinbase-rv-1"
+TEXAS_RV_SOURCE = "Coinbase"
+TEXAS_RV_PRODUCT = "BTC-USD"
+TEXAS_RV_GRANULARITY_SECONDS = 60
+TEXAS_RV_HORIZON_MINUTES = 15
 
 
 def is_texas_holdem_strategy(value: object) -> bool:

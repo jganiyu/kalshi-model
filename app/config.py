@@ -123,10 +123,25 @@ DEFAULT_SETTINGS: dict[str, object] = {
     "texas_holdem_river_stop": 0.60,
     "texas_holdem_entry_window_seconds": 20,
     "texas_holdem_additional_retries": 2,
-    # Texas 2.0 gates are deliberately isolated by execution environment.
+    # Retained read-only compatibility knobs for historical Texas 2.0 records.
+    # New Texas entries must never read these MVI values.
     "paper_texas_holdem_v2_mvi_minimum": 4.0,
     "demo_texas_holdem_v2_mvi_minimum": 4.0,
     "live_texas_holdem_v2_mvi_minimum": 4.0,
+    # Coinbase BTC-USD closed-candle realized volatility, expressed in actual
+    # percentage points (0.20 means 0.20%, not .002).  These are deliberately
+    # per-environment: Paper/Demo tuning cannot alter Live behaviour.
+    "paper_texas_holdem_v21_realized_volatility_gate_pct": 0.20,
+    "demo_texas_holdem_v21_realized_volatility_gate_pct": 0.20,
+    "live_texas_holdem_v21_realized_volatility_gate_pct": 0.20,
+    "paper_texas_holdem_v21_realized_volatility_boost_pct": 0.80,
+    "demo_texas_holdem_v21_realized_volatility_boost_pct": 0.80,
+    "live_texas_holdem_v21_realized_volatility_boost_pct": 0.80,
+    # A sizing multiplier, not a risk-limit override.  The normal allocation
+    # and every general execution/risk ceiling still apply after this value.
+    "paper_texas_holdem_v21_realized_volatility_boost_multiplier": 1.5,
+    "demo_texas_holdem_v21_realized_volatility_boost_multiplier": 1.5,
+    "live_texas_holdem_v21_realized_volatility_boost_multiplier": 1.5,
     "paper_texas_holdem_v2_base_allocation_pct": 0.01,
     "demo_texas_holdem_v2_base_allocation_pct": 0.01,
     "live_texas_holdem_v2_base_allocation_pct": 0.01,

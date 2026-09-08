@@ -73,9 +73,11 @@ def assessments(*, yes_bid: float, yes_ask: float) -> dict[str, dict]:
         for side in ("YES", "NO")
     }
     for value in result.values():
-        value["margin_volatility"] = {
-            "mvi": 8.0, "reliable": True, "reliability_state": "RELIABLE",
-            "observed_at": "2026-09-01T12:00:00+00:00",
+        value["coinbase_realized_volatility"] = {
+            "version": "coinbase-rv-1", "source": "Coinbase", "product": "BTC-USD",
+            "granularity_seconds": 60, "status": "ready", "current_stale": False,
+            "as_of": "2026-09-01T12:00:00+00:00",
+            "horizons": {"15": {"rv_pct": .20, "current_valid": True}},
         }
     return result
 
@@ -244,46 +246,38 @@ def test_price_cap_blocks_opening_attempt_without_consuming_retry(tmp_path: Path
     assert db.fetch_one("SELECT id FROM paper_entries WHERE ticker='TEXAS'") is None
 
 
-def test_texas_v2_requires_reliable_mvi_on_each_entry_attempt(tmp_path: Path) -> None:
+def test_texas_v21_requires_current_coinbase_rv_on_each_entry_attempt(tmp_path: Path) -> None:
     db = make_db(tmp_path)
     service = PaperTradingService(db)
     quotes = assessments(yes_bid=.52, yes_ask=.54)
-    quotes["NO"]["margin_volatility"] = {
-            "mvi": 3.99, "reliable": True, "observed_at": "2026-09-01T12:00:00+00:00"
-    }
+    quotes["NO"]["coinbase_realized_volatility"]["horizons"]["15"]["rv_pct"] = .19
     blocked = run_strategy(service, quotes, margin=25.0)["texas_holdem"]
     assert blocked["attempt_count"] == 0
-    assert "MVI ≥ 4.0" in blocked["blocker"]
-    quotes["NO"]["margin_volatility"] = {
-        "mvi": 8.0, "reliable": False, "observed_at": "2026-09-01T12:00:00+00:00"
-    }
+    assert "0.20%" in blocked["blocker"]
+    quotes["NO"]["coinbase_realized_volatility"]["horizons"]["15"]["current_valid"] = False
     unavailable = run_strategy(
         service, quotes, margin=25.0, observed_at="2026-09-01T12:00:02+00:00"
     )["texas_holdem"]
     assert unavailable["attempt_count"] == 0
-    assert "fresh reliable MVI" in unavailable["blocker"]
-    quotes["NO"]["margin_volatility"] = {
-        "mvi": 8.0, "reliable": True, "observed_at": "2026-09-01T12:00:00+00:00",
-        "calculation_version": "mvi-2", "cushion_ratio": 1.25,
-        "expected_remaining_move": 20.0, "raw_realized_volatility": 2.0,
-        "movement_intensity": 2.0, "reversal_component": .5, "coverage": .9,
-        "source_reliable": True,
-    }
+    assert "16 consecutive" in unavailable["blocker"]
+    quotes["NO"]["coinbase_realized_volatility"]["horizons"]["15"].update({"rv_pct": .80, "current_valid": True})
     admitted = run_strategy(
         service, quotes, margin=25.0, observed_at="2026-09-01T12:00:03+00:00"
     )["texas_holdem"]
     assert admitted["attempt_count"] == 1
     evidence = db.fetch_one("SELECT evidence_json FROM texas_holdem_attempts WHERE attempt_number=1")
-    assert '"mvi_minimum": 4.0' in str(evidence["evidence_json"])
-    assert '"margin_cushion_ratio": 1.25' in str(evidence["evidence_json"])
-    assert '"margin_volatility_version": "mvi-2"' in str(evidence["evidence_json"])
+    assert '"realized_volatility_gate_pct": 0.2' in str(evidence["evidence_json"])
+    assert '"realized_volatility_value_pct": 0.8' in str(evidence["evidence_json"])
+    assert '"realized_volatility_version": "coinbase-rv-1"' in str(evidence["evidence_json"])
 
 
-def test_texas_v2_mvi_gate_boost_and_mode_isolation(tmp_path: Path) -> None:
+def test_texas_v21_rv_gate_boost_and_mode_isolation(tmp_path: Path) -> None:
     db = make_db(tmp_path)
     db.update_settings({
-        "paper_texas_holdem_v2_mvi_minimum": 4.0,
-        "demo_texas_holdem_v2_mvi_minimum": 6.0,
+        "paper_texas_holdem_v21_realized_volatility_gate_pct": .20,
+        "demo_texas_holdem_v21_realized_volatility_gate_pct": .60,
+        "paper_texas_holdem_v21_realized_volatility_boost_multiplier": 1.8,
+        "demo_texas_holdem_v21_realized_volatility_boost_multiplier": 1.2,
     })
     service = PaperTradingService(db)
     quotes = assessments(yes_bid=.52, yes_ask=.54)
@@ -293,9 +287,7 @@ def test_texas_v2_mvi_gate_boost_and_mode_isolation(tmp_path: Path) -> None:
         seen.append(kwargs)
         return True, kwargs["bankroll_fraction"]
 
-    quotes["NO"]["margin_volatility"] = {
-        "mvi": 3.99, "reliable": True, "observed_at": "2026-09-01T12:00:00+00:00",
-    }
+    quotes["NO"]["coinbase_realized_volatility"]["horizons"]["15"]["rv_pct"] = .19
     blocked = service._texas_holdem_state(
         ticker="GATE", assessments=quotes, opening_elapsed=1, seconds_remaining=899,
         threshold_margin_dollars=25, market_open_time="2026-09-01T12:00:00+00:00",
@@ -304,8 +296,8 @@ def test_texas_v2_mvi_gate_boost_and_mode_isolation(tmp_path: Path) -> None:
         entry_exists=False, model_version="test", fixed_entry_handler=submit,
         execution_risk_by_side={},
     )
-    assert blocked["attempt_count"] == 0 and "MVI ≥ 4.0" in blocked["blocker"]
-    quotes["NO"]["margin_volatility"]["mvi"] = 4.0
+    assert blocked["attempt_count"] == 0 and "0.20%" in blocked["blocker"]
+    quotes["NO"]["coinbase_realized_volatility"]["horizons"]["15"]["rv_pct"] = .20
     admitted = service._texas_holdem_state(
         ticker="GATE", assessments=quotes, opening_elapsed=1, seconds_remaining=899,
         threshold_margin_dollars=25, market_open_time="2026-09-01T12:00:00+00:00",
@@ -316,7 +308,7 @@ def test_texas_v2_mvi_gate_boost_and_mode_isolation(tmp_path: Path) -> None:
     )
     assert admitted["attempt_count"] == 1
     assert seen[-1]["bankroll_fraction"] == pytest.approx(.01)
-    quotes["NO"]["margin_volatility"]["mvi"] = 8.0
+    quotes["NO"]["coinbase_realized_volatility"]["horizons"]["15"]["rv_pct"] = .80
     quotes["NO"]["ask_size"] = 99  # a new executable quote permits retry
     boosted = service._texas_holdem_state(
         ticker="GATE", assessments=quotes, opening_elapsed=3, seconds_remaining=897,
@@ -327,13 +319,13 @@ def test_texas_v2_mvi_gate_boost_and_mode_isolation(tmp_path: Path) -> None:
         execution_risk_by_side={},
     )
     assert boosted["attempt_count"] == 2
-    assert seen[-1]["bankroll_fraction"] == pytest.approx(.015)
+    assert seen[-1]["bankroll_fraction"] == pytest.approx(.018)
     evidence = db.fetch_one(
         "SELECT evidence_json FROM texas_holdem_attempts WHERE attempt_number=2"
     ) or {}
-    assert '"mvi_boost_multiplier": 1.5' in evidence["evidence_json"]
+    assert '"realized_volatility_boost_multiplier": 1.8' in evidence["evidence_json"]
     # The Demo gate remains distinct from Paper's saved value.
-    quotes["NO"]["margin_volatility"]["mvi"] = 5.0
+    quotes["NO"]["coinbase_realized_volatility"]["horizons"]["15"]["rv_pct"] = .50
     demo = service._texas_holdem_state(
         ticker="DEMO-GATE", assessments=quotes, opening_elapsed=1, seconds_remaining=899,
         threshold_margin_dollars=25, market_open_time="2026-09-01T12:00:00+00:00",
@@ -342,7 +334,28 @@ def test_texas_v2_mvi_gate_boost_and_mode_isolation(tmp_path: Path) -> None:
         entry_exists=False, model_version="test", fixed_entry_handler=submit,
         execution_risk_by_side={},
     )
-    assert demo["attempt_count"] == 0 and "MVI ≥ 6.0" in demo["blocker"]
+    assert demo["attempt_count"] == 0 and "0.60%" in demo["blocker"]
+
+    # Zero is an explicit valid gate/boost threshold, not a falsy missing
+    # value. The actual opening path uses the same saved multiplier as preview.
+    db.update_settings({
+        "paper_texas_holdem_v21_realized_volatility_gate_pct": 0.0,
+        "paper_texas_holdem_v21_realized_volatility_boost_pct": 0.0,
+        "paper_texas_holdem_v21_realized_volatility_boost_multiplier": 1.7,
+    })
+    quotes["NO"]["coinbase_realized_volatility"]["horizons"]["15"]["rv_pct"] = 0.0
+    quotes["NO"]["coinbase_realized_volatility"]["as_of"] = "2026-09-01T12:15:00+00:00"
+    zero = service._texas_holdem_state(
+        ticker="ZERO-RV", assessments=quotes, opening_elapsed=1, seconds_remaining=899,
+        threshold_margin_dollars=25, market_open_time="2026-09-01T12:15:00+00:00",
+        market_observed_at="2026-09-01T12:15:01+00:00", status_open=True,
+        execution_mode="PAPER", automatic_enabled=True, execution_block_reason=None,
+        entry_exists=False, model_version="test", fixed_entry_handler=submit,
+        execution_risk_by_side={},
+    )
+    assert zero["attempt_count"] == 1
+    assert zero["rules"]["realized_volatility_boost_multiplier"] == pytest.approx(1.7)
+    assert seen[-1]["bankroll_fraction"] == pytest.approx(.017)
 
 
 def test_legacy_texas_does_not_gain_v2_gate_or_rules(tmp_path: Path) -> None:
@@ -823,6 +836,7 @@ def test_texas_settings_are_validated_and_defaults_are_safe() -> None:
             "texas_holdem_entry_window_seconds": 20,
             "texas_holdem_additional_retries": 2,
             "live_texas_holdem_v2_mvi_minimum": 4.0,
+            "live_texas_holdem_v21_realized_volatility_boost_multiplier": 1.7,
         }
     )
     assert cleaned == {
@@ -831,8 +845,11 @@ def test_texas_settings_are_validated_and_defaults_are_safe() -> None:
         "texas_holdem_entry_window_seconds": 20,
         "texas_holdem_additional_retries": 2,
         "live_texas_holdem_v2_mvi_minimum": 4.0,
+        "live_texas_holdem_v21_realized_volatility_boost_multiplier": 1.7,
     }
     with pytest.raises(Exception):
         clean_settings_payload({"texas_holdem_max_entry_price": 1.0})
     with pytest.raises(Exception):
         clean_settings_payload({"live_texas_holdem_v2_mvi_minimum": 10.1})
+    with pytest.raises(Exception):
+        clean_settings_payload({"live_texas_holdem_v21_realized_volatility_boost_multiplier": .9})

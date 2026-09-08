@@ -20,8 +20,6 @@ from app.domain import (
     NextThresholdForecast,
     SETTLEMENT_WINDOW_SECONDS,
     TEXAS_HOLDEM_V2,
-    TEXAS_V2_MVI_BOOST_MULTIPLIER,
-    TEXAS_V2_MVI_BOOST_THRESHOLD,
     TEXAS_V2_RULE_VERSION,
     TEXAS_V2_THESIS_CHECKPOINT_SECONDS,
     TEXAS_V2_THESIS_UNFAVORABLE_DISTANCE,
@@ -56,9 +54,8 @@ from app.services.market_data import (
     live_composite_quote,
 )
 from app.services.margin_volatility import MarginVolatilityService, quotes_are_fresh_and_qualified
-from app.services.historical_realized_volatility import CoinbaseRealizedVolatilityService
+from app.services.historical_realized_volatility import CoinbaseRealizedVolatilityService, texas_readiness
 from app.services.paper import PaperTradingService
-from app.services.texas_breach import breach_features
 from app.services.streaming import BitcoinWebSocketFeeds, KalshiWebSocketFeed
 from app.services.training import ModelManager
 from app.services.trading import TradingCoordinator
@@ -603,11 +600,15 @@ class AnalysisEngine:
             "threshold_breach_exempt": True,
             "rules": {
                 "version": TEXAS_V2_RULE_VERSION,
-                "mvi_minimum": self.paper._texas_v2_mvi_minimum(
+                "realized_volatility_gate_pct": self.paper._texas_v21_realized_volatility_gate(
                     settings, str(settings.get("trading_mode") or "PAPER")
                 ),
-                "mvi_boost_threshold": TEXAS_V2_MVI_BOOST_THRESHOLD,
-                "mvi_boost_multiplier": TEXAS_V2_MVI_BOOST_MULTIPLIER,
+                "realized_volatility_boost_pct": self.paper._texas_v21_realized_volatility_boost(
+                    settings, str(settings.get("trading_mode") or "PAPER")
+                ),
+                "realized_volatility_boost_multiplier": self.paper._texas_v21_realized_volatility_boost_multiplier(
+                    settings, str(settings.get("trading_mode") or "PAPER")
+                ),
                 "thesis_checkpoint_seconds": TEXAS_V2_THESIS_CHECKPOINT_SECONDS,
                 "thesis_unfavorable_distance": TEXAS_V2_THESIS_UNFAVORABLE_DISTANCE,
             },
@@ -1760,38 +1761,13 @@ class AnalysisEngine:
             benchmark_uncertainty_pct=benchmark_uncertainty,
             settlement_window=settlement_window,
         )
-        btc_observed = parse_time(btc.get("observed_at"))
-        mvi_source_reliable = bool(
-            int(btc.get("exchange_count") or 0)
-            >= int(settings.get("minimum_exchange_feeds", 2))
-            and float(btc.get("dispersion_pct") or 0)
-            <= float(settings.get("max_exchange_dispersion_pct", 0.40))
-            and btc_observed is not None
-            and (datetime.now(UTC) - btc_observed).total_seconds()
-            <= float(settings.get("max_data_age_seconds", 20))
-            and quotes_are_fresh_and_qualified(
-                list(btc.get("quotes") or []), btc_observed, settings
-            )
-        )
-        margin_volatility = self.margin_volatility.observe(
-            observed_at=observed_at,
-            ticker=str(market["ticker"]),
-            threshold=float(strike),
-            btc_proxy=float(btc["price"]),
-            seconds_remaining=seconds_remaining,
-            source_reliable=mvi_source_reliable,
-        )
-        texas_breach = breach_features(
-            now_timestamp=(parse_time(observed_at) or datetime.now(UTC)).timestamp(),
-            ticker=str(market["ticker"]),
-            btc_price=btc.get("price"),
-            threshold=strike,
-            seconds_remaining=seconds_remaining,
-            margin_volatility=margin_volatility,
-            source_reliable=mvi_source_reliable,
-            price_timestamp=(parse_time(btc.get("observed_at")) or datetime.now(UTC)).timestamp(),
-            max_age_seconds=float(settings.get("max_data_age_seconds", 20)),
-            samples=self._recent_qualified_btc_samples,
+        # Coinbase RV is Texas's active volatility measurement.  MVI2 remains
+        # stored only for legacy reviews; this quote path must not create a new
+        # MVI row or feed it into Texas.  The forecast still owns its separate
+        # composite volatility feature, which is not an MVI entry rule.
+        coinbase_realized_volatility = (
+            self.historical_realized_volatility.dashboard_state()
+            if self.historical_realized_volatility else {}
         )
         directional_momentum = regression_momentum(
             self._recent_btc_samples,
@@ -1852,8 +1828,7 @@ class AnalysisEngine:
         for side, assessment in assessments.items():
             assessment["decision_confidence"] = decisions[side].confidence
             assessment["exchange_index"] = market.get("exchange_index")
-            assessment["margin_volatility"] = margin_volatility
-            assessment["texas_breach_reference"] = texas_breach
+            assessment["coinbase_realized_volatility"] = coinbase_realized_volatility
         decision = decisions.get(selected_side, decisions["YES"])
         previous = self.db.fetch_one(
             "SELECT * FROM signal_snapshots WHERE ticker=? ORDER BY id DESC LIMIT 1",
@@ -1886,7 +1861,7 @@ class AnalysisEngine:
             signal_id = self._save_signal(
                 market["ticker"], forecast, decision, model_version, features, btc,
                 market_state, reason, observed_at, probability, selected_side,
-                margin_volatility,
+                None,
             )
             if previous_forecast and previous_forecast != forecast.signal:
                 notification = {
@@ -1906,16 +1881,16 @@ class AnalysisEngine:
                 settings.get(f"{trading_mode.lower()}_automatic_trading_enabled", False)
             ) and bool(readiness.get("automatic_armed"))
             texas_enabled = bool(settings.get("texas_holdem_enabled", False))
-            try:
-                texas_mvi = float((margin_volatility or {}).get("mvi"))
-            except (TypeError, ValueError):
-                texas_mvi = float("nan")
+            texas_rv = texas_readiness(coinbase_realized_volatility, observed_at=observed_at)
+            rv_boost = self.paper._texas_v21_realized_volatility_boost(settings, trading_mode)
+            rv_multiplier = self.paper._texas_v21_realized_volatility_boost_multiplier(settings, trading_mode)
+            rv_value = texas_rv.get("rv_pct")
             texas_boost = (
-                TEXAS_V2_MVI_BOOST_MULTIPLIER
+                rv_multiplier
                 if texas_enabled
-                and bool((margin_volatility or {}).get("reliable"))
-                and math.isfinite(texas_mvi)
-                and texas_mvi >= TEXAS_V2_MVI_BOOST_THRESHOLD
+                and bool(texas_rv.get("ready"))
+                and rv_value is not None
+                and float(rv_value) + 1e-12 >= rv_boost
                 else 1.0
             )
             execution_risk_by_side = {
@@ -1958,13 +1933,7 @@ class AnalysisEngine:
                     model_version=entry_model_version,
                     reason=entry_decision.explanation,
                     stop_loss_cents=settings.get("default_stop_loss_cents"),
-                    strategy_metadata={
-                        "margin_volatility_index": margin_volatility.get("mvi"),
-                        "margin_cushion_ratio": margin_volatility.get("cushion_ratio"),
-                        "margin_volatility_version": margin_volatility.get(
-                            "calculation_version"
-                        ),
-                    },
+                    strategy_metadata={},
                 )
                 return entered
 
@@ -2001,7 +1970,7 @@ class AnalysisEngine:
             settlement_window=settlement_window,
             z_distance=baseline.z_distance,
             threshold_margin_dollars=float(btc["price"]) - float(strike),
-            margin_volatility=margin_volatility,
+            margin_volatility=None,
             directional_momentum=directional_momentum,
             model_version=model_version,
             portfolio=portfolio,
@@ -2039,8 +2008,7 @@ class AnalysisEngine:
                 },
                 "trade_assessments": assessments,
                 "threshold_state": threshold_state,
-                "margin_volatility": margin_volatility,
-                "texas_breach_reference": texas_breach,
+                "coinbase_realized_volatility": coinbase_realized_volatility,
                 "directional_momentum": directional_momentum,
                 "volume_signals": volume_signals,
                 "automatic_entry": automatic_entry,
@@ -2459,10 +2427,10 @@ class AnalysisEngine:
         )
         return {
             "points": points,
-            "volatility_points": self.margin_volatility.chart(since),
-            "maximum_margin_volatility": float(
-                self.db.settings().get("maximum_margin_volatility", 0)
-            ),
+            # The worker owns this cache; endpoint reads never scan candles or
+            # recompute realized volatility.
+            "realized_volatility": self.historical_realized_volatility.chart_state()
+            if self.historical_realized_volatility else {},
         }
 
     def _degrade(self, error: str) -> None:
