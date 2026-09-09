@@ -931,6 +931,20 @@ function renderConnectionHud(streams, btc, current) {
   const brti = quotes.get("BRTI");
   const brtiStale = stale(brti?.observed_at);
   set("#connection-brti", sources.has("BRTI") && !brtiStale ? "live" : brti && !brtiStale ? "fallback" : "offline", brti && !brtiStale ? `WS · ${ageLabel(brti.observed_at)}` : "Unavailable");
+  // Coinbase supplies closed candles only, so it has no quote timestamp in the
+  // market stream.  Its real health belongs to the realized-volatility worker.
+  // Without an explicit state this HUD item inherited the stylesheet's red
+  // default, falsely implying a Coinbase outage when the worker was healthy.
+  const coinbaseHistory = btc?.history || {};
+  const coinbaseState = coinbaseHistory.status;
+  const coinbaseUnavailable = coinbaseState === "error";
+  const coinbaseWaiting = coinbaseState === "loading" || coinbaseState === "stale"
+    || coinbaseHistory.current_stale;
+  set(
+    "#connection-coinbase",
+    coinbaseUnavailable ? "offline" : coinbaseWaiting ? "reconnecting" : "live",
+    coinbaseUnavailable ? "Unavailable" : coinbaseWaiting ? "Waiting for closed candles" : "Closed candles",
+  );
   const kalshi = streams.kalshi || {};
   set(
     "#connection-kalshi-market",

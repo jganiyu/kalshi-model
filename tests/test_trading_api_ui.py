@@ -185,11 +185,15 @@ def test_trading_ui_contains_mode_safety_and_confirmation_controls() -> None:
     assert "data.strategy?.texas_holdem" in script
     assert '"Kalshi market data reconnecting"' in script
     assert 'id="connection-coinbase"' in template
-    assert 'id="connection-kraken"' in template
-    assert 'id="connection-bitstamp"' in template
+    # BRTI is now the single market reference; Coinbase remains only for
+    # closed-candle realized volatility, so legacy proxy-feed HUD items are gone.
+    assert 'id="connection-kraken"' not in template
+    assert 'id="connection-bitstamp"' not in template
     assert 'id="connection-kalshi-market"' in template
     assert 'id="connection-kalshi-account"' in template
     assert "function renderConnectionHud(streams, btc, current)" in script
+    assert 'const coinbaseHistory = btc?.history || {};' in script
+    assert 'coinbaseUnavailable ? "offline" : coinbaseWaiting ? "reconnecting" : "live"' in script
     assert 'data-state="reconnecting"' in styles
 
 
