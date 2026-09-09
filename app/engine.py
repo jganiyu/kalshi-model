@@ -2527,8 +2527,30 @@ class AnalysisEngine:
                ORDER BY ticks.observed_at ASC""",
             (bucket_seconds, since),
         )
+        # The dashboard crosshair is display-only.  Keep one latest executable
+        # bid snapshot per readable time bucket instead of sending the full
+        # order-book stream back to the browser.  The 15-minute view gets the
+        # requested 15-second resolution; broader views stay bounded at one
+        # minute because sub-minute labels are not legible there.
+        price_bucket_seconds = 15 if minutes <= 15 else 60
+        contract_prices = self.db.fetch_all(
+            """WITH buckets AS (
+                 SELECT CAST(strftime('%s', observed_at) AS INTEGER) / ? AS bucket,
+                        MAX(id) AS id
+                 FROM kalshi_snapshots
+                 WHERE observed_at >= ?
+                 GROUP BY bucket
+               )
+               SELECT snapshots.observed_at, snapshots.ticker,
+                      snapshots.yes_bid, snapshots.no_bid
+               FROM kalshi_snapshots AS snapshots
+               JOIN buckets ON buckets.id = snapshots.id
+               ORDER BY snapshots.observed_at ASC""",
+            (price_bucket_seconds, since),
+        )
         return {
             "points": points,
+            "contract_prices": contract_prices,
             # The worker owns this cache; endpoint reads never scan candles or
             # recompute realized volatility.
             "realized_volatility": self.historical_realized_volatility.chart_state()

@@ -1162,6 +1162,15 @@ MIGRATIONS: list[tuple[int, str]] = [
             ON coinbase_realized_volatility_events(version,occurred_at DESC);
         """,
     ),
+    (
+        31,
+        """
+        -- Dashboard chart crosshair reads recent executable prices by time.
+        -- This prevents a broad history scan from competing with live writes.
+        CREATE INDEX IF NOT EXISTS idx_kalshi_snapshots_observed_at
+            ON kalshi_snapshots(observed_at);
+        """,
+    ),
 ]
 
 

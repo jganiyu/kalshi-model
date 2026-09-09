@@ -44,6 +44,28 @@ def test_texas_dashboard_state_stays_visible_without_current_market(tmp_path: Pa
     assert texas["maximum_attempts"] == 5
 
 
+def test_chart_returns_bounded_historical_executable_bids_for_crosshair(tmp_path: Path) -> None:
+    db = make_db(tmp_path)
+    ticker = "KXBTC15M-TEST"
+    observed_at = iso_now()
+    add_market(db, ticker, opened_at=observed_at)
+    db.execute(
+        """INSERT INTO kalshi_snapshots(
+               observed_at,ticker,yes_bid,yes_ask,no_bid,no_ask,spread,liquidity,
+               open_interest,volume,yes_bid_size,yes_ask_size,imbalance,
+               rapid_repricing,orderbook_json
+             ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (observed_at, ticker, .57, .58, .41, .42, .01, 100, 1, 1, 1, 1, 0, 0, "{}"),
+    )
+    engine = AnalysisEngine(AppConfig(database_path=db.path), db)
+
+    chart = engine.chart(15)
+
+    assert chart["contract_prices"] == [{
+        "observed_at": observed_at, "ticker": ticker, "yes_bid": .57, "no_bid": .41,
+    }]
+
+
 def add_market(
     db: Database,
     ticker: str,

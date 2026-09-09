@@ -1,6 +1,9 @@
 const state = {
   dashboard: null,
   chartPoints: [],
+  chartContractPrices: [],
+  dashboardChartCrosshair: { timestamp: null, pointerX: null },
+  dashboardChartGeometry: null,
   realizedVolatility: {},
   chartMode: "btc",
   chartWindow: 15,
@@ -1574,6 +1577,65 @@ function drawVolatilityChart(context, width, height, color, numberFont) {
   context.fillStyle = color("--hud-warning"); context.fill();
 }
 
+function dashboardChartSnapIntervalMs() {
+  // The short chart is deliberately inspectable at the requested 15-second
+  // cadence.  Longer views use one-minute snapshots to remain readable.
+  return state.chartWindow <= 15 ? 15000 : 60000;
+}
+
+function dashboardChartPriceAt(timestamp) {
+  const prices = state.chartContractPrices || [];
+  if (!prices.length || !Number.isFinite(timestamp)) return null;
+  let nearest = null;
+  for (const price of prices) {
+    const time = new Date(price.observed_at).getTime();
+    if (!Number.isFinite(time)) continue;
+    if (!nearest || Math.abs(time - timestamp) < Math.abs(nearest.time - timestamp)) {
+      nearest = { ...price, time };
+    }
+  }
+  // Do not turn a long book outage into a misleading historical quote.
+  return nearest && Math.abs(nearest.time - timestamp) <= dashboardChartSnapIntervalMs() * 1.5
+    ? nearest : null;
+}
+
+function renderDashboardChartTooltip(timestamp, pointerX, width) {
+  const tooltip = $("#dashboard-chart-tooltip");
+  if (!tooltip || !Number.isFinite(timestamp)) return;
+  const price = dashboardChartPriceAt(timestamp);
+  tooltip.innerHTML = `<time>${chartTimeLabel(timestamp, true, state.chartWindow >= 1440)}</time>
+    <span>Up bid <b>${cents(price?.yes_bid)}</b></span>
+    <span>Down bid <b>${cents(price?.no_bid)}</b></span>`;
+  tooltip.hidden = false;
+  const tooltipWidth = 140;
+  const proposed = pointerX > width * 0.62 ? pointerX - tooltipWidth - 12 : pointerX + 12;
+  tooltip.style.left = `${Math.max(8, Math.min(width - tooltipWidth - 8, proposed))}px`;
+}
+
+function clearDashboardChartCrosshair() {
+  state.dashboardChartCrosshair = { timestamp: null, pointerX: null };
+  const tooltip = $("#dashboard-chart-tooltip");
+  if (tooltip) tooltip.hidden = true;
+}
+
+function updateDashboardChartCrosshair(event) {
+  if (state.chartMode !== "btc") return;
+  const canvas = $("#price-chart");
+  const geometry = state.dashboardChartGeometry;
+  if (!canvas || !geometry) return;
+  const box = canvas.getBoundingClientRect();
+  const pointerX = Math.max(geometry.left, Math.min(geometry.plotRight, event.clientX - box.left));
+  const rawTime = geometry.viewStart + ((pointerX - geometry.left) / geometry.chartWidth)
+    * (geometry.viewEnd - geometry.viewStart);
+  const interval = dashboardChartSnapIntervalMs();
+  const timestamp = Math.max(geometry.viewStart, Math.min(
+    geometry.viewEnd,
+    Math.round(rawTime / interval) * interval,
+  ));
+  state.dashboardChartCrosshair = { timestamp, pointerX: geometry.x(timestamp) };
+  drawChart();
+}
+
 function drawChart(frameTime = performance.now()) {
   const canvas = $("#price-chart");
   if (!canvas) return;
@@ -1599,6 +1661,7 @@ function drawChart(frameTime = performance.now()) {
   $("#volatility-legend").hidden = !volatilityMode;
   $("#volatility-max-legend").hidden = true;
   if (volatilityMode) {
+    clearDashboardChartCrosshair();
     drawVolatilityChart(context, width, height, color, numberFont);
     return;
   }
@@ -1846,6 +1909,20 @@ function drawChart(frameTime = performance.now()) {
     );
   }
   context.beginPath(); context.arc(x(lastPoint.time), y(lastPoint.price), 3.25, 0, Math.PI * 2); context.fillStyle = color("--chart-line"); context.fill();
+
+  state.dashboardChartGeometry = { left, plotRight, chartWidth, viewStart, viewEnd, x };
+  const selected = state.dashboardChartCrosshair;
+  if (Number.isFinite(selected?.timestamp)) {
+    const crosshairX = x(selected.timestamp);
+    context.save();
+    context.strokeStyle = color("--muted");
+    context.globalAlpha = .85;
+    context.lineWidth = 1;
+    context.setLineDash([3, 3]);
+    context.beginPath(); context.moveTo(crosshairX, top); context.lineTo(crosshairX, top + chartHeight); context.stroke();
+    context.restore();
+    renderDashboardChartTooltip(selected.timestamp, crosshairX, width);
+  }
 }
 
 function activePriceMovement(frameTime = performance.now()) {
@@ -1889,6 +1966,20 @@ function appendLiveChartPoint(data) {
   else state.chartPoints.push(point);
   const cutoff = Date.now() - state.chartWindow * 60 * 1000;
   state.chartPoints = state.chartPoints.filter((item) => new Date(item.observed_at).getTime() >= cutoff);
+  const market = data?.current;
+  const observedAt = market?.executable_quote_at || market?.observed_at;
+  if (observedAt && (market?.yes_bid != null || market?.no_bid != null)) {
+    const quote = {
+      observed_at: observedAt,
+      ticker: market.ticker,
+      yes_bid: numberOrNull(market.yes_bid),
+      no_bid: numberOrNull(market.no_bid),
+    };
+    const lastQuote = state.chartContractPrices.at(-1);
+    if (lastQuote?.observed_at === quote.observed_at) state.chartContractPrices[state.chartContractPrices.length - 1] = quote;
+    else state.chartContractPrices.push(quote);
+    state.chartContractPrices = state.chartContractPrices.filter((item) => new Date(item.observed_at).getTime() >= cutoff);
+  }
 }
 
 function mergeLiveMarket(data) {
@@ -1990,6 +2081,7 @@ async function refreshDashboard() {
       api("/api/dashboard"), api(`/api/chart?minutes=${state.chartWindow}`),
     ]);
     state.chartPoints = chart.points || [];
+    state.chartContractPrices = chart.contract_prices || [];
     state.realizedVolatility = chart.realized_volatility || {};
     renderDashboard(dashboard);
   } catch (error) {
@@ -3156,19 +3248,33 @@ function bindEvents() {
   $$("[data-trading-mode]").forEach((button) => button.addEventListener("click", () => selectTradingMode(button.dataset.tradingMode)));
   $$("[data-window]").forEach((button) => button.addEventListener("click", async () => {
     state.chartWindow = Number(button.dataset.window);
+    clearDashboardChartCrosshair();
     resetChartAxis();
     $$("[data-window]").forEach((item) => item.classList.toggle("active", item === button));
     const chart = await api(`/api/chart?minutes=${state.chartWindow}`);
     state.chartPoints = chart.points || [];
+    state.chartContractPrices = chart.contract_prices || [];
     state.realizedVolatility = chart.realized_volatility || {};
     drawChart();
   }));
   $$('[data-chart-mode]').forEach((button) => button.addEventListener("click", () => {
     state.chartMode = button.dataset.chartMode === "volatility" ? "volatility" : "btc";
+    clearDashboardChartCrosshair();
     $$('[data-chart-mode]').forEach((item) => item.classList.toggle("active", item === button));
     resetChartAxis();
     drawChart();
   }));
+  const dashboardChart = $("#price-chart");
+  dashboardChart.addEventListener("pointerdown", (event) => {
+    dashboardChart.setPointerCapture?.(event.pointerId);
+    updateDashboardChartCrosshair(event);
+  });
+  dashboardChart.addEventListener("pointermove", updateDashboardChartCrosshair);
+  dashboardChart.addEventListener("pointerleave", () => {
+    if (state.chartMode !== "btc") return;
+    clearDashboardChartCrosshair();
+    drawChart();
+  });
   $("#credential-form").addEventListener("submit", saveKalshiCredentials);
   $("#remove-credentials").addEventListener("click", removeKalshiCredentials);
   $$("[data-trading-credential-form]").forEach((form) => form.addEventListener("submit", saveTradingCredentials));
