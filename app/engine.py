@@ -2509,8 +2509,8 @@ class AnalysisEngine:
         since = (datetime.now(UTC) - timedelta(minutes=minutes)).isoformat()
         points = self.db.fetch_all(
             """
-            SELECT observed_at, composite_price AS price, dispersion_pct,
-                   volatility_15m FROM btc_ticks
+            SELECT observed_at, composite_price AS price, dispersion_pct
+            FROM btc_ticks
             WHERE observed_at >= ? ORDER BY observed_at ASC
             """,
             (since,),

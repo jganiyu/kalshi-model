@@ -1505,10 +1505,11 @@ function drawVolatilityChart(context, width, height, color, numberFont) {
   const liveGutterMs = Math.min(10000, windowMs * 0.025);
   const viewEnd = Date.now() + liveGutterMs;
   const viewStart = viewEnd - windowMs;
-  // Coinbase RV uses completed one-minute candles.  Select the closest
-  // available horizon while the existing buttons continue to select the span.
-  const horizon = state.chartWindow <= 5 ? "5" : state.chartWindow <= 15 ? "15" : "60";
-  $("#volatility-legend").textContent = `Coinbase ${horizon}m realized volatility`;
+  // The chart is a history of the exact 15-minute Coinbase RV value Texas
+  // uses. The 5m/15m/30m/60m controls select display span, never a second
+  // volatility calculation.
+  const horizon = "15";
+  $("#volatility-legend").textContent = "Coinbase 15m realized volatility";
   const points = ((state.realizedVolatility?.series || {})[horizon] || [])
     .map((point) => ({ ...point, time: new Date(point.closed_at).getTime(), value: numberOrNull(point.rv_pct) }))
     .filter((point) => Number.isFinite(point.time) && point.time >= viewStart && point.time <= viewEnd);
@@ -1874,7 +1875,6 @@ function appendLiveChartPoint(data) {
     observed_at: btc.observed_at,
     price: Number(btc.price),
     dispersion_pct: btc.dispersion_pct,
-    volatility_15m: btc.volatility_15m,
   };
   const previousPrice = Number(last?.price);
   if (Number.isFinite(previousPrice) && point.price !== previousPrice) {

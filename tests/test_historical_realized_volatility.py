@@ -48,12 +48,12 @@ def test_percentile_is_midrank_and_prior_only_minimum_is_explicit() -> None:
     assert midrank_percentile(2, [1, 2, 3], minimum_samples=4) is None
 
 
-def test_summary_has_independent_horizons_and_never_invents_zero(tmp_path) -> None:
+def test_summary_has_only_the_active_texas_horizon_and_never_invents_zero(tmp_path) -> None:
     db = Database(tmp_path / "rv.sqlite")
     db.initialize()
     service = CoinbaseRealizedVolatilityService(db, object())  # type: ignore[arg-type]
     now = completed_minute_epoch(datetime(2026, 1, 1, tzinfo=UTC))
-    # More than 7 days allows a percentile for every independent horizon.
+    # More than 7 days allows a percentile for the active Texas horizon.
     service._store(rows(now - 8 * 24 * 60 * 60, 8 * 24 * 60 + 1, ratio=1.0001))
     # Pin wall time so the stored newest candle is the summary's current close.
     import app.services.historical_realized_volatility as module
@@ -63,11 +63,9 @@ def test_summary_has_independent_horizons_and_never_invents_zero(tmp_path) -> No
         state = service._summary()
     finally:
         module.completed_minute_epoch = original
-    assert state["horizons"]["5"]["rv_pct"] is not None
     assert state["horizons"]["15"]["rv_pct"] is not None
-    assert state["horizons"]["60"]["rv_pct"] is not None
-    assert state["horizons"]["60"]["percentile"] is not None
-    assert state["horizons"]["15"]["sample_count"] != state["horizons"]["60"]["sample_count"]
+    assert state["horizons"]["15"]["percentile"] is not None
+    assert set(state["horizons"]) == {"15"}
     assert db.fetch_one("SELECT version FROM coinbase_realized_volatility_state")["version"] == "coinbase-rv-1"
 
 
@@ -247,6 +245,9 @@ def test_worker_summary_exposes_bounded_closed_candle_chart_cache(tmp_path) -> N
         module.completed_minute_epoch = original
         module.utc_now = original_utc_now
     assert chart["status"] == "ready"
-    assert set(chart["series"]) == {"5", "15", "60"}
+    assert set(chart["series"]) == {"15"}
     assert all(len(points) <= 361 for points in chart["series"].values())
     assert chart["series"]["15"][-1]["closed_at"] == datetime.fromtimestamp(now + 60, UTC).isoformat()
+    assert chart["series"]["15"][-1]["rv_pct"] == pytest.approx(
+        service._state["horizons"]["15"]["rv_pct"]
+    )

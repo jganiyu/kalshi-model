@@ -1,8 +1,8 @@
 """Read-only Coinbase candle volatility context.
 
-This deliberately does not share data with MVI or the live BTC composite.  It
-answers a narrower question: how large was the realized *path* over a closed
-5/15/60 minute candle window, relative to earlier Coinbase BTC-USD windows?
+This deliberately does not share data with MVI or the live BRTI price feed.
+It answers one question: how large was the realized *path* over the closed
+15-minute Coinbase BTC-USD candle window that Texas uses?
 """
 from __future__ import annotations
 
@@ -26,8 +26,11 @@ VERSION = "coinbase-rv-1"
 SOURCE = "Coinbase"
 PRODUCT = "BTC-USD"
 GRANULARITY_SECONDS = 60
-HORIZONS = (5, 15, 60)
 TEXAS_HORIZON = 15
+# The Dashboard chart is a time history of this one Texas signal.  The chart
+# controls select display span only; they must never silently change the
+# underlying volatility calculation.
+HORIZONS = (TEXAS_HORIZON,)
 BASELINE_DAYS = 90
 MINIMUM_BASELINE_DAYS = 7
 MINIMUM_BASELINE_SAMPLES = MINIMUM_BASELINE_DAYS * 24 * 60
