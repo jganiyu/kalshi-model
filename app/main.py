@@ -187,7 +187,7 @@ async def live(websocket: WebSocket) -> None:
 
 
 @app.get("/api/chart")
-async def chart(minutes: int = Query(default=5, ge=5, le=360)) -> dict[str, Any]:
+async def chart(minutes: int = Query(default=15, ge=15, le=1440)) -> dict[str, Any]:
     return {"minutes": minutes, **engine.chart(minutes)}
 
 
@@ -754,7 +754,7 @@ def clean_settings_payload(payload: dict[str, Any]) -> dict[str, Any]:
         "calibration_tolerance": (0.0, 0.50),
         "retraining_cadence_hours": (1, 720),
         "initial_retrain_settlements": (0, 10_000),
-        "chart_window_minutes": (5, 360),
+        "chart_window_minutes": (15, 1440),
     }
     for mode in ("demo", "live"):
         numeric_ranges.update(

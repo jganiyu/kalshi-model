@@ -2505,15 +2505,27 @@ class AnalysisEngine:
         return dict(self._calibration_summary)
 
     def chart(self, minutes: int) -> dict[str, Any]:
-        minutes = max(5, min(360, int(minutes)))
+        minutes = max(15, min(1440, int(minutes)))
         since = (datetime.now(UTC) - timedelta(minutes=minutes)).isoformat()
+        # Keep the visual chart bounded at longer spans.  BRTI can arrive at
+        # 5Hz; retaining every tick for a day would waste the UI's frame time
+        # without adding readable information.  The newest tick in each bucket
+        # preserves the displayed current path while leaving execution state
+        # and stored observations untouched.
+        bucket_seconds = 1 if minutes <= 15 else 5 if minutes <= 60 else 10 if minutes <= 180 else 60
         points = self.db.fetch_all(
-            """
-            SELECT observed_at, composite_price AS price, dispersion_pct
-            FROM btc_ticks
-            WHERE observed_at >= ? ORDER BY observed_at ASC
-            """,
-            (since,),
+            """WITH buckets AS (
+                 SELECT CAST(strftime('%s', observed_at) AS INTEGER) / ? AS bucket,
+                        MAX(observed_at) AS observed_at
+                 FROM btc_ticks
+                 WHERE observed_at >= ?
+                 GROUP BY bucket
+               )
+               SELECT ticks.observed_at, ticks.composite_price AS price, ticks.dispersion_pct
+               FROM btc_ticks AS ticks
+               JOIN buckets ON buckets.observed_at = ticks.observed_at
+               ORDER BY ticks.observed_at ASC""",
+            (bucket_seconds, since),
         )
         return {
             "points": points,

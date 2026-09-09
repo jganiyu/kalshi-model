@@ -202,7 +202,7 @@ DEFAULT_SETTINGS: dict[str, object] = {
     "calibration_tolerance": 0.01,
     "retraining_cadence_hours": 24,
     "initial_retrain_settlements": 20,
-    "chart_window_minutes": 5,
+    "chart_window_minutes": 15,
     "kalshi_series": "KXBTC15M",
     "trading_mode": "PAPER",
     "demo_automatic_trading_enabled": False,

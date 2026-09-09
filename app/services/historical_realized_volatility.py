@@ -487,7 +487,10 @@ class CoinbaseRealizedVolatilityService:
             # Bounded, worker-computed cache for the Dashboard. A null point
             # is an explicit gap; the renderer must never connect across it.
             series: list[dict[str, Any]] = []
-            chart_start = max(target + horizon * 60, now - 360 * 60)
+            # The Dashboard can display up to one day of the fixed 15-minute
+            # Texas signal.  This remains a bounded worker cache, never an
+            # endpoint-time candle scan or recalculation.
+            chart_start = max(target + horizon * 60, now - 1440 * 60)
             for end_epoch in range(chart_start, now + 1, GRANULARITY_SECONDS):
                 window = [(end_epoch - horizon * 60 + index * 60,
                            by_epoch.get(end_epoch - horizon * 60 + index * 60))

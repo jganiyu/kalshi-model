@@ -246,7 +246,7 @@ def test_worker_summary_exposes_bounded_closed_candle_chart_cache(tmp_path) -> N
         module.utc_now = original_utc_now
     assert chart["status"] == "ready"
     assert set(chart["series"]) == {"15"}
-    assert all(len(points) <= 361 for points in chart["series"].values())
+    assert all(len(points) <= 1441 for points in chart["series"].values())
     assert chart["series"]["15"][-1]["closed_at"] == datetime.fromtimestamp(now + 60, UTC).isoformat()
     assert chart["series"]["15"][-1]["rv_pct"] == pytest.approx(
         service._state["horizons"]["15"]["rv_pct"]

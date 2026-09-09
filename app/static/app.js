@@ -3,7 +3,7 @@ const state = {
   chartPoints: [],
   realizedVolatility: {},
   chartMode: "btc",
-  chartWindow: 5,
+  chartWindow: 15,
   closeTime: null,
   lastNotification: null,
   activePage: "dashboard",
@@ -1472,16 +1472,18 @@ function chartTickInterval(windowMs, chartWidth) {
   const intervals = [
     1000, 2000, 5000, 10000, 15000, 30000, 60000, 120000,
     300000, 600000, 900000, 1800000, 3600000,
+    7200000, 10800000, 14400000, 21600000, 43200000,
   ];
   return intervals.find((interval) => interval >= rough) || intervals.at(-1);
 }
 
-function chartTimeLabel(timestamp, includeSeconds) {
+function chartTimeLabel(timestamp, includeSeconds, includeDate = false) {
   const date = new Date(timestamp);
   const hour = date.getHours() % 12 || 12;
   const minute = String(date.getMinutes()).padStart(2, "0");
   const second = String(date.getSeconds()).padStart(2, "0");
-  return includeSeconds ? `${hour}:${minute}:${second}` : `${hour}:${minute}`;
+  const time = includeSeconds ? `${hour}:${minute}:${second}` : `${hour}:${minute}`;
+  return includeDate ? `${date.toLocaleString(undefined, { month: "short", day: "numeric" })} ${time}` : time;
 }
 
 function smoothChartAxis(targetLow, targetHigh, frameTime) {
@@ -1506,7 +1508,7 @@ function drawVolatilityChart(context, width, height, color, numberFont) {
   const viewEnd = Date.now() + liveGutterMs;
   const viewStart = viewEnd - windowMs;
   // The chart is a history of the exact 15-minute Coinbase RV value Texas
-  // uses. The 5m/15m/30m/60m controls select display span, never a second
+  // uses. The 15m/1h/3h/1d controls select display span, never a second
   // volatility calculation.
   const horizon = "15";
   $("#volatility-legend").textContent = "Coinbase 15m realized volatility";
@@ -1541,7 +1543,7 @@ function drawVolatilityChart(context, width, height, color, numberFont) {
     const columnX = x(timestamp);
     context.beginPath(); context.moveTo(columnX, top); context.lineTo(columnX, top + chartHeight); context.stroke();
     if (columnX >= left + 34 && columnX <= plotRight - 34) {
-      context.fillText(chartTimeLabel(timestamp, state.chartWindow <= 5), columnX, height - 8);
+      context.fillText(chartTimeLabel(timestamp, state.chartWindow <= 15, state.chartWindow >= 1440), columnX, height - 8);
     }
   }
 
@@ -1675,7 +1677,7 @@ function drawChart(frameTime = performance.now()) {
     const columnX = x(timestamp);
     context.beginPath(); context.moveTo(columnX, top); context.lineTo(columnX, top + chartHeight); context.stroke();
     if (columnX >= left + 34 && columnX <= plotRight - 34) {
-      context.fillText(chartTimeLabel(timestamp, state.chartWindow <= 5), columnX, height - 8);
+      context.fillText(chartTimeLabel(timestamp, state.chartWindow <= 15, state.chartWindow >= 1440), columnX, height - 8);
     }
   }
 

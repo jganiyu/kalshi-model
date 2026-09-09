@@ -157,8 +157,11 @@ def test_trading_ui_contains_mode_safety_and_confirmation_controls() -> None:
     # Filled order rows show the confirmed execution price; resting rows fall
     # back to their limit rather than displaying a misleading 0.01 sell cap.
     assert "order.average_fill_price ?? order.limit_price" in script
-    assert 'data-window="15"' in template
-    assert 'data-window="180"' not in template
+    assert 'data-window="15">15m' in template
+    assert 'data-window="60">1h' in template
+    assert 'data-window="180">3h' in template
+    assert 'data-window="1440">1d' in template
+    assert 'data-window="5"' not in template
     assert "Settle margin" in template
     assert "threshold_margin_gate_dollars" in script
     assert "$$('[data-arm-session]')" in script
