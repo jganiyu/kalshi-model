@@ -158,3 +158,20 @@ def test_engine_persists_only_read_only_terminal_forecast_evidence(tmp_path: Pat
     assert saved is not None
     assert saved["status"] == "COMPARED"
     assert saved["official_threshold"] == pytest.approx(100.5)
+
+
+def test_engine_prefers_official_brti_final_minute_average(tmp_path: Path) -> None:
+    db = Database(tmp_path / "forecast.db")
+    db.initialize()
+    engine = AnalysisEngine(AppConfig(database_path=db.path), db)
+    opens = datetime(2026, 9, 4, 12, 15, tzinfo=UTC)
+    observed = stamp(opens - timedelta(seconds=1))
+    engine._next_market = market("NEXT", opens)  # type: ignore[assignment]
+    engine._cfbenchmarks = {
+        "connected": True, "index_id": "BRTI", "value": 100.0,
+        "final_minute_average": 101.25, "observed_at": observed,
+    }
+    engine._update_next_threshold_forecast(observed)
+    state = engine.dashboard["next_threshold_forecast"]
+    assert state["estimate"] == pytest.approx(101.25)
+    assert state["qualifier"] == "Official BRTI 60-second average"

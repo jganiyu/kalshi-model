@@ -91,9 +91,9 @@
                     </div>
                   </div>
                   <div class="chart-price-stat">
-                    <span>BTC PROXY</span>
+                    <span>BRTI</span>
                     <strong id="btc-price">--</strong>
-                    <small id="chart-now-distance">Waiting for proxy price</small>
+                    <small id="chart-now-distance">Waiting for BRTI</small>
                     <div id="historical-realized-volatility" class="historical-realized-volatility" aria-live="polite">
                       <span>15M REALIZED VOLATILITY</span>
                       <strong id="historical-realized-volatility-value">--</strong>
@@ -120,20 +120,19 @@
                   <button data-window="30">30m</button>
                   <button data-window="60">60m</button>
                 </div>
-                <p id="composite-source">Multi-exchange median</p>
+                <p id="composite-source">CF Benchmarks BRTI</p>
                 <span id="btc-dispersion">--</span>
                 <div class="connection-hud" aria-label="Market data connection status">
-                  <span class="connection-hud-item" id="connection-coinbase"><i></i><b>Coinbase</b><em>Checking</em></span>
-                  <span class="connection-hud-item" id="connection-kraken"><i></i><b>Kraken</b><em>Checking</em></span>
-                  <span class="connection-hud-item" id="connection-bitstamp"><i></i><b>Bitstamp</b><em>Checking</em></span>
+                  <span class="connection-hud-item" id="connection-brti"><i></i><b>BRTI</b><em>Checking</em></span>
+                  <span class="connection-hud-item" id="connection-coinbase"><i></i><b>Coinbase volatility</b><em>Closed candles</em></span>
                   <span class="connection-hud-item" id="connection-kalshi-market"><i></i><b>Kalshi market</b><em>Checking</em></span>
                   <span class="connection-hud-item" id="connection-kalshi-account"><i></i><b>Kalshi account</b><em>Checking</em></span>
                 </div>
               </div>
             </div>
-            <div class="chart-wrap"><canvas id="price-chart" aria-label="Live Bitcoin proxy price chart"></canvas></div>
+            <div class="chart-wrap"><canvas id="price-chart" aria-label="Live BRTI price chart"></canvas></div>
             <div class="chart-legend">
-              <span id="price-legend"><i class="legend-price"></i>BTC proxy</span>
+              <span id="price-legend"><i class="legend-price"></i>BRTI</span>
               <span id="threshold-legend"><i class="legend-strike" id="threshold-legend-swatch"></i>Current threshold</span>
               <span id="volatility-legend" hidden><i class="legend-volatility"></i>Coinbase realized volatility</span>
               <span id="volatility-max-legend" hidden></span>
@@ -250,7 +249,7 @@
                 <span id="standard-edge-liquidity-gate"><i></i><b>Liquidity <button class="hud-help" type="button" aria-label="About liquidity" data-tooltip="Contracts available at the executable ask versus the configured minimum.">i</button></b><small>--</small></span>
                 <span id="standard-edge-data-gate"><i></i><b>Data <button class="hud-help" type="button" aria-label="About data quality" data-tooltip="Whether critical feeds are current, reliable, mutually consistent, and the market is active.">i</button></b><small>--</small></span>
                 <span id="standard-edge-quality-gate"><i></i><b>Confidence <button class="hud-help" type="button" aria-label="About trade confidence" data-tooltip="Composite trade-confidence tier based on edge, spread, model agreement, and calibration evidence. It is separate from forecast probability.">i</button></b><small>--</small></span>
-                <span id="standard-edge-threshold-gate"><i></i><b>Threshold <button class="hud-help" type="button" aria-label="About threshold margin" data-tooltip="Up entries require the BTC proxy above the configured threshold band; Down entries require it below the band.">i</button></b><small>--</small></span>
+                <span id="standard-edge-threshold-gate"><i></i><b>Threshold <button class="hud-help" type="button" aria-label="About threshold margin" data-tooltip="Up entries require BRTI above the configured threshold band; Down entries require it below the band.">i</button></b><small>--</small></span>
                 <span id="standard-edge-direction-gate"><i></i><b>Direction <button class="hud-help" type="button" aria-label="About BTC direction" data-tooltip="The fitted BTC-proxy move over the configured lookback must rise for Up entries and fall for Down entries.">i</button></b><small>--</small></span>
                 <span id="standard-edge-volatility-gate"><i></i><b>Legacy MVI <button class="hud-help" type="button" aria-label="About legacy margin volatility" data-tooltip="MVI is retired from active calibration. A saved non-zero legacy MVI limit safely blocks Standard Edge entries until it is cleared from the stored settings; it is not a current volatility measurement.">i</button></b><small>Off</small></span>
                 <span id="standard-edge-risk-gate"><i></i><b>Risk <button class="hud-help" type="button" aria-label="About risk controls" data-tooltip="Whether bankroll, drawdown, position, duplicate-entry, and sizing controls permit an automatic entry.">i</button></b><small>--</small></span>

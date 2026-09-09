@@ -56,6 +56,50 @@ def test_cfbenchmarks_per_second_tick_updates_only_display_forecast_state() -> N
     asyncio.run(scenario())
 
 
+def test_cfbenchmarks_5hz_tick_is_coalesced_without_direct_forecast_work() -> None:
+    async def scenario() -> None:
+        engine = AnalysisEngine.__new__(AnalysisEngine)
+        engine._cfbenchmarks = {"connected": False, "index_id": "BRTI"}
+        engine._last_brti_source_ms = 0
+        calls: list[str] = []
+        engine._update_next_threshold_forecast = calls.append
+        engine._schedule_publish = lambda: None
+        await engine._handle_cfbenchmarks_message({
+            "type": "cfbenchmarks_value_5hz", "msg": {
+                "index_id": "BRTI", "value_usd": "68000.12", "source_ts_ms": 1710000000123,
+            },
+        })
+        assert engine._cfbenchmarks["value"] == pytest.approx(68000.12)
+        assert calls == []
+
+    asyncio.run(scenario())
+
+
+def test_reordered_per_second_frame_keeps_live_brti_but_accepts_official_average() -> None:
+    async def scenario() -> None:
+        engine = AnalysisEngine.__new__(AnalysisEngine)
+        engine._cfbenchmarks = {
+            "connected": True, "index_id": "BRTI", "value": 68001.0,
+            "source_ts_ms": 1710000000200,
+            "observed_at": "2024-03-09T16:00:00.200000+00:00",
+        }
+        engine._last_brti_source_ms = 1710000000200
+        calls: list[str] = []
+        engine._update_next_threshold_forecast = calls.append
+        engine._schedule_publish = lambda: None
+        await engine._handle_cfbenchmarks_message({
+            "type": "cfbenchmarks_value", "msg": {
+                "index_id": "BRTI", "data": '{"time":1710000000000,"value":"68000.12"}',
+                "last_60s_windowed_average_15min": {"value": "68000.23"},
+            },
+        })
+        assert engine._cfbenchmarks["value"] == pytest.approx(68001.0)
+        assert engine._cfbenchmarks["final_minute_average"] == pytest.approx(68000.23)
+        assert len(calls) == 1
+
+    asyncio.run(scenario())
+
+
 def test_public_kalshi_requests_have_a_short_independent_timeout() -> None:
     async def scenario() -> None:
         observed_timeout: dict[str, float] = {}
@@ -325,7 +369,7 @@ def test_live_refresh_ignores_incomplete_or_mismatched_market_transition(
 
 
 def test_benchmark_band_and_sparse_settlement_window_block_automatic_trade() -> None:
-    btc = {"exchange_count": 3, "dispersion_pct": 0.01}
+    btc = {"source": "BRTI", "exchange_count": 1, "dispersion_pct": 0.0}
     market = {
         "yes_bid": 0.54, "yes_ask": 0.55, "no_bid": 0.45, "no_ask": 0.46,
         "executable_quote_at": datetime.now(UTC).isoformat(),
@@ -362,7 +406,7 @@ def test_benchmark_band_and_sparse_settlement_window_block_automatic_trade() -> 
 def test_data_quality_requires_current_kalshi_executable_quote() -> None:
     market = {"yes_bid": .54, "yes_ask": .55, "no_bid": .45, "no_ask": .46}
     result = AnalysisEngine._data_quality(
-        {"exchange_count": 3, "dispersion_pct": .01}, market, 30.0,
+        {"source": "BRTI", "exchange_count": 1, "dispersion_pct": 0.0}, market, 30.0,
         {"max_exchange_dispersion_pct": .4, "max_data_age_seconds": 20},
         reference_price=101.0, strike=100.0, benchmark_uncertainty_pct=.0001,
         settlement_window={"elapsed_seconds": 0.0, "coverage": 1.0},
@@ -374,7 +418,7 @@ def test_data_quality_requires_current_kalshi_executable_quote() -> None:
 
     market["executable_quote_at"] = (datetime.now(UTC) - timedelta(seconds=21)).isoformat()
     stale = AnalysisEngine._data_quality(
-        {"exchange_count": 3, "dispersion_pct": .01}, market, 30.0,
+        {"source": "BRTI", "exchange_count": 1, "dispersion_pct": 0.0}, market, 30.0,
         {"max_exchange_dispersion_pct": .4, "max_data_age_seconds": 20},
         reference_price=101.0, strike=100.0, benchmark_uncertainty_pct=.0001,
         settlement_window={"elapsed_seconds": 0.0, "coverage": 1.0},

@@ -325,7 +325,7 @@ function thresholdBreachExitText(protection = {}) {
   const fields = [
     `Threshold breach exit: ${on ? "On" : "Off"}`,
     `Exit level ${money(protection.exit_level)}`,
-    `Current BTC proxy ${money(protection.btc_proxy ?? protection.trigger_btc_proxy)}`,
+    `Current BRTI ${money(protection.btc_proxy ?? protection.trigger_btc_proxy)}`,
     `Distance to exit ${signedMoney(protection.distance_to_exit)}`,
     `Status: ${status}`,
   ];
@@ -866,12 +866,10 @@ function renderDashboard(data) {
   syncPriceMovement();
   $("#chart-now-distance").textContent = threshold === null
     ? "Waiting for threshold"
-    : distance === null ? "Waiting for proxy price"
+    : distance === null ? "Waiting for BRTI"
     : `${distance > 0 ? "+" : ""}${money(distance)} (${percent(distance / threshold, 3, true)})`;
-  $("#btc-dispersion").textContent = btc.price
-    ? `${btc.exchange_count} feeds · ${Number(btc.dispersion_pct || 0).toFixed(3)}% dispersion`
-    : "No composite available";
-  $("#composite-source").textContent = btc.quotes?.map((quote) => quote.exchange).join(" · ") || "Multi-exchange median";
+  $("#btc-dispersion").textContent = btc.price ? "Official market reference" : "BRTI unavailable";
+  $("#composite-source").textContent = "CF Benchmarks BRTI";
   renderConnectionHud(streams, btc, current);
 
   state.closeTime = current?.close_time ? new Date(current.close_time) : null;
@@ -927,22 +925,9 @@ function renderConnectionHud(streams, btc, current) {
     item.dataset.state = state;
     item.querySelector("em").textContent = label;
   };
-  for (const source of ["Coinbase", "Kraken"]) {
-    const quote = quotes.get(source);
-    const quoteStale = stale(quote?.observed_at);
-    const live = sources.has(source) && !quoteStale;
-    const fallback = !!quote && !quoteStale;
-    set(
-      `#connection-${source.toLowerCase()}`,
-      live ? "live" : fallback ? "fallback" : quote ? "stale" : "offline",
-      live ? `WS · ${ageLabel(quote.observed_at)}` : fallback ? `REST · ${ageLabel(quote.observed_at)}` : quote ? `Stale · ${ageLabel(quote.observed_at)}` : "Unavailable",
-    );
-  }
-  set(
-    "#connection-bitstamp",
-    quotes.has("Bitstamp") && !stale(quotes.get("Bitstamp")?.observed_at) ? "live" : quotes.has("Bitstamp") ? "stale" : "offline",
-    quotes.has("Bitstamp") && !stale(quotes.get("Bitstamp")?.observed_at) ? `REST · ${ageLabel(quotes.get("Bitstamp").observed_at)}` : quotes.has("Bitstamp") ? `Stale · ${ageLabel(quotes.get("Bitstamp").observed_at)}` : "Unavailable",
-  );
+  const brti = quotes.get("BRTI");
+  const brtiStale = stale(brti?.observed_at);
+  set("#connection-brti", sources.includes("BRTI") && !brtiStale ? "live" : brti && !brtiStale ? "fallback" : "offline", brti && !brtiStale ? `WS · ${ageLabel(brti.observed_at)}` : "Unavailable");
   const kalshi = streams.kalshi || {};
   set(
     "#connection-kalshi-market",
@@ -1930,12 +1915,10 @@ function renderLiveMarketUpdate(data) {
   renderHistoricalRealizedVolatility(btc);
   $("#chart-now-distance").textContent = threshold === null
     ? "Waiting for threshold"
-    : distance === null ? "Waiting for proxy price"
+    : distance === null ? "Waiting for BRTI"
     : `${distance > 0 ? "+" : ""}${money(distance)} (${percent(distance / threshold, 3, true)})`;
-  $("#btc-dispersion").textContent = btc.price
-    ? `${btc.exchange_count} feeds · ${Number(btc.dispersion_pct || 0).toFixed(3)}% dispersion`
-    : "No composite available";
-  $("#composite-source").textContent = btc.quotes?.map((quote) => quote.exchange).join(" · ") || "Multi-exchange median";
+  $("#btc-dispersion").textContent = btc.price ? "Official market reference" : "BRTI unavailable";
+  $("#composite-source").textContent = "CF Benchmarks BRTI";
   renderConnectionHud(system.streams || {}, btc, current);
   const kalshiConnection = $("#kalshi-connection");
   const btcConnection = $("#btc-connection");
@@ -2040,7 +2023,7 @@ const calibrationGroups = [
     { id: "automatic_buy_duration_pct", label: "Required Buy duration", unit: "%", min: 50, max: 100, step: 1, scale: 100, tip: "Share of the confirmation period that must be spent in Buy. Default: 50%." },
     { id: "automatic_min_confidence", label: "Minimum edge strength", type: "select", options: ["Low", "Moderate", "High"], tip: "Lowest edge-strength label allowed for an automatic entry. Speculative assessments never enter automatically. Default: Moderate." },
     { id: "threshold_margin_gate_dollars", label: "Threshold margin", unit: "dollars", min: 0, max: 100000, step: 1, tip: "Directional BTC-proxy distance required for automatic entries: Up must be above the threshold and Down below it by this amount. Use 0 to turn it off. Default: $50." },
-    { type: "subsection", label: "BTC Directional Momentum", description: "Requires the BTC proxy's regression direction to agree with the side of every automatic entry." },
+    { type: "subsection", label: "BRTI Directional Momentum", description: "Requires BRTI regression direction to agree with the side of every automatic entry." },
     { id: "directional_momentum_gate_enabled", label: "Enable BTC Direction Gate", type: "toggle", tip: "Blocks automatic Up entries unless BTC is rising and Down entries unless BTC is falling across the configured regression window. Default: on." },
     { id: "directional_momentum_lookback_seconds", label: "Regression lookback", unit: "seconds", min: 5, max: 120, step: 1, integer: true, tip: "Recent BTC-proxy window used for the least-squares direction calculation. Default: 15 seconds." },
     { id: "directional_momentum_minimum_movement_dollars", label: "Minimum directional movement", unit: "dollars", min: 0, max: 100000, step: .25, tip: "Minimum fitted BTC move required across the lookback window in the entry direction. Default: $1." },
@@ -2073,8 +2056,8 @@ const calibrationGroups = [
     { id: "default_stop_loss_cents", label: "Default stop-loss", unit: "cents", min: 0, max: 99, step: 1, nullable: true, tip: "Optional absolute bid trigger prefilled on new Buy drafts. Use 0 or leave blank to turn it off; existing stops never change." },
     { id: "global_profit_take_enabled", label: "Global profit take", type: "toggle", tip: "Closes open positions in Paper, Demo, or Live when the executable bid reaches the configured level. Default: on." },
     { id: "global_profit_take_price", label: "Profit-take bid", unit: "cents", min: 1, max: 99, step: 1, scale: 100, tip: "Executable bid that triggers an exit for every strategy and manual trade. Demo and Live require the app to stay connected. Default: 99 cents." },
-    { type: "subsection", label: "Threshold Breach Exit", description: "This is a side-aware exit based on the BTC proxy versus To Beat. It does not use contract price as the trigger." },
-    { id: "threshold_breach_exit_enabled", label: "Enable Threshold Breach Exit", type: "toggle", tip: "Side-aware BTC-proxy exit for Standard Edge and manual positions. Texas Hold’em positions are intentionally exempt because they begin contrarian. Default: on." },
+    { type: "subsection", label: "Threshold Breach Exit", description: "This is a side-aware exit based on BRTI versus To Beat. It does not use contract price as the trigger." },
+    { id: "threshold_breach_exit_enabled", label: "Enable Threshold Breach Exit", type: "toggle", tip: "Side-aware BRTI exit for Standard Edge and manual positions. Texas Hold’em positions are intentionally exempt because they begin contrarian. Default: on." },
     { id: "threshold_breach_exit_buffer_dollars", label: "Threshold exit buffer", unit: "dollars", min: -100000, max: 100000, step: .25, tip: "Signed side-aware offset from To Beat. A negative value tolerates an adverse move beyond the threshold; -$2 exits an Up at $2 below To Beat or a Down at $2 above it. Positive values exit before the threshold. Default: $0." },
   ]],
   ["Position Sizing and Risk", [
@@ -2088,8 +2071,6 @@ const calibrationGroups = [
   ]],
   ["Data Quality", [
     { id: "max_data_age_seconds", label: "Maximum feed age", unit: "seconds", min: 1, max: 300, step: 1, tip: "Oldest BTC or Kalshi update considered safe. Default: 20 seconds." },
-    { id: "max_exchange_dispersion_pct", label: "Exchange dispersion", unit: "%", min: .01, max: 5, step: .05, tip: "Maximum disagreement across BTC exchanges. Default: 0.40%." },
-    { id: "minimum_exchange_feeds", label: "Minimum exchange feeds", unit: "feeds", min: 1, max: 3, step: 1, integer: true, tip: "Reliable BTC venues required for a signal. Default: 2 feeds." },
     { id: "closing_guard_seconds", label: "Closing guard", unit: "seconds", min: 1, max: 60, step: 1, integer: true, tip: "Final seconds in which market data is considered unsafe to trade. Default: 10 seconds." },
     { id: "settlement_min_coverage_pct", label: "Settlement coverage", unit: "%", min: 10, max: 100, step: 5, scale: 100, tip: "Required coverage of the observed final-minute proxy. Default: 50%." },
   ]],
@@ -2691,7 +2672,7 @@ async function toggleHistoricalTradeReview(row) {
       ${historicalReviewSummary(review)}
       ${historicalReviewCoverageWarning(review)}
       <div class="trade-review-chart-shell"><canvas class="trade-review-canvas" tabindex="0" aria-label="Historical market chart. Use left and right arrow keys to inspect saved points."></canvas><div class="trade-review-tooltip" hidden></div></div>
-      <div class="trade-review-legend"><span><i class="btc"></i>BTC proxy</span><span><i class="threshold"></i>Threshold</span><span><i class="entry"></i>Entry</span><span><i class="exit"></i>Exit</span><span><i class="settlement"></i>Settlement</span><small>Crosshair snaps to saved 5-second observations. Shaded areas are explicit recording gaps.</small></div>
+      <div class="trade-review-legend"><span><i class="btc"></i>BRTI</span><span><i class="threshold"></i>Threshold</span><span><i class="entry"></i>Entry</span><span><i class="exit"></i>Exit</span><span><i class="settlement"></i>Settlement</span><small>Crosshair snaps to saved 5-second observations. Shaded areas are explicit recording gaps.</small></div>
       <div class="trade-review-metrics">${reviewMetricContent(null)}</div>
     </section></td>`;
     bindHistoricalReviewPanel(reviewRow.querySelector(".trade-review-expanded"));
@@ -2778,7 +2759,7 @@ async function loadPaper() {
     const profitTake = data.profit_take_state || {};
     const stopState = data.stop_loss_state || {};
     const thresholdState = data.threshold_breach_exit_state || {};
-    $("#protection-warning").textContent = `${protectiveExit.warning || ""} ${stopState.warning || "Stop-loss execution requires the Kalshi Model to remain running and connected."} ${profitTake.warning || "Profit taking requires an armed, reconciled connection."} ${thresholdState.warning || "Threshold Breach Exit uses the BTC proxy versus To Beat."}`.trim();
+    $("#protection-warning").textContent = `${protectiveExit.warning || ""} ${stopState.warning || "Stop-loss execution requires the Kalshi Model to remain running and connected."} ${profitTake.warning || "Profit taking requires an armed, reconciled connection."} ${thresholdState.warning || "Threshold Breach Exit uses BRTI versus To Beat."}`.trim();
     $("#position-table").innerHTML = (data.positions || []).length ? data.positions.map((position) => `
       <tr><td>${position.ticker}</td><td>${marketSideLabel(position.side)}</td><td>${position.contracts}</td>
       <td>${money(position.market_exposure)}</td><td>${position.stop_loss_price == null ? "Off" : cents(position.stop_loss_price)}</td>
@@ -3092,7 +3073,7 @@ async function saveSettings() {
   const ids = [
     "starting_bankroll", "paper_trading_enabled", "min_edge", "slippage_cents",
     "fractional_kelly", "risk_controls_enabled", "max_position_pct",
-    "max_risk_per_trade_pct", "max_session_drawdown_pct", "max_exchange_dispersion_pct",
+    "max_risk_per_trade_pct", "max_session_drawdown_pct",
   ];
   const payload = {};
   ids.forEach((id) => {

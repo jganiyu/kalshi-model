@@ -51,7 +51,6 @@ from app.services.market_data import (
     BitcoinCompositeFeed,
     CompositeQuote,
     ExchangeQuote,
-    live_composite_quote,
 )
 from app.services.margin_volatility import MarginVolatilityService, quotes_are_fresh_and_qualified
 from app.services.historical_realized_volatility import CoinbaseRealizedVolatilityService, texas_readiness
@@ -172,13 +171,14 @@ class AnalysisEngine:
         self._latest_quotes: dict[str, ExchangeQuote] = {}
         self._latest_btc: dict[str, Any] | None = None
         self._cfbenchmarks: dict[str, Any] = {"connected": False, "index_id": "BRTI"}
+        self._last_brti_source_ms = 0
         self._current_market: dict[str, Any] | None = None
         self._next_market: dict[str, Any] | None = None
         self._market_state: dict[str, Any] | None = None
         self._execution_market_state: dict[str, Any] | None = None
         self._stream_status: dict[str, dict[str, Any]] = {
             "Coinbase": {"connected": False},
-            "Kraken": {"connected": False},
+            "BRTI": {"connected": False},
             "Kalshi": {
                 "connected": False,
                 "configured": bool(
@@ -219,16 +219,8 @@ class AnalysisEngine:
         self._historical_realized_volatility_task = asyncio.create_task(
             self.historical_realized_volatility.run()
         )
-        bitcoin_streams = BitcoinWebSocketFeeds(
-            self._handle_stream_quote, self._handle_stream_status,
-            self._handle_stream_trade,
-        )
-        self._stream_tasks.extend(
-            [
-                asyncio.create_task(bitcoin_streams.run_coinbase()),
-                asyncio.create_task(bitcoin_streams.run_kraken()),
-            ]
-        )
+        # Coinbase is retained only by the closed-candle volatility worker.
+        # Live price, threshold, and Texas logic use authenticated BRTI below.
         self._start_kalshi_stream()
         self._start_cfbenchmarks_stream()
         self._kalshi_book_fallback_task = asyncio.create_task(
@@ -320,6 +312,7 @@ class AnalysisEngine:
 
     async def _handle_cfbenchmarks_status(self, source: str, connected: bool, error: str | None) -> None:
         self._cfbenchmarks = {**self._cfbenchmarks, "connected": connected, "error": error}
+        await self._handle_stream_status("BRTI", connected, error)
         self._schedule_publish()
 
     async def _handle_cfbenchmarks_message(self, message: dict[str, Any]) -> None:
@@ -335,13 +328,27 @@ class AnalysisEngine:
             return
         if not math.isfinite(value) or value <= 0 or source_ms <= 0:
             return
+        # Do not move the canonical live price backwards.  A 1Hz frame can
+        # legitimately arrive behind a later 5Hz tick, however, and still
+        # carries the provider's official final-minute average.
+        reordered = source_ms < getattr(self, "_last_brti_source_ms", 0)
+        if reordered and kind != "cfbenchmarks_value":
+            return
+        if reordered:
+            average = dict(payload.get("last_60s_windowed_average_15min") or {})
+            average_value = as_float(average.get("value"))
+            if average_value and math.isfinite(average_value):
+                self._cfbenchmarks["final_minute_average"] = average_value
+                self._update_next_threshold_forecast(iso_now())
+                self._schedule_publish()
+            return
+        self._last_brti_source_ms = max(getattr(self, "_last_brti_source_ms", 0), source_ms)
         observed_at = datetime.fromtimestamp(source_ms / 1000, UTC).isoformat()
         self._cfbenchmarks = {**self._cfbenchmarks, "connected": True, "index_id": "BRTI",
                               "value": value, "source_ts_ms": source_ms, "observed_at": observed_at,
                               "channel": kind, "error": None}
-        # The 1Hz channel has one official print per second and the provider's
-        # running final-minute average.  It replaces only the *display-only*
-        # threshold forecast sample, not entry/exit or position logic.
+        # BRTI is the canonical price source. Rendering/persistence is
+        # coalesced below, so its 5Hz ticks never cause 5Hz DB/UI work.
         if kind == "cfbenchmarks_value":
             average = dict(payload.get("last_60s_windowed_average_15min") or {})
             try:
@@ -350,6 +357,8 @@ class AnalysisEngine:
                 average_value = None
             self._cfbenchmarks["final_minute_average"] = average_value if average_value and math.isfinite(average_value) else None
             self._update_next_threshold_forecast(observed_at)
+        if hasattr(self, "_live_refresh_task"):
+            self._schedule_live_refresh()
         self._schedule_publish()
 
     async def set_kalshi_credentials(
@@ -424,15 +433,11 @@ class AnalysisEngine:
         return self.dashboard["bootstrap"]
 
     async def collect_once(self) -> None:
-        assert self.bitcoin and self.kalshi
-        composite, market_pair = await asyncio.gather(
-            self.bitcoin.fetch(), self.kalshi.active_markets()
-        )
+        assert self.kalshi
+        market_pair = await self.kalshi.active_markets()
         current_market, next_market = market_pair
         observed_at = iso_now()
-        btc_state = await self._save_bitcoin(composite, observed_at)
-        self._latest_quotes = {quote.exchange: quote for quote in composite.quotes}
-        self._latest_btc = btc_state
+        btc_state = await self._fresh_brti_state(observed_at, persist=True)
         self._current_market = current_market
         self._next_market = next_market
         self._update_next_threshold_forecast(observed_at)
@@ -496,7 +501,7 @@ class AnalysisEngine:
                 if not market_strike(current_market)
                 else "The contract clock is missing from the Kalshi response."
                 if not parse_time(current_market.get("close_time"))
-                else "Fewer than two reliable BTC exchange feeds are available."
+                else "The BRTI market reference feed is unavailable or stale."
             )
             current_payload = self._unreliable_current(
                 current_market, reason
@@ -687,11 +692,7 @@ class AnalysisEngine:
             queue.put_nowait(None)
 
     def _system_state(self, reliable: bool, observed_at: str) -> dict[str, Any]:
-        bitcoin_sources = [
-            name
-            for name in ("Coinbase", "Kraken")
-            if self._stream_status[name].get("connected")
-        ]
+        bitcoin_sources = ["BRTI"] if self._stream_status["BRTI"].get("connected") else []
         kalshi_status = self._stream_status["Kalshi"]
         # Streaming market data and authenticated order REST are independent
         # paths. A live websocket must not be presented as proof that orders
@@ -721,10 +722,7 @@ class AnalysisEngine:
                 "bitcoin": {
                     "connected": bool(bitcoin_sources),
                     "sources": bitcoin_sources,
-                    "status": {
-                        name: dict(self._stream_status.get(name, {}))
-                        for name in ("Coinbase", "Kraken", "Bitstamp")
-                    },
+                    "status": {"BRTI": dict(self._stream_status.get("BRTI", {}))},
                 },
                 "kalshi": {
                     "connected": bool(kalshi_status.get("connected")),
@@ -805,28 +803,42 @@ class AnalysisEngine:
         if delay:
             await asyncio.sleep(delay)
         async with self._update_lock:
-            quotes = list(self._latest_quotes.values())
             observed_at = iso_now()
-            preferred = {
-                name
-                for name in ("Coinbase", "Kraken")
-                if self._stream_status[name].get("connected")
-            }
-            composite = live_composite_quote(
-                quotes, preferred,
-                maximum_age_seconds=float(self.db.settings().get("max_data_age_seconds", 20)),
-            )
-            if composite.price is not None:
-                now = time.monotonic()
-                persist = now - self._last_btc_persist >= 1.0
-                self._latest_btc = await self._save_bitcoin(
-                    composite, observed_at, persist=persist
-                )
-                if persist:
-                    self._last_btc_persist = now
+            now = time.monotonic()
+            persist = now - self._last_btc_persist >= 1.0
+            btc_state = await self._fresh_brti_state(observed_at, persist=persist)
+            if btc_state.get("price") is not None and persist:
+                self._last_btc_persist = now
             self._update_next_threshold_forecast(observed_at)
             self._refresh_cached_dashboard(observed_at)
             self._last_live_update = time.monotonic()
+
+    async def _fresh_brti_state(self, observed_at: str, *, persist: bool) -> dict[str, Any]:
+        """Create the canonical BTC state from a fresh authenticated BRTI tick.
+
+        There is deliberately no Coinbase/Kraken fallback: a stale BRTI blocks
+        entries rather than letting a different benchmark change Texas logic.
+        """
+        tick_at = parse_time(self._cfbenchmarks.get("observed_at"))
+        now = parse_time(observed_at) or datetime.now(UTC)
+        value = as_float(self._cfbenchmarks.get("value"))
+        if (
+            tick_at is None or value is None or value <= 0
+            or (now - tick_at).total_seconds() < 0
+            or (now - tick_at).total_seconds() > 3
+        ):
+            self._latest_btc = {
+                "price": None, "exchange_count": 0, "dispersion_pct": None,
+                "quotes": [], "errors": {"BRTI": "unavailable or stale"},
+                "source": "BRTI", "observed_at": observed_at,
+            }
+            return self._latest_btc
+        quote = ExchangeQuote("BRTI", float(value), None, None, None, 0.0, tick_at.isoformat())
+        state = await self._save_bitcoin(
+            CompositeQuote(float(value), 0.0, [quote], {}), observed_at, persist=persist
+        )
+        self._latest_btc = {**state, "source": "BRTI", "brti_source_ts_ms": self._cfbenchmarks.get("source_ts_ms")}
+        return self._latest_btc
 
     async def _handle_kalshi_message(
         self, message: dict[str, Any], book_metrics: dict[str, Any] | None
@@ -1330,7 +1342,8 @@ class AnalysisEngine:
                 "errors": composite.errors,
             }
         if persist:
-            await asyncio.to_thread(self.volume_signals.audit_cumulative, composite, observed_at)
+            if not (composite.quotes and composite.quotes[0].exchange == "BRTI"):
+                await asyncio.to_thread(self.volume_signals.audit_cumulative, composite, observed_at)
             for quote in composite.quotes:
                 await asyncio.to_thread(self.db.execute,
                     """
@@ -1393,9 +1406,12 @@ class AnalysisEngine:
         ]
         settings = self.db.settings()
         qualified = (
-            float(composite.dispersion_pct or 0)
-            <= float(settings.get("max_exchange_dispersion_pct", 0.40))
-            and quotes_are_fresh_and_qualified(composite.quotes, observed_time, settings)
+            bool(composite.quotes and composite.quotes[0].exchange == "BRTI")
+            or (
+                float(composite.dispersion_pct or 0)
+                <= float(settings.get("max_exchange_dispersion_pct", 0.40))
+                and quotes_are_fresh_and_qualified(composite.quotes, observed_time, settings)
+            )
         )
         if qualified:
             self._recent_qualified_btc_samples.append((now_epoch, composite.price))
@@ -2091,10 +2107,8 @@ class AnalysisEngine:
         benchmark_uncertainty_pct: float,
         settlement_window: dict[str, float | int | None],
     ) -> dict[str, Any]:
-        if int(btc.get("exchange_count") or 0) < int(
-            settings.get("minimum_exchange_feeds", 2)
-        ):
-            return {"reliable": False, "reason": "fewer than two exchange feeds responded"}
+        if btc.get("source") != "BRTI":
+            return {"reliable": False, "reason": "BRTI is required for new entries"}
         now = datetime.now(UTC)
         maximum_age = float(settings.get("max_data_age_seconds", 20))
         for label, timestamp in (("BTC", btc.get("observed_at")),):
@@ -2112,8 +2126,6 @@ class AnalysisEngine:
                 "reliable": False,
                 "reason": "the Kalshi executable quote is stale",
             }
-        if float(btc.get("dispersion_pct") or 0) > float(settings["max_exchange_dispersion_pct"]):
-            return {"reliable": False, "reason": "cross-exchange prices disagree beyond the configured limit"}
         if seconds_remaining <= float(settings.get("closing_guard_seconds", 10)):
             return {"reliable": False, "reason": "the contract is closing or transitioning"}
         if any(market.get(key) is None for key in ("yes_bid", "yes_ask", "no_bid", "no_ask")):
@@ -2316,12 +2328,11 @@ class AnalysisEngine:
         frozen, frozen_evidence = self._next_threshold_forecast.freeze_if_due(observed_at)
         if frozen_evidence:
             self._persist_next_threshold_forecast(frozen_evidence)
-        source_label = "Proxy estimate · not official CF Benchmarks BRTI"
-        forecast_price = (self._latest_btc or {}).get("price")
+        source_label = "BRTI estimate · awaiting current source tick"
+        forecast_price = None
         cf_at = parse_time(self._cfbenchmarks.get("observed_at"))
         now = parse_time(observed_at)
-        # Do not quietly use a stale official tick.  The public composite
-        # remains the display-only fallback until BRTI is current again.
+        # Never substitute another venue: this estimate must be BRTI or blank.
         if cf_at and now and 0 <= (now - cf_at).total_seconds() <= 3:
             candidate = self._cfbenchmarks.get("value")
             try:
@@ -2329,8 +2340,13 @@ class AnalysisEngine:
             except (TypeError, ValueError):
                 candidate = None
             if candidate and math.isfinite(candidate) and candidate > 0:
-                forecast_price = candidate
-                source_label = "CF Benchmarks BRTI estimate · official source ticks"
+                official_average = as_float(self._cfbenchmarks.get("final_minute_average"))
+                forecast_price = official_average if official_average and official_average > 0 else candidate
+                source_label = (
+                    "Official BRTI 60-second average"
+                    if official_average and official_average > 0
+                    else "CF Benchmarks BRTI estimate · official source ticks"
+                )
         state, comparison_evidence = self._next_threshold_forecast.observe(
             next_market=self._next_market,
             known_markets=(self._current_market, self._next_market),
