@@ -927,7 +927,7 @@ function renderConnectionHud(streams, btc, current) {
   };
   const brti = quotes.get("BRTI");
   const brtiStale = stale(brti?.observed_at);
-  set("#connection-brti", sources.includes("BRTI") && !brtiStale ? "live" : brti && !brtiStale ? "fallback" : "offline", brti && !brtiStale ? `WS · ${ageLabel(brti.observed_at)}` : "Unavailable");
+  set("#connection-brti", sources.has("BRTI") && !brtiStale ? "live" : brti && !brtiStale ? "fallback" : "offline", brti && !brtiStale ? `WS · ${ageLabel(brti.observed_at)}` : "Unavailable");
   const kalshi = streams.kalshi || {};
   set(
     "#connection-kalshi-market",
