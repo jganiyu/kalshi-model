@@ -1068,6 +1068,10 @@ def test_dashboard_markup_has_two_fixed_books_and_paper_trade_history() -> None:
     assert 'const tag = entryEvent ? "Entry" : exitEvent ? "Exit" : null;' in script
     assert 'data-chart-mode="volatility"' in markup
     assert 'Coinbase 15m realized volatility' in script
+    assert 'function texasVolatilityGatePct()' in script
+    assert 'const gateLabel = `Texas gate ${gate.toFixed(2)}%`;' in script
+    assert 'const maxValue = Math.max(.05, gate, ...values) * 1.15;' in script
+    assert 'Math.max(top + .5, Math.min(top + chartHeight - .5, y(gate)))' in script
     assert 'texas-rv-multiplier' in markup
     assert 'BOOSTED 1.5×' not in script
     # MVI is retired from active calibration.  A saved legacy value remains

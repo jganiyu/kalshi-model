@@ -1519,6 +1519,18 @@ function smoothChartAxis(targetLow, targetHigh, frameTime) {
   return axis;
 }
 
+function texasVolatilityGatePct() {
+  const current = state.dashboard?.current || {};
+  const texas = current.texas_holdem
+    || current.automatic_entry?.texas_holdem
+    || state.dashboard?.strategy?.texas_holdem
+    || {};
+  const gate = Number(texas.rules?.realized_volatility_gate_pct);
+  // The red reference stays useful while market data is reconnecting, when
+  // the recovery HUD is the only available Texas state.
+  return Number.isFinite(gate) && gate >= 0 ? gate : .20;
+}
+
 function drawVolatilityChart(context, width, height, color, numberFont) {
   const windowMs = state.chartWindow * 60 * 1000;
   const liveGutterMs = Math.min(10000, windowMs * 0.025);
@@ -1541,7 +1553,11 @@ function drawVolatilityChart(context, width, height, color, numberFont) {
   const plotRight = width - right;
   const x = (timestamp) => left + ((timestamp - viewStart) / windowMs) * chartWidth;
   const values = points.map((point) => point.value).filter(Number.isFinite);
-  const maxValue = Math.max(.05, ...values) * 1.15;
+  const gate = texasVolatilityGatePct();
+  // Always include the Texas entry gate in the scale.  Otherwise a higher
+  // configured gate would disappear above a quiet chart and defeat its value
+  // as a visual entry reference.
+  const maxValue = Math.max(.05, gate, ...values) * 1.15;
   const y = (value) => top + (1 - value / maxValue) * chartHeight;
 
   context.strokeStyle = color("--chart-grid");
@@ -1563,6 +1579,25 @@ function drawVolatilityChart(context, width, height, color, numberFont) {
       context.fillText(chartTimeLabel(timestamp, state.chartWindow <= 15, state.chartWindow >= 1440), columnX, height - 8);
     }
   }
+
+  // A zero gate is valid; keep its one-pixel reference inside the plot rather
+  // than letting the canvas clip it at the bottom border.
+  const gateY = Math.max(top + .5, Math.min(top + chartHeight - .5, y(gate)));
+  const gateLabel = `Texas gate ${gate.toFixed(2)}%`;
+  context.save();
+  context.strokeStyle = color("--red");
+  context.lineWidth = 1;
+  context.beginPath(); context.moveTo(left, gateY); context.lineTo(plotRight, gateY); context.stroke();
+  context.font = `600 9px ${numberFont}`;
+  const gateLabelWidth = context.measureText(gateLabel).width;
+  const gateLabelY = Math.max(top + 7, Math.min(top + chartHeight - 7, gateY - 7));
+  context.fillStyle = color("--surface");
+  context.fillRect(left + 5, gateLabelY - 7, gateLabelWidth + 8, 14);
+  context.fillStyle = color("--red");
+  context.textAlign = "left";
+  context.textBaseline = "middle";
+  context.fillText(gateLabel, left + 9, gateLabelY);
+  context.restore();
 
   if (!values.length) {
     context.fillStyle = color("--chart-label");
