@@ -2157,13 +2157,22 @@ class KalshiBroker(Broker):
             self.client.settlements if full_audit
             else getattr(self.client, "recent_settlements", self.client.settlements)
         )
-        requests = [
-            asyncio.create_task(call())
-            for call in (
-                self.client.balance, orders_call, fills_call,
-                self.client.positions, settlements_call,
-            )
-        ]
+        # These are intentionally sequential.  Account reconciliation is a
+        # background lane in AuthenticatedRequestController, which admits one
+        # background request at a time to reserve capacity for execution.  A
+        # concurrent five-call sweep made four requests wait behind the first
+        # one, then hit their local admission deadline without ever reaching
+        # Kalshi.  Between each read the controller can also admit an exit or
+        # targeted recovery request ahead of the next account page.
+        calls = (
+            (0, self.client.balance),
+            (1, orders_call),
+            # Positions are applied before fills so a partial account refresh
+            # advances the protective-position view as early as possible.
+            (3, self.client.positions),
+            (2, fills_call),
+            (4, settlements_call),
+        )
         responses: dict[int, dict[str, Any]] = {}
         with self._position_fact_lock:
             position_generations = dict(self._position_fact_generations)
@@ -2253,33 +2262,18 @@ class KalshiBroker(Broker):
                 applied.add(index)
 
         try:
-            pending = set(requests)
-            while pending:
-                done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
-                failures: list[BaseException] = []
-                for request in done:
-                    try:
-                        responses[requests.index(request)] = request.result()
-                    except BaseException as exc:
-                        failures.append(exc)
-                await apply_in_worker(apply_available, failed=bool(failures))
-                if failures:
-                    raise failures[0]
+            for index, call in calls:
+                responses[index] = await call()
+                # Retain durable positive evidence even if a later endpoint
+                # is slow or unavailable.  This does not claim full account
+                # reconciliation until every required response succeeds.
+                await apply_in_worker(apply_available)
             balance, orders, fills, positions, settlements = (responses[index] for index in range(5))
         except asyncio.CancelledError:
-            for request in requests:
-                request.cancel()
-            await asyncio.gather(*requests, return_exceptions=True)
             await apply_in_worker(apply_available, failed=True)
             raise
         except Exception as exc:
-            # asyncio.gather does not cancel sibling requests when one fails.
-            # Leaving those retries alive caused overlapping reconciliation
-            # storms that starved order and quote traffic during an outage.
-            for request in requests:
-                if not request.done():
-                    request.cancel()
-            await asyncio.gather(*requests, return_exceptions=True)
+            await apply_in_worker(apply_available, failed=True)
             exchange_error = _exchange_error_detail(exc)
             # An HTTP response (including rate limits and 5xx) confirms that
             # Kalshi is reachable.  Only a transport failure warrants a

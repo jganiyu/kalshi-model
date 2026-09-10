@@ -566,6 +566,40 @@ async def test_partial_fills_have_weighted_average_and_no_duplicates(tmp_path: P
 
 
 @run_async
+async def test_reconciliation_reads_account_resources_sequentially(tmp_path: Path) -> None:
+    """The one-slot background lane must not self-timeout on a five-read sweep."""
+    db = make_db(tmp_path)
+    broker = KalshiBroker("DEMO", db, None)
+    client = FakeTradingClient()
+    active = 0
+    maximum_active = 0
+
+    def delayed(method):
+        async def call(*args, **kwargs):
+            nonlocal active, maximum_active
+            active += 1
+            maximum_active = max(maximum_active, active)
+            try:
+                await asyncio.sleep(.01)
+                return await method(*args, **kwargs)
+            finally:
+                active -= 1
+        return call
+
+    client.balance = delayed(client.balance)  # type: ignore[method-assign]
+    client.orders = delayed(client.orders)  # type: ignore[method-assign]
+    client.fills = delayed(client.fills)  # type: ignore[method-assign]
+    client.positions = delayed(client.positions)  # type: ignore[method-assign]
+    client.settlements = delayed(client.settlements)  # type: ignore[method-assign]
+    broker.set_client(client)  # type: ignore[arg-type]
+
+    await broker.reconcile(full_audit=True)
+
+    assert maximum_active == 1
+    assert broker.readiness()["reconciled"] is True
+
+
+@run_async
 async def test_allocation_caps_include_positions_resting_and_pending(tmp_path: Path) -> None:
     db, broker, _ = await ready_broker(tmp_path)
     db.update_settings({"demo_bankroll_cap_pct": 0.10})
