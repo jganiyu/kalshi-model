@@ -126,7 +126,7 @@ Texas Hold’em 2.1 records its own strategy version and has separate settings f
 
 - **Entry gate:** Coinbase 15-minute realized volatility must be at least 0.20% by default.
 - **Allocation boost:** Volatility at or above 0.80% applies a 1.5× boost by default.
-- **Thesis check:** After five minutes, Texas exits when BRTI is more than $50 unfavorable, even after an earlier brief breach.
+- **Thesis check:** After five minutes, Texas exits when BRTI is more than $50 unfavorable after zero crossings or exactly one round trip; three or more crossings keep playing.
 - **Hard limits:** Position, risk, and execution caps always remain ceilings.
 
 ### How it protects a trade

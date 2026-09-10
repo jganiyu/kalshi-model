@@ -656,7 +656,7 @@ function renderTexasHoldemHud(texas = {}) {
       : thesis.status === "BREACHED" ? "Post-fill breach recorded"
         : "5m thesis checkpoint pending";
   $("#texas-v2-rules").textContent = isV2
-    ? `15m Coinbase vol >=${Number(texas.rules?.realized_volatility_gate_pct ?? .20).toFixed(2)}% · ${Number(texas.rules?.realized_volatility_boost_multiplier ?? 1.5).toFixed(1)}x at >=${Number(texas.rules?.realized_volatility_boost_pct ?? .80).toFixed(2)}% · 5m >$50 unfavorable exit · ${thesisDetail}`
+    ? `15m Coinbase vol >=${Number(texas.rules?.realized_volatility_gate_pct ?? .20).toFixed(2)}% · ${Number(texas.rules?.realized_volatility_boost_multiplier ?? 1.5).toFixed(1)}x at >=${Number(texas.rules?.realized_volatility_boost_pct ?? .80).toFixed(2)}% · 5m >$50 exit at 0 or 2 crossings · ${thesisDetail}`
     : "Legacy Texas rules";
   $("#texas-rv-gate-control").hidden = !isV2;
   $("#texas-rv-boost-control").hidden = !isV2;

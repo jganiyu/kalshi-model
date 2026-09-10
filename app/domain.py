@@ -603,7 +603,7 @@ TEXAS_V2_THESIS_CHECKPOINT_SECONDS = 300.0
 TEXAS_V2_THESIS_UNFAVORABLE_DISTANCE = 50.0
 # Keep the existing user-facing Texas Hold'em 2.0 name.  The persisted rules
 # version distinguishes its Coinbase realized-volatility successor.
-TEXAS_V2_RULE_VERSION = "texas-holdem-2.1.0"
+TEXAS_V2_RULE_VERSION = "texas-holdem-2.1.1"
 TEXAS_RV_VERSION = "coinbase-rv-1"
 TEXAS_RV_SOURCE = "Coinbase"
 TEXAS_RV_PRODUCT = "BTC-USD"

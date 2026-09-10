@@ -271,11 +271,11 @@ class PaperTradingService:
         )
         return self._texas_round(str(row["environment"]), str(row["ticker"])) or row
 
-    def _rehydrate_texas_v2_breach(self, row: dict[str, Any]) -> dict[str, Any]:
-        """Recover a post-fill crossing from durable review points after restart."""
+    def _rehydrate_texas_v2_crossings(self, row: dict[str, Any]) -> dict[str, Any]:
+        """Recover post-fill crossings from durable review points after restart."""
         if (
             not is_modern_texas_holdem_strategy(row.get("strategy"))
-            or row.get("post_fill_breached_at")
+            or row.get("post_fill_last_zone")
             or not row.get("first_filled_at")
         ):
             return row
@@ -295,21 +295,34 @@ class PaperTradingService:
             """,
             (row["environment"], row["ticker"]),
         )
-        crossed = next(
-            (
-                point for point in points
-                if parse_time(point.get("observed_at")) is not None
-                and parse_time(point.get("observed_at")) >= first_time
-                and texas_threshold_breached(
-                    side, point.get("btc_proxy"), threshold or point.get("threshold")
-                )
-            ),
-            None,
-        )
-        if crossed:
+        crossing_count = 0
+        last_zone = "UNFAVORABLE"
+        last_crossing_at = None
+        first_breached_at = row.get("post_fill_breached_at")
+        for point in points:
+            point_time = parse_time(point.get("observed_at"))
+            if point_time is None or point_time < first_time:
+                continue
+            favorable = texas_threshold_breached(
+                side, point.get("btc_proxy"), threshold or point.get("threshold")
+            )
+            zone = "FAVORABLE" if favorable else "UNFAVORABLE"
+            if zone != last_zone:
+                crossing_count += 1
+                last_zone = zone
+                last_crossing_at = point.get("observed_at")
+                if favorable and not first_breached_at:
+                    first_breached_at = point.get("observed_at")
+        if last_crossing_at:
             self.db.execute(
-                "UPDATE texas_holdem_rounds SET post_fill_breached_at=?,updated_at=? WHERE id=?",
-                (crossed["observed_at"], iso_now(), row["id"]),
+                """UPDATE texas_holdem_rounds
+                   SET post_fill_breached_at=?,post_fill_crossing_count=?,
+                       post_fill_last_zone=?,post_fill_last_crossing_at=?,updated_at=?
+                   WHERE id=?""",
+                (
+                    first_breached_at, crossing_count, last_zone,
+                    last_crossing_at, iso_now(), row["id"],
+                ),
             )
             return self._texas_round(str(row["environment"]), str(row["ticker"])) or row
         return row
@@ -326,7 +339,7 @@ class PaperTradingService:
         """Evaluate the one-shot five-minute thesis-loss checkpoint."""
         if not is_modern_texas_holdem_strategy(row.get("strategy")):
             return {"enabled": False}
-        row = self._rehydrate_texas_v2_breach(row)
+        row = self._rehydrate_texas_v2_crossings(row)
         observed = parse_time(observed_at)
         # A fresh executable quote is not evidence that the BTC proxy itself
         # is fresh. Callers must provide the independently observed proxy tick.
@@ -347,16 +360,33 @@ class PaperTradingService:
             and math.isfinite(proxy_value) and math.isfinite(threshold_value)
         )
         current_reliable = bool(data_reliable and btc_fresh)
-        if (
-            current_reliable and observed and first and observed >= first
-            and texas_threshold_breached(side, proxy_value, threshold_value)
-            and not row.get("post_fill_breached_at")
-        ):
-            self.db.execute(
-                "UPDATE texas_holdem_rounds SET post_fill_breached_at=?,updated_at=? WHERE id=?",
-                (observed_at, iso_now(), row["id"]),
-            )
-            row = self._texas_round(str(row["environment"]), str(row["ticker"])) or row
+        if current_reliable and observed and first and observed >= first:
+            favorable = texas_threshold_breached(side, proxy_value, threshold_value)
+            zone = "FAVORABLE" if favorable else "UNFAVORABLE"
+            last_zone = str(row.get("post_fill_last_zone") or "UNFAVORABLE")
+            crossing_count = int(row.get("post_fill_crossing_count") or 0)
+            first_breached_at = row.get("post_fill_breached_at")
+            if zone != last_zone:
+                crossing_count += 1
+                if favorable and not first_breached_at:
+                    first_breached_at = observed_at
+                self.db.execute(
+                    """UPDATE texas_holdem_rounds
+                       SET post_fill_breached_at=?,post_fill_crossing_count=?,
+                           post_fill_last_zone=?,post_fill_last_crossing_at=?,updated_at=?
+                       WHERE id=?""",
+                    (
+                        first_breached_at, crossing_count, zone,
+                        observed_at, iso_now(), row["id"],
+                    ),
+                )
+                row = self._texas_round(str(row["environment"]), str(row["ticker"])) or row
+            elif not row.get("post_fill_last_zone"):
+                self.db.execute(
+                    "UPDATE texas_holdem_rounds SET post_fill_last_zone=?,updated_at=? WHERE id=?",
+                    (zone, iso_now(), row["id"]),
+                )
+                row = self._texas_round(str(row["environment"]), str(row["ticker"])) or row
         status = str(row.get("thesis_status") or "WAITING")
         evidence = _strategy_metadata(row.get("thesis_evidence_json"))
         distance = texas_unfavorable_distance(
@@ -373,13 +403,19 @@ class PaperTradingService:
                 "btc_proxy": proxy_value,
                 "btc_observed_at": btc_observed_at,
                 "post_fill_breached_at": row.get("post_fill_breached_at"),
+                "post_fill_crossing_count": int(row.get("post_fill_crossing_count") or 0),
                 "unfavorable_distance": distance,
                 "strict_distance_rule": TEXAS_V2_THESIS_UNFAVORABLE_DISTANCE,
             }
-            # The five-minute state is authoritative. A brief earlier touch
-            # does not protect a position that has crossed back and is now
-            # materially unfavorable at the checkpoint.
-            if distance is not None and distance > TEXAS_V2_THESIS_UNFAVORABLE_DISTANCE:
+            crossing_count = int(row.get("post_fill_crossing_count") or 0)
+            # No breach and exactly one round trip share the loss exit. Three
+            # or more crossings identify the volatile market the strategy is
+            # intended to keep playing.
+            if (
+                crossing_count in {0, 2}
+                and distance is not None
+                and distance > TEXAS_V2_THESIS_UNFAVORABLE_DISTANCE
+            ):
                 status = "EXIT_TRIGGERED"
             elif row.get("post_fill_breached_at"):
                 status = "BREACHED"
@@ -395,6 +431,8 @@ class PaperTradingService:
             "first_filled_at": row.get("first_filled_at"),
             "checkpoint_at": row.get("thesis_checkpoint_at"),
             "post_fill_breached_at": row.get("post_fill_breached_at"),
+            "post_fill_crossing_count": int(row.get("post_fill_crossing_count") or 0),
+            "post_fill_last_zone": row.get("post_fill_last_zone"),
             "unfavorable_distance": distance,
             "btc_fresh": btc_fresh,
             "evidence": evidence,

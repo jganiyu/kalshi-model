@@ -26,7 +26,7 @@ Read this before making changes. It is a working map, not trading advice.
   - Entry gate: `>= 0.20%`
   - Allocation boost trigger: `>= 0.80%`
   - Boost size: `1.5x`
-  - Thesis-loss rule: five minutes after first fill, exit when BRTI is more than $50 unfavorable, even after an earlier brief breach.
+  - Thesis-loss rule: five minutes after first fill, exit when BRTI is more than $50 unfavorable after zero crossings or exactly two crossings; three or more crossings keep playing.
 - The Dashboard Volatility view charts the same 15-minute Coinbase RV signal used by Texas. It is not a second volatility calculation.
 - A solid red `Texas gate <value>%` line is always drawn and is included in the Y-axis range.
 

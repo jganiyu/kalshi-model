@@ -234,7 +234,7 @@ function renderTexasHud(texas = {}) {
       : thesis.status === "BREACHED" ? "Post-fill breach recorded"
         : "5m thesis checkpoint pending";
   $("#texas-mobile-rules").textContent = texas.rules?.version
-    ? `15m Coinbase vol ≥${Number(texas.rules?.realized_volatility_gate_pct ?? .20).toFixed(2)}% · ${Number(texas.rules?.realized_volatility_boost_multiplier ?? 1.5).toFixed(1)}× at ≥${Number(texas.rules?.realized_volatility_boost_pct ?? .80).toFixed(2)}% · 5m >$50 unfavorable exit · ${detail}`
+    ? `15m Coinbase vol ≥${Number(texas.rules?.realized_volatility_gate_pct ?? .20).toFixed(2)}% · ${Number(texas.rules?.realized_volatility_boost_multiplier ?? 1.5).toFixed(1)}× at ≥${Number(texas.rules?.realized_volatility_boost_pct ?? .80).toFixed(2)}% · 5m >$50 exit at 0 or 2 crossings · ${detail}`
     : "Legacy Texas rules";
   if (texas.allocation_boosted) {
     // The filled position may predate a calibration change, so do not attach

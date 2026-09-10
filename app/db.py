@@ -1171,6 +1171,18 @@ MIGRATIONS: list[tuple[int, str]] = [
             ON kalshi_snapshots(observed_at);
         """,
     ),
+    (
+        32,
+        """
+        -- Texas Hold'em 2.1 counts durable post-fill threshold crossings so
+        -- the five-minute rule can distinguish one round trip from a more
+        -- volatile market without scanning review history on every tick.
+        ALTER TABLE texas_holdem_rounds
+            ADD COLUMN post_fill_crossing_count INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE texas_holdem_rounds ADD COLUMN post_fill_last_zone TEXT;
+        ALTER TABLE texas_holdem_rounds ADD COLUMN post_fill_last_crossing_at TEXT;
+        """,
+    ),
 ]
 
 

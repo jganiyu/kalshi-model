@@ -491,10 +491,12 @@ def test_texas_v21_double_breach_exits_at_checkpoint(tmp_path: Path) -> None:
         "data_quality": {"reliable": True}, "no_bid": .40, "no_bid_size": 100,
     }) == 1
     first = db.fetch_one(
-        "SELECT thesis_status,post_fill_breached_at,exit_reason FROM texas_holdem_rounds WHERE ticker='TEXAS'"
+        """SELECT thesis_status,post_fill_breached_at,post_fill_crossing_count,
+                  exit_reason FROM texas_holdem_rounds WHERE ticker='TEXAS'"""
     )
     assert first["thesis_status"] == "EXIT_TRIGGERED"
     assert first["post_fill_breached_at"].startswith("2026-09-01T12:02:00")
+    assert first["post_fill_crossing_count"] == 2
     assert first["exit_reason"] == "TEXAS_THESIS_FAILURE"
 
     # An independent new V2 round exits at the same exact checkpoint when the
@@ -549,6 +551,35 @@ def test_texas_v21_early_breach_still_favorable_at_checkpoint_does_not_exit(
     assert row["post_fill_breached_at"].startswith("2026-09-01T12:02:00")
 
 
+def test_texas_v21_four_crossings_keep_playing_volatile_market(tmp_path: Path) -> None:
+    db = make_db(tmp_path)
+    db.update_settings({
+        "texas_holdem_flop_target": .95, "texas_holdem_turn_target": .95,
+        "texas_holdem_river_target": .99, "texas_holdem_flop_stop": 0,
+        "texas_holdem_turn_stop": 0, "texas_holdem_river_stop": 0,
+    })
+    service = PaperTradingService(db)
+    run_strategy(service, assessments(yes_bid=.52, yes_ask=.54), margin=25.0)
+    for minute, btc_proxy in ((1, 100.0), (2, 180.0), (3, 90.0), (4, 180.0)):
+        assert service.process_texas_holdem_exits("TEXAS", {
+            "observed_at": f"2026-09-01T12:0{minute}:00+00:00",
+            "btc_observed_at": f"2026-09-01T12:0{minute}:00+00:00",
+            "time_remaining_seconds": 900 - minute * 60, "btc_proxy": btc_proxy,
+            "data_quality": {"reliable": True}, "no_bid": .40, "no_bid_size": 100,
+        }) == 0
+    assert service.process_texas_holdem_exits("TEXAS", {
+        "observed_at": "2026-09-01T12:05:01+00:00",
+        "btc_observed_at": "2026-09-01T12:05:01+00:00",
+        "time_remaining_seconds": 599, "btc_proxy": 180.0,
+        "data_quality": {"reliable": True}, "no_bid": .40, "no_bid_size": 100,
+    }) == 0
+    row = db.fetch_one(
+        "SELECT thesis_status,post_fill_crossing_count FROM texas_holdem_rounds WHERE ticker='TEXAS'"
+    )
+    assert row["thesis_status"] == "BREACHED"
+    assert row["post_fill_crossing_count"] == 4
+
+
 def test_texas_v21_new_rounds_are_labeled_without_relabeling_legacy_data(tmp_path: Path) -> None:
     db = make_db(tmp_path)
     db.execute(
@@ -596,6 +627,7 @@ def test_texas_v2_rehydrates_early_breach_then_exits_after_cross_back(tmp_path: 
     )
     assert restored["status"] == "EXIT_TRIGGERED"
     assert restored["unfavorable_distance"] == pytest.approx(80.0)
+    assert restored["post_fill_crossing_count"] == 2
     assert db.fetch_one("SELECT post_fill_breached_at FROM texas_holdem_rounds WHERE ticker='REHYDRATE'")["post_fill_breached_at"].startswith("2026-09-01T12:02:00")
 
 
