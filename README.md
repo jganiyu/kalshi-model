@@ -1,6 +1,6 @@
 # Kalshi Model
 
-A local macOS research and trading app for Kalshi's 15-minute Bitcoin Up or Down markets. Think of each market as a fast hand of intelligent poker: read the board, estimate the odds, make only the small bets the edge earns, and fold when the table turns. The model prices probability first, sizes risk conservatively, and uses a Threshold Breach Exit to fold and close positions when the BTC proxy crosses the threshold.
+A local macOS research and trading app for Kalshi's 15-minute Bitcoin Up or Down markets. Think of each market as a fast hand of intelligent poker: read the board, estimate the odds, make only the small bets the edge earns, and fold when the table turns. The model prices probability first, sizes risk conservatively, and uses a Threshold Breach Exit to fold and close positions when BRTI crosses the threshold.
 
 > Research only, not financial advice. Live trading can lose real money.
 
@@ -17,8 +17,9 @@ A local macOS research and trading app for Kalshi's 15-minute Bitcoin Up or Down
 
 ## Features
 
-- **Dashboard:** Live BTC proxy, outcome forecast, Open Trades, Standard Edge HUD, dual order books, recent economic trades, and connection/protection health.
-- **BTC proxy:** Median Coinbase, Kraken, and Bitstamp price with learned BRTI uncertainty.
+- **Dashboard:** Live BRTI, outcome forecast, Open Trades, Standard Edge HUD, dual order books, recent economic trades, and connection/protection health.
+- **Live BTC reference:** Official BRTI from Kalshi drives the chart, threshold distance, Texas logic, and next-threshold estimate.
+- **Coinbase volatility:** Closed one-minute candles provide the 15-minute realized-volatility signal used by Texas.
 - **Three modes:** Paper, isolated Kalshi Demo, and deliberately armed Kalshi Live.
 - **Mobile Monitor:** Read-only HUD, market metrics, and recent trades on iPhone through Tailscale.
 - **Strategies:** Standard Edge probability-and-value entries, plus an optional Texas Hold’em 2.0 opening play with Flop, Turn, and River exits.
@@ -49,7 +50,7 @@ A local macOS research and trading app for Kalshi's 15-minute Bitcoin Up or Down
 
 - Win chance and net EV fill toward their configured targets; confirmation starts only after every entry requirement passes.
 - Spread, liquidity, data, quality, threshold, volatility, and risk show what is blocking an automatic entry.
-- **MVI** scores 30-minute threshold-margin volatility from 0–10; cushion compares today’s margin with the expected remaining move.
+- **Volatility** shows the same Coinbase 15-minute realized-volatility signal used by Texas.
 - Hover over an info icon for a plain-language explanation of any metric.
 
 When Texas Hold’em is enabled, this card becomes a three-street strategy HUD. Its Flop, Turn, and River bars fill smoothly through each five-minute phase, show the active exit target and River stop, and allow quick target edits on the Mac. The iPhone monitor mirrors the state without exposing controls.
@@ -60,7 +61,7 @@ When Texas Hold’em is enabled, this card becomes a three-street strategy HUD. 
 
 - Apply saves one auditable configuration snapshot; Discard and Restore are reversible.
 - Results show settled samples, Brier score, and calibration in 10-point probability ranges.
-- Margin Volatility has one maximum setting; `0` leaves the gate off while evidence accumulates.
+- Texas has an editable realized-volatility entry gate, allocation boost trigger, and boost size for each mode.
 - Automatic entries still require a valid price, positive Buy EV, confirmation, liquidity, and risk approval.
 - The Texas Hold’em section controls its entry cap, opening window, additional retries, phase targets/stops, and Texas 2.0 allocation. The saved opening window and retry count—not hard-coded copy—control execution. It is off by default.
 
@@ -108,7 +109,7 @@ The model has one simple loop: estimate the odds, compare them with the price, t
 
 | Step | What it does |
 | --- | --- |
-| **1. Read the market** | Builds a clean BTC proxy from Coinbase, Kraken, and Bitstamp; then measures its distance from To Beat, time left, volatility, and data reliability. |
+| **1. Read the market** | Reads official BRTI, distance from To Beat, time left, Coinbase realized volatility, and data reliability. |
 | **2. Price the outcome** | Turns that context and settled-market history into an Up/Down probability. A forecast is a probability estimate—not a trade instruction. |
 | **3. Test the bet** | Compares probability with the executable contract price after fees and slippage. A likely outcome can still be a bad price. |
 | **4. Manage the hand** | Requires confirmation and gates before entry, limits size, and manages exits once a position exists. |
@@ -121,11 +122,16 @@ Every entry must clear probability, EV, spread, liquidity, data, confidence, thr
 
 Texas Hold’em is an alternative automatic strategy. Once the official market opens and To Beat is known, it buys the contract opposite BTC’s opening position versus the threshold—Down when BTC is above it, Up when BTC is below it—only when the all-in executable price is at or below the configured entry cap. It sends an aggressive IOC attempt plus the configured number of remaining-quantity retries, each using genuinely fresh market state, during the configured opening window; otherwise it folds until the next market. Standard Edge entries are disabled while this strategy is on.
 
-Texas Hold’em 2.0 records its own strategy version. Its per-environment MVI gate defaults to 4; MVI at or above 8 applies the built-in 1.5× allocation boost to the configured Texas 2.0 base allocation before normal position, risk, and execution caps. Its five-minute thesis check can reduce risk when no breach occurred and BTC has moved sufficiently farther from the threshold. Hard caps always remain ceilings.
+Texas Hold’em 2.0 records its own strategy version and has separate settings for Paper, Demo, and Live.
+
+- **Entry gate:** Coinbase 15-minute realized volatility must be at least 0.20% by default.
+- **Allocation boost:** Volatility at or above 0.80% applies a 1.5× boost by default.
+- **Thesis check:** After five minutes without a breach, Texas can reduce risk when BTC moves farther from the threshold.
+- **Hard limits:** Position, risk, and execution caps always remain ceilings.
 
 ### How it protects a trade
 
-Margin Volatility measures how choppily BTC is moving around To Beat. It can block automatic entries when the configured maximum is exceeded; its cushion is recorded for review, not used as an entry gate.
+The Dashboard Volatility chart shows the same Coinbase 15-minute realized-volatility signal used by Texas. The red Texas gate line marks the configured entry minimum.
 
 Profit take exits at a configured executable bid—99¢ by default—and stop-losses remain optional. Threshold Breach Exit is the model's fold: its signed buffer can trigger before To Beat or tolerate a configured adverse move beyond it before closing. These are safeguards, not guarantees of an exit price or fill.
 
