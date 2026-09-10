@@ -5,7 +5,12 @@ from pathlib import Path
 import pytest
 
 from app.db import Database
-from app.domain import TEXAS_HOLDEM_V2, texas_holdem_exit_reason, texas_holdem_phase
+from app.domain import (
+    TEXAS_HOLDEM_V2,
+    TEXAS_HOLDEM_V21,
+    texas_holdem_exit_reason,
+    texas_holdem_phase,
+)
 from app.mobile import mobile_snapshot
 from app.main import clean_settings_payload
 from app.services.broker import KalshiBroker
@@ -219,11 +224,11 @@ def test_opening_play_is_contrarian_and_threshold_exit_exempt(tmp_path: Path) ->
         margin=25.0,
     )
     texas = result["texas_holdem"]
-    assert result["active_strategy"] == TEXAS_HOLDEM_V2
+    assert result["active_strategy"] == TEXAS_HOLDEM_V21
     assert texas["side"] == "NO"
     assert texas["status"] in {"ATTEMPTING", "ENTERED"}
     entry = db.fetch_one(
-        "SELECT * FROM paper_entries WHERE ticker='TEXAS' AND strategy='TEXAS_HOLDEM_2_0'"
+        "SELECT * FROM paper_entries WHERE ticker='TEXAS' AND strategy='TEXAS_HOLDEM_2_1'"
     )
     assert entry is not None
     assert entry["side"] == "NO"
@@ -448,7 +453,7 @@ def test_texas_v2_thesis_checkpoint_is_one_shot_and_strictly_over_fifty(tmp_path
     row = db.fetch_one(
         "SELECT strategy,first_filled_at,thesis_checkpoint_at,thesis_status FROM texas_holdem_rounds WHERE ticker='TEXAS'"
     )
-    assert row["strategy"] == TEXAS_HOLDEM_V2
+    assert row["strategy"] == TEXAS_HOLDEM_V21
     assert row["first_filled_at"].startswith("2026-09-01T12:00:01")
     assert row["thesis_checkpoint_at"].startswith("2026-09-01T12:05:01")
     assert row["thesis_status"] == "NO_EXIT"
@@ -462,7 +467,7 @@ def test_texas_v2_thesis_checkpoint_is_one_shot_and_strictly_over_fifty(tmp_path
     assert db.fetch_one("SELECT thesis_status FROM texas_holdem_rounds WHERE ticker='TEXAS'")["thesis_status"] == "NO_EXIT"
 
 
-def test_texas_v2_thesis_exit_and_post_fill_breach_latch(tmp_path: Path) -> None:
+def test_texas_v21_double_breach_exits_at_checkpoint(tmp_path: Path) -> None:
     db = make_db(tmp_path)
     db.update_settings({
         "texas_holdem_flop_target": .95, "texas_holdem_turn_target": .95,
@@ -471,7 +476,8 @@ def test_texas_v2_thesis_exit_and_post_fill_breach_latch(tmp_path: Path) -> None
     })
     service = PaperTradingService(db)
     run_strategy(service, assessments(yes_bid=.52, yes_ask=.54), margin=25.0)
-    # A post-fill touch is a breach and prevents the thesis-failure exit.
+    # An early touch is retained as evidence, but crossing back to the losing
+    # side by more than $50 at five minutes triggers the thesis-failure exit.
     service.process_texas_holdem_exits("TEXAS", {
         "observed_at": "2026-09-01T12:02:00+00:00",
         "btc_observed_at": "2026-09-01T12:02:00+00:00",
@@ -483,8 +489,13 @@ def test_texas_v2_thesis_exit_and_post_fill_breach_latch(tmp_path: Path) -> None
         "btc_observed_at": "2026-09-01T12:05:01+00:00",
         "time_remaining_seconds": 599, "btc_proxy": 180.0,
         "data_quality": {"reliable": True}, "no_bid": .40, "no_bid_size": 100,
-    }) == 0
-    assert db.fetch_one("SELECT thesis_status,post_fill_breached_at FROM texas_holdem_rounds WHERE ticker='TEXAS'")["thesis_status"] == "BREACHED"
+    }) == 1
+    first = db.fetch_one(
+        "SELECT thesis_status,post_fill_breached_at,exit_reason FROM texas_holdem_rounds WHERE ticker='TEXAS'"
+    )
+    assert first["thesis_status"] == "EXIT_TRIGGERED"
+    assert first["post_fill_breached_at"].startswith("2026-09-01T12:02:00")
+    assert first["exit_reason"] == "TEXAS_THESIS_FAILURE"
 
     # An independent new V2 round exits at the same exact checkpoint when the
     # thesis has not breached and BTC is strictly more than $50 unfavorable.
@@ -508,7 +519,37 @@ def test_texas_v2_thesis_exit_and_post_fill_breach_latch(tmp_path: Path) -> None
     assert db.fetch_one("SELECT exit_reason FROM texas_holdem_rounds WHERE ticker='TEXAS-2'")["exit_reason"] == "TEXAS_THESIS_FAILURE"
 
 
-def test_texas_v2_new_rounds_are_labeled_without_relabeling_legacy_data(tmp_path: Path) -> None:
+def test_texas_v21_early_breach_still_favorable_at_checkpoint_does_not_exit(
+    tmp_path: Path,
+) -> None:
+    db = make_db(tmp_path)
+    db.update_settings({
+        "texas_holdem_flop_target": .95, "texas_holdem_turn_target": .95,
+        "texas_holdem_river_target": .99, "texas_holdem_flop_stop": 0,
+        "texas_holdem_turn_stop": 0, "texas_holdem_river_stop": 0,
+    })
+    service = PaperTradingService(db)
+    run_strategy(service, assessments(yes_bid=.52, yes_ask=.54), margin=25.0)
+    service.process_texas_holdem_exits("TEXAS", {
+        "observed_at": "2026-09-01T12:02:00+00:00",
+        "btc_observed_at": "2026-09-01T12:02:00+00:00",
+        "time_remaining_seconds": 780, "btc_proxy": 100.0,
+        "data_quality": {"reliable": True}, "no_bid": .40, "no_bid_size": 100,
+    })
+    assert service.process_texas_holdem_exits("TEXAS", {
+        "observed_at": "2026-09-01T12:05:01+00:00",
+        "btc_observed_at": "2026-09-01T12:05:01+00:00",
+        "time_remaining_seconds": 599, "btc_proxy": 80.0,
+        "data_quality": {"reliable": True}, "no_bid": .40, "no_bid_size": 100,
+    }) == 0
+    row = db.fetch_one(
+        "SELECT thesis_status,post_fill_breached_at FROM texas_holdem_rounds WHERE ticker='TEXAS'"
+    )
+    assert row["thesis_status"] == "BREACHED"
+    assert row["post_fill_breached_at"].startswith("2026-09-01T12:02:00")
+
+
+def test_texas_v21_new_rounds_are_labeled_without_relabeling_legacy_data(tmp_path: Path) -> None:
     db = make_db(tmp_path)
     db.execute(
         """INSERT INTO texas_holdem_rounds(environment,ticker,status,entry_price_cap,
@@ -518,10 +559,10 @@ def test_texas_v2_new_rounds_are_labeled_without_relabeling_legacy_data(tmp_path
     )
     assert db.fetch_one("SELECT strategy FROM texas_holdem_rounds WHERE ticker='LEGACY'")["strategy"] == "TEXAS_HOLDEM"
     run_strategy(PaperTradingService(db), assessments(yes_bid=.52, yes_ask=.54), margin=25.0)
-    assert db.fetch_one("SELECT strategy FROM texas_holdem_rounds WHERE ticker='TEXAS'")["strategy"] == TEXAS_HOLDEM_V2
+    assert db.fetch_one("SELECT strategy FROM texas_holdem_rounds WHERE ticker='TEXAS'")["strategy"] == TEXAS_HOLDEM_V21
 
 
-def test_texas_v2_rehydrates_post_fill_breach_from_durable_review_history(tmp_path: Path) -> None:
+def test_texas_v2_rehydrates_early_breach_then_exits_after_cross_back(tmp_path: Path) -> None:
     db = make_db(tmp_path)
     service = PaperTradingService(db)
     db.execute(
@@ -553,7 +594,8 @@ def test_texas_v2_rehydrates_post_fill_breach_from_durable_review_history(tmp_pa
         row, btc_proxy=180.0, observed_at="2026-09-01T12:05:00+00:00",
         btc_observed_at="2026-09-01T12:05:00+00:00", data_reliable=True
     )
-    assert restored["status"] == "BREACHED"
+    assert restored["status"] == "EXIT_TRIGGERED"
+    assert restored["unfavorable_distance"] == pytest.approx(80.0)
     assert db.fetch_one("SELECT post_fill_breached_at FROM texas_holdem_rounds WHERE ticker='REHYDRATE'")["post_fill_breached_at"].startswith("2026-09-01T12:02:00")
 
 

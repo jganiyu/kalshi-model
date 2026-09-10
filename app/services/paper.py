@@ -11,10 +11,12 @@ from app.db import Database
 from app.domain import (
     TEXAS_HOLDEM_LEGACY,
     TEXAS_HOLDEM_V2,
+    TEXAS_HOLDEM_V21,
     TEXAS_V2_RULE_VERSION,
     TEXAS_V2_THESIS_CHECKPOINT_SECONDS,
     TEXAS_V2_THESIS_UNFAVORABLE_DISTANCE,
     is_texas_holdem_strategy,
+    is_modern_texas_holdem_strategy,
     iso_now,
     kalshi_fee,
     parse_time,
@@ -225,7 +227,7 @@ class PaperTradingService:
                 """
                 SELECT COALESCE(SUM(remaining_contracts),0) amount
                 FROM paper_entries WHERE ticker=? AND side=?
-                  AND strategy IN ('TEXAS_HOLDEM','TEXAS_HOLDEM_2_0')
+                  AND strategy IN ('TEXAS_HOLDEM','TEXAS_HOLDEM_2_0','TEXAS_HOLDEM_2_1')
                   AND status='open'
                 """,
                 (ticker, side),
@@ -235,7 +237,7 @@ class PaperTradingService:
                 """
                 SELECT COALESCE(SUM(contracts),0) amount
                 FROM broker_positions WHERE mode=? AND ticker=? AND side=?
-                  AND strategy IN ('TEXAS_HOLDEM','TEXAS_HOLDEM_2_0') AND status='open'
+                  AND strategy IN ('TEXAS_HOLDEM','TEXAS_HOLDEM_2_0','TEXAS_HOLDEM_2_1') AND status='open'
                 """,
                 (mode, ticker, side),
             ) or {}
@@ -245,7 +247,7 @@ class PaperTradingService:
         self, row: dict[str, Any], first_filled_at: str | None
     ) -> dict[str, Any]:
         """Latch the earliest confirmed fill; later partial fills never reset it."""
-        if str(row.get("strategy") or TEXAS_HOLDEM_LEGACY) != TEXAS_HOLDEM_V2:
+        if not is_modern_texas_holdem_strategy(row.get("strategy")):
             return row
         candidates = [
             parsed for parsed in (
@@ -272,7 +274,7 @@ class PaperTradingService:
     def _rehydrate_texas_v2_breach(self, row: dict[str, Any]) -> dict[str, Any]:
         """Recover a post-fill crossing from durable review points after restart."""
         if (
-            str(row.get("strategy") or TEXAS_HOLDEM_LEGACY) != TEXAS_HOLDEM_V2
+            not is_modern_texas_holdem_strategy(row.get("strategy"))
             or row.get("post_fill_breached_at")
             or not row.get("first_filled_at")
         ):
@@ -321,8 +323,8 @@ class PaperTradingService:
         btc_observed_at: str | None = None,
         data_reliable: bool,
     ) -> dict[str, Any]:
-        """Evaluate the one-shot five-minute no-breach thesis checkpoint."""
-        if str(row.get("strategy") or TEXAS_HOLDEM_LEGACY) != TEXAS_HOLDEM_V2:
+        """Evaluate the one-shot five-minute thesis-loss checkpoint."""
+        if not is_modern_texas_holdem_strategy(row.get("strategy")):
             return {"enabled": False}
         row = self._rehydrate_texas_v2_breach(row)
         observed = parse_time(observed_at)
@@ -374,10 +376,13 @@ class PaperTradingService:
                 "unfavorable_distance": distance,
                 "strict_distance_rule": TEXAS_V2_THESIS_UNFAVORABLE_DISTANCE,
             }
-            if row.get("post_fill_breached_at"):
-                status = "BREACHED"
-            elif distance is not None and distance > TEXAS_V2_THESIS_UNFAVORABLE_DISTANCE:
+            # The five-minute state is authoritative. A brief earlier touch
+            # does not protect a position that has crossed back and is now
+            # materially unfavorable at the checkpoint.
+            if distance is not None and distance > TEXAS_V2_THESIS_UNFAVORABLE_DISTANCE:
                 status = "EXIT_TRIGGERED"
+            elif row.get("post_fill_breached_at"):
+                status = "BREACHED"
             else:
                 status = "NO_EXIT"
             self.db.execute(
@@ -457,7 +462,7 @@ class PaperTradingService:
                 ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
-                    mode, ticker, TEXAS_HOLDEM_V2, market_open_time, threshold,
+                    mode, ticker, TEXAS_HOLDEM_V21, market_open_time, threshold,
                     opening_proxy, proposed_side, "PASSED" if passed else "WAITING", maximum_price,
                     targets["flop"], targets["turn"], targets["river"],
                     targets["river_stop"], now_iso, now_iso,
@@ -470,7 +475,7 @@ class PaperTradingService:
                 (market_observed_at or iso_now(), passed["id"]),
             )
         strategy = str(row.get("strategy") or TEXAS_HOLDEM_LEGACY)
-        texas_v2 = strategy == TEXAS_HOLDEM_V2
+        texas_v2 = is_modern_texas_holdem_strategy(strategy)
         stored_side = str(row.get("side") or "") or None
         side = stored_side or proposed_side
         filled = self._texas_filled_contracts(mode, ticker, side) if side else 0.0
@@ -498,7 +503,7 @@ class PaperTradingService:
         elif texas_v2 and status == "PARTIALLY_FILLED":
             # An accepted partial IOC is confirmed exposure. It is never a
             # license for a later automatic buy during recovery.
-            blocker = "A partially filled Texas Hold’em 2.0 entry already holds confirmed exposure."
+            blocker = "A partially filled Texas Hold’em 2.1 entry already holds confirmed exposure."
         elif status not in {"ENTERED", "FOLDED", "EXITED", "PASSED"} and not (
             status == "PARTIALLY_FILLED" and blocker
         ):
@@ -550,7 +555,7 @@ class PaperTradingService:
                     and float(rv_value) + 1e-12 < rv_gate
                 ):
                     blocker = (
-                        f"Texas Hold’em 2.0 requires 15m Coinbase volatility ≥ {rv_gate:.2f}% "
+                        f"Texas Hold’em 2.1 requires 15m Coinbase volatility ≥ {rv_gate:.2f}% "
                         f"(current {float(rv_value):.2f}%)."
                     )
                 elif executable is None:
@@ -720,9 +725,11 @@ class PaperTradingService:
         latest_evidence = _strategy_metadata(latest_attempt.get("evidence_json"))
         return {
             "strategy": str(row.get("strategy") or TEXAS_HOLDEM_LEGACY),
-            "display_name": "Texas Hold’em 2.0"
-            if str(row.get("strategy") or TEXAS_HOLDEM_LEGACY) == TEXAS_HOLDEM_V2
-            else "Texas Hold’em",
+            "display_name": (
+                "Texas Hold’em 2.1" if strategy == TEXAS_HOLDEM_V21
+                else "Texas Hold’em 2.0" if strategy == TEXAS_HOLDEM_V2
+                else "Texas Hold’em"
+            ),
             "enabled": True,
             "phase": phase,
             "side": side,
@@ -1009,13 +1016,13 @@ class PaperTradingService:
             SELECT e.*,t.outcome,t.status AS trade_status
             FROM paper_entries e
             JOIN paper_trades t ON t.id=e.trade_id
-            WHERE e.strategy IN ('STANDARD_EDGE','EARLY_THRESHOLD','LATE_CONVICTION','SWING','TEXAS_HOLDEM','TEXAS_HOLDEM_2_0')
+            WHERE e.strategy IN ('STANDARD_EDGE','EARLY_THRESHOLD','LATE_CONVICTION','SWING','TEXAS_HOLDEM','TEXAS_HOLDEM_2_0','TEXAS_HOLDEM_2_1')
             ORDER BY e.id ASC
             """
         )
         results: dict[str, dict[str, Any]] = {}
         for strategy in (
-            "STANDARD_EDGE", "EARLY_THRESHOLD", "LATE_CONVICTION", "SWING", "TEXAS_HOLDEM", "TEXAS_HOLDEM_2_0"
+            "STANDARD_EDGE", "EARLY_THRESHOLD", "LATE_CONVICTION", "SWING", "TEXAS_HOLDEM", "TEXAS_HOLDEM_2_0", "TEXAS_HOLDEM_2_1"
         ):
             entries = [row for row in rows if row.get("strategy") == strategy]
             settled = [row for row in entries if row.get("status") == "settled"]
@@ -1909,7 +1916,7 @@ class PaperTradingService:
         entries = self.db.fetch_all(
             """
             SELECT * FROM paper_entries
-            WHERE ticker=? AND strategy IN ('TEXAS_HOLDEM','TEXAS_HOLDEM_2_0') AND status='open'
+            WHERE ticker=? AND strategy IN ('TEXAS_HOLDEM','TEXAS_HOLDEM_2_0','TEXAS_HOLDEM_2_1') AND status='open'
               AND remaining_contracts>0 ORDER BY id ASC
             """,
             (ticker,),
@@ -3368,13 +3375,13 @@ class PaperTradingService:
                 fixed_entry_handler=fixed_entry_handler,
                 execution_risk_by_side=execution_risk_by_side,
             )
-            result["active_strategy"] = TEXAS_HOLDEM_V2
+            result["active_strategy"] = TEXAS_HOLDEM_V21
             result["texas_holdem"] = texas
             result["entered"] = texas.get("status") in {
                 "ATTEMPTING", "PARTIALLY_FILLED", "ENTERED",
             }
             self.reset_automatic_confirmation()
-            return finish(priority_strategy=TEXAS_HOLDEM_V2, blocked_reason=texas.get("blocker"))
+            return finish(priority_strategy=TEXAS_HOLDEM_V21, blocked_reason=texas.get("blocker"))
         if not enabled:
             self.reset_automatic_confirmation()
             return finish(

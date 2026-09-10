@@ -484,7 +484,7 @@ def test_mvi_9_to_10_bucket_has_no_lower_score_leakage_and_counts_round_trips(
     assert report["buckets"][9]["settled"] == 0
     assert report["buckets"][1]["entries"] == 0
     assert report["buckets"][9]["realized_pnl"] == pytest.approx(.2)
-    assert "Texas Hold’em 2.0's separate lower MVI gate" in report["guidance"]
+    assert "Texas Hold’em 2.1's separate entry gate" in report["guidance"]
 
 
 @pytest.mark.parametrize("mode", ["PAPER", "DEMO", "LIVE"])

@@ -90,11 +90,16 @@ def _json(value: object) -> dict[str, Any]:
 
 
 def _strategy_version(value: object) -> str:
-    return "V2" if str(value or "").upper() == "TEXAS_HOLDEM_2_0" else "LEGACY"
+    normalized = str(value or "").upper()
+    if normalized == "TEXAS_HOLDEM_2_1":
+        return "V21"
+    return "V2" if normalized == "TEXAS_HOLDEM_2_0" else "LEGACY"
 
 
 def _is_texas(value: object) -> bool:
-    return str(value or "").upper() in {"TEXAS_HOLDEM", "TEXAS_HOLDEM_2_0"}
+    return str(value or "").upper() in {
+        "TEXAS_HOLDEM", "TEXAS_HOLDEM_2_0", "TEXAS_HOLDEM_2_1",
+    }
 
 
 def _fill_key(row: dict[str, Any]) -> tuple[float, int]:
@@ -561,7 +566,12 @@ def replay_texas_rv(db: Database) -> dict[str, Any]:
             environment: _summary([row for row in report_rows if row["environment"] == environment])
             for environment in ("PAPER", "DEMO", "LIVE")
         }, "chronological": {"early": _summary(early), "late": _summary(late)},
-        "by_strategy": {version: _summary([row for row in report_rows if row["strategy_version"] == version]) for version in ("LEGACY", "V2")},
+        "by_strategy": {
+            version: _summary(
+                [row for row in report_rows if row["strategy_version"] == version]
+            )
+            for version in ("LEGACY", "V2", "V21")
+        },
         "loss_minimization_sweep": _sweep_loss_minimization(sweep_inputs),
         "loss_minimization_by_rv15_gate": {
             f"≥{gate:.2f}%": _sweep_loss_minimization(sweep_inputs, minimum_rv15_pct=gate)

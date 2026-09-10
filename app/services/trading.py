@@ -17,8 +17,8 @@ import httpx
 from app.config import AppConfig
 from app.db import Database
 from app.domain import (
-    TEXAS_HOLDEM_V2,
     is_texas_holdem_strategy,
+    is_modern_texas_holdem_strategy,
     kalshi_fee,
     parse_time,
     threshold_breach_exit_state,
@@ -720,7 +720,7 @@ class TradingCoordinator:
                UNION ALL
                SELECT 1 FROM broker_order_intents
                WHERE mode=? AND ticker=?
-                 AND strategy IN ('TEXAS_HOLDEM','TEXAS_HOLDEM_2_0') LIMIT 1""",
+                 AND strategy IN ('TEXAS_HOLDEM','TEXAS_HOLDEM_2_0','TEXAS_HOLDEM_2_1') LIMIT 1""",
             (mode, ticker, mode, ticker),
         ) is not None
 
@@ -732,15 +732,15 @@ class TradingCoordinator:
             "SELECT * FROM texas_holdem_rounds WHERE environment=? AND ticker=?",
             (mode, ticker),
         )
-        if not row or str(row.get("strategy") or "") != TEXAS_HOLDEM_V2:
+        if not row or not is_modern_texas_holdem_strategy(row.get("strategy")):
             return row
         earliest = self.db.fetch_one(
             """
             SELECT MIN(filled_at) AS filled_at FROM broker_fills
             WHERE mode=? AND ticker=? AND side=? AND action='BUY'
-              AND strategy='TEXAS_HOLDEM_2_0'
+              AND strategy=?
             """,
-            (mode, ticker, side),
+            (mode, ticker, side, row["strategy"]),
         ) or {}
         return self.paper._ensure_texas_v2_fill_clock(
             row, earliest.get("filled_at") or fallback or datetime_now()
@@ -1442,10 +1442,10 @@ class TradingCoordinator:
                     UPDATE broker_positions SET strategy=?,source=?,stop_loss_price=?,
                         target_exit_price=?,fallback_exit_mode=?,fallback_exit_seconds=?,
                         strategy_metadata_json=?,threshold_breach_enabled=CASE
-                            WHEN ? IN ('TEXAS_HOLDEM','TEXAS_HOLDEM_2_0') THEN 0 ELSE threshold_breach_enabled END,
-                        threshold_exit_status=CASE WHEN ? IN ('TEXAS_HOLDEM','TEXAS_HOLDEM_2_0') THEN 'Watching'
+                            WHEN ? IN ('TEXAS_HOLDEM','TEXAS_HOLDEM_2_0','TEXAS_HOLDEM_2_1') THEN 0 ELSE threshold_breach_enabled END,
+                        threshold_exit_status=CASE WHEN ? IN ('TEXAS_HOLDEM','TEXAS_HOLDEM_2_0','TEXAS_HOLDEM_2_1') THEN 'Watching'
                             ELSE threshold_exit_status END,
-                        threshold_exit_block_reason=CASE WHEN ? IN ('TEXAS_HOLDEM','TEXAS_HOLDEM_2_0')
+                        threshold_exit_block_reason=CASE WHEN ? IN ('TEXAS_HOLDEM','TEXAS_HOLDEM_2_0','TEXAS_HOLDEM_2_1')
                             THEN 'Threshold Breach Exit is inactive for Texas Hold''em positions.'
                             ELSE threshold_exit_block_reason END
                     WHERE mode=? AND ticker=? AND side=? AND status='open'

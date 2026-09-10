@@ -212,7 +212,7 @@ function renderTexasHud(texas = {}) {
   }
   const phase = String(texas.phase?.key || texasTiming(texas.market_open_time).phase);
   $("#texas-mobile-phase").textContent = `THE ${phase}`;
-  $("#texas-mobile-title").textContent = String(texas.display_name || "Texas Hold’em 2.0").toUpperCase();
+  $("#texas-mobile-title").textContent = String(texas.display_name || "Texas Hold’em 2.1").toUpperCase();
   $("#texas-mobile-status").textContent = String(texas.status || "WAITING").replaceAll("_", " ");
   $("#texas-mobile-status").dataset.status = String(texas.status || "WATCHING").toLowerCase();
   $("#texas-mobile-flop-target").textContent = `${cents(texas.targets?.flop, 0)} target · ${cents(texas.targets?.flop_stop, 0)} stop`;
@@ -234,7 +234,7 @@ function renderTexasHud(texas = {}) {
       : thesis.status === "BREACHED" ? "Post-fill breach recorded"
         : "5m thesis checkpoint pending";
   $("#texas-mobile-rules").textContent = texas.rules?.version
-    ? `15m Coinbase vol ≥${Number(texas.rules?.realized_volatility_gate_pct ?? .20).toFixed(2)}% · ${Number(texas.rules?.realized_volatility_boost_multiplier ?? 1.5).toFixed(1)}× at ≥${Number(texas.rules?.realized_volatility_boost_pct ?? .80).toFixed(2)}% · 5m no-breach >$50 exit · ${detail}`
+    ? `15m Coinbase vol ≥${Number(texas.rules?.realized_volatility_gate_pct ?? .20).toFixed(2)}% · ${Number(texas.rules?.realized_volatility_boost_multiplier ?? 1.5).toFixed(1)}× at ≥${Number(texas.rules?.realized_volatility_boost_pct ?? .80).toFixed(2)}% · 5m >$50 unfavorable exit · ${detail}`
     : "Legacy Texas rules";
   if (texas.allocation_boosted) {
     // The filled position may predate a calibration change, so do not attach
@@ -253,7 +253,7 @@ function tradeResult(trade) {
     TEXAS_TURN_TARGET: "Texas Hold’em · Turn target",
     TEXAS_RIVER_TARGET: "Texas Hold’em · River target",
     TEXAS_RIVER_STOP: "Texas Hold’em · River stop",
-    TEXAS_THESIS_FAILURE: "Texas Hold’em 2.0 · Thesis failure",
+    TEXAS_THESIS_FAILURE: "Texas Hold’em · Thesis failure",
   };
   const exitLabel = exitLabels[reason] ? ` · ${exitLabels[reason]}` : "";
   return trade.realized_pnl == null
@@ -288,6 +288,7 @@ function texasExitText(state = {}) {
 
 function displayStrategy(value) {
   const strategy = String(value || "Manual").toUpperCase();
+  if (strategy === "TEXAS_HOLDEM_2_1") return "Texas Hold’em 2.1";
   if (strategy === "TEXAS_HOLDEM_2_0") return "Texas Hold’em 2.0";
   if (strategy === "TEXAS_HOLDEM") return "Texas Hold’em";
   return String(value || "Manual").replaceAll("_", " ");
@@ -335,7 +336,7 @@ function renderOpenTrades(trades, mode, availableCash, market) {
       <div class="open-trade-head"><strong class="${sideClass}">${escapeHtml(sideLabel(trade.side))}</strong><span>${escapeHtml(strategy)}</span></div>
       <p title="${escapeHtml(trade.ticker)}">${escapeHtml(trade.ticker || "Current market")}</p>
       <div><span>${escapeHtml(compact(trade.contracts))} contracts</span><span>${escapeHtml(cents(trade.entry_price))} entry</span><span>${escapeHtml(money(trade.exposure))} exposure</span></div>
-      <p class="threshold-breach-state">${escapeHtml(["TEXAS_HOLDEM", "TEXAS_HOLDEM_2_0"].includes(String(trade.strategy).toUpperCase()) ? texasExitText(trade.texas_holdem_exit || {}) : thresholdBreachExitText(trade.threshold_breach_exit || {}))}</p>
+      <p class="threshold-breach-state">${escapeHtml(["TEXAS_HOLDEM", "TEXAS_HOLDEM_2_0", "TEXAS_HOLDEM_2_1"].includes(String(trade.strategy).toUpperCase()) ? texasExitText(trade.texas_holdem_exit || {}) : thresholdBreachExitText(trade.threshold_breach_exit || {}))}</p>
     </article>`;
   }).join("");
 }

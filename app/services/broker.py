@@ -16,9 +16,9 @@ from typing import Any
 
 from app.db import Database
 from app.domain import (
-    TEXAS_HOLDEM_V2,
     TEXAS_V2_THESIS_CHECKPOINT_SECONDS,
     is_texas_holdem_strategy,
+    is_modern_texas_holdem_strategy,
     iso_now,
     kalshi_fee,
     parse_time,
@@ -2591,7 +2591,7 @@ class KalshiBroker(Broker):
         result: dict[str, dict[str, Any]] = {}
         for strategy in (
             "STANDARD_EDGE", "EARLY_THRESHOLD", "LATE_CONVICTION", "SWING",
-            "TEXAS_HOLDEM", "TEXAS_HOLDEM_2_0",
+            "TEXAS_HOLDEM", "TEXAS_HOLDEM_2_0", "TEXAS_HOLDEM_2_1",
         ):
             rows = [row for row in fills if row.get("strategy") == strategy]
             buys = [row for row in rows if row.get("action") == "BUY"]
@@ -2917,7 +2917,7 @@ class KalshiBroker(Broker):
             """
             SELECT filled_contracts,average_fill_price,limit_price FROM broker_orders
             WHERE mode=? AND ticker=? AND side=? AND action='BUY'
-              AND strategy IN ('TEXAS_HOLDEM','TEXAS_HOLDEM_2_0') AND filled_contracts>0
+              AND strategy IN ('TEXAS_HOLDEM','TEXAS_HOLDEM_2_0','TEXAS_HOLDEM_2_1') AND filled_contracts>0
             """,
             (self.mode, intent.ticker, intent.side),
         )
@@ -2951,9 +2951,9 @@ class KalshiBroker(Broker):
                     THEN excluded.average_price ELSE broker_positions.average_price END,
                 market_exposure=CASE WHEN excluded.contracts>broker_positions.contracts
                     THEN excluded.market_exposure ELSE broker_positions.market_exposure END,
-                strategy=CASE WHEN excluded.strategy='TEXAS_HOLDEM_2_0'
+                strategy=CASE WHEN excluded.strategy IN ('TEXAS_HOLDEM_2_0','TEXAS_HOLDEM_2_1')
                     THEN excluded.strategy ELSE COALESCE(broker_positions.strategy,excluded.strategy) END,
-                source=CASE WHEN excluded.strategy='TEXAS_HOLDEM_2_0'
+                source=CASE WHEN excluded.strategy IN ('TEXAS_HOLDEM_2_0','TEXAS_HOLDEM_2_1')
                     THEN excluded.source ELSE COALESCE(broker_positions.source,excluded.source) END,
                 updated_at=excluded.updated_at,status='open'
             """,
@@ -2969,26 +2969,31 @@ class KalshiBroker(Broker):
             intent=intent,
         )
 
-    def _has_texas_v2_entry_evidence(self, ticker: str, side: str) -> bool:
-        """Never infer 2.0 from a waiting/pass round alone.
+    def _texas_modern_entry_strategy(self, ticker: str, side: str) -> str | None:
+        """Never infer a modern Texas version from a waiting/pass round alone.
 
         Position and fill reconciliation can arrive before the local round
         state is refreshed.  A matching durable entry intent or fill is the
         minimum attribution evidence; a bare UI/runtime round is not.
         """
-        return self.db.fetch_one(
+        row = self.db.fetch_one(
             """
-            SELECT 1 FROM broker_order_intents
+            SELECT strategy FROM broker_order_intents
             WHERE mode=? AND ticker=? AND side=? AND action='BUY'
-              AND strategy='TEXAS_HOLDEM_2_0'
-            UNION ALL
-            SELECT 1 FROM broker_fills
-            WHERE mode=? AND ticker=? AND side=? AND action='BUY'
-              AND strategy='TEXAS_HOLDEM_2_0'
-            LIMIT 1
+              AND strategy IN ('TEXAS_HOLDEM_2_0','TEXAS_HOLDEM_2_1')
+            ORDER BY created_at DESC LIMIT 1
             """,
-            (self.mode, ticker, side, self.mode, ticker, side),
-        ) is not None
+            (self.mode, ticker, side),
+        ) or self.db.fetch_one(
+            """
+            SELECT strategy FROM broker_fills
+            WHERE mode=? AND ticker=? AND side=? AND action='BUY'
+              AND strategy IN ('TEXAS_HOLDEM_2_0','TEXAS_HOLDEM_2_1')
+            ORDER BY filled_at DESC LIMIT 1
+            """,
+            (self.mode, ticker, side),
+        )
+        return str(row["strategy"]) if row else None
 
     def _upsert_fill(
         self, fill: dict[str, Any], *, available_cash_after: float | None = None
@@ -3051,11 +3056,11 @@ class KalshiBroker(Broker):
             (self.mode, client_id),
         ) if client_id else None
         ticker = str(fill.get("ticker") or (order or {}).get("ticker") or "")
-        v2_entry_evidence = self._has_texas_v2_entry_evidence(ticker, side)
+        modern_entry_strategy = self._texas_modern_entry_strategy(ticker, side)
         fill_strategy = (
             (intent or {}).get("strategy")
             or (order or {}).get("strategy")
-            or (TEXAS_HOLDEM_V2 if v2_entry_evidence else None)
+            or modern_entry_strategy
         )
         self.db.execute(
             """
@@ -3087,19 +3092,19 @@ class KalshiBroker(Broker):
             ),
         )
         strategy = fill_strategy
-        if action == "BUY" and str(strategy or "") == TEXAS_HOLDEM_V2:
+        if action == "BUY" and is_modern_texas_holdem_strategy(strategy):
             earliest = self.db.fetch_one(
                 """
                 SELECT MIN(filled_at) AS filled_at FROM broker_fills
                 WHERE mode=? AND ticker=? AND side=? AND action='BUY'
-                  AND strategy='TEXAS_HOLDEM_2_0'
+                  AND strategy=?
                 """,
-                (self.mode, ticker, side),
+                (self.mode, ticker, side, strategy),
             ) or {}
             existing_round = self.db.fetch_one(
                 """SELECT first_filled_at FROM texas_holdem_rounds
-                   WHERE environment=? AND ticker=? AND strategy='TEXAS_HOLDEM_2_0'""",
-                (self.mode, ticker),
+                   WHERE environment=? AND ticker=? AND strategy=?""",
+                (self.mode, ticker, strategy),
             ) or {}
             candidates = [
                 candidate for candidate in (
@@ -3115,9 +3120,9 @@ class KalshiBroker(Broker):
                     """
                     UPDATE texas_holdem_rounds
                     SET first_filled_at=?,thesis_checkpoint_at=?,updated_at=?
-                    WHERE environment=? AND ticker=? AND strategy='TEXAS_HOLDEM_2_0'
+                    WHERE environment=? AND ticker=? AND strategy=?
                     """,
-                    (first_at, checkpoint, iso_now(), self.mode, ticker),
+                    (first_at, checkpoint, iso_now(), self.mode, ticker, strategy),
                 )
         if available_cash_after is not None:
             self.db.execute(
@@ -3224,7 +3229,7 @@ class KalshiBroker(Broker):
             "SELECT * FROM broker_positions WHERE mode=? AND ticker=? AND side=?",
             (self.mode, ticker, side),
         ) or {}
-        v2_entry_evidence = self._has_texas_v2_entry_evidence(ticker, side)
+        modern_entry_strategy = self._texas_modern_entry_strategy(ticker, side)
         exposure = abs(_number(position.get("market_exposure_dollars") or position.get("market_exposure")))
         average_price = exposure / contracts if contracts else None
         self.db.execute(
@@ -3238,9 +3243,9 @@ class KalshiBroker(Broker):
                 contracts=excluded.contracts,average_price=excluded.average_price,
                 market_exposure=excluded.market_exposure,realized_pnl=excluded.realized_pnl,
                 fees=excluded.fees,
-                strategy=CASE WHEN excluded.strategy='TEXAS_HOLDEM_2_0'
+                strategy=CASE WHEN excluded.strategy IN ('TEXAS_HOLDEM_2_0','TEXAS_HOLDEM_2_1')
                     THEN excluded.strategy ELSE COALESCE(broker_positions.strategy,excluded.strategy) END,
-                source=CASE WHEN excluded.strategy='TEXAS_HOLDEM_2_0'
+                source=CASE WHEN excluded.strategy IN ('TEXAS_HOLDEM_2_0','TEXAS_HOLDEM_2_1')
                     THEN excluded.source ELSE COALESCE(broker_positions.source,excluded.source) END,
                 updated_at=excluded.updated_at,status='open'
             """,
@@ -3248,8 +3253,8 @@ class KalshiBroker(Broker):
                 self.mode, ticker, side, contracts, average_price, exposure,
                 _number(position.get("realized_pnl_dollars") or position.get("realized_pnl")),
                 _number(position.get("fees_paid_dollars") or position.get("fees_paid")),
-                TEXAS_HOLDEM_V2 if v2_entry_evidence else existing.get("strategy"),
-                "automatic" if v2_entry_evidence else existing.get("source"),
+                modern_entry_strategy or existing.get("strategy"),
+                "automatic" if modern_entry_strategy else existing.get("source"),
                 existing.get("stop_loss_price"),
                 existing.get("target_exit_price"), existing.get("fallback_exit_mode"),
                 existing.get("fallback_exit_seconds"), existing.get("opened_at") or iso_now(),
@@ -3281,12 +3286,12 @@ class KalshiBroker(Broker):
         self.db.execute(
             """
             UPDATE broker_positions SET
-                texas_exit_status=CASE WHEN strategy IN ('TEXAS_HOLDEM','TEXAS_HOLDEM_2_0') OR EXISTS (
+                texas_exit_status=CASE WHEN strategy IN ('TEXAS_HOLDEM','TEXAS_HOLDEM_2_0','TEXAS_HOLDEM_2_1') OR EXISTS (
                     SELECT 1 FROM texas_holdem_rounds r
                     WHERE r.environment=broker_positions.mode
                       AND r.ticker=broker_positions.ticker
                 ) THEN 'Exited' ELSE texas_exit_status END,
-                texas_exit_reason=CASE WHEN strategy IN ('TEXAS_HOLDEM','TEXAS_HOLDEM_2_0') OR EXISTS (
+                texas_exit_reason=CASE WHEN strategy IN ('TEXAS_HOLDEM','TEXAS_HOLDEM_2_0','TEXAS_HOLDEM_2_1') OR EXISTS (
                     SELECT 1 FROM texas_holdem_rounds r
                     WHERE r.environment=broker_positions.mode
                       AND r.ticker=broker_positions.ticker

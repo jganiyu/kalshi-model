@@ -22,7 +22,7 @@ A local macOS research and trading app for Kalshi's 15-minute Bitcoin Up or Down
 - **Coinbase volatility:** Closed one-minute candles provide the 15-minute realized-volatility signal used by Texas.
 - **Three modes:** Paper, isolated Kalshi Demo, and deliberately armed Kalshi Live.
 - **Mobile Monitor:** Read-only HUD, market metrics, and recent trades on iPhone through Tailscale.
-- **Strategies:** Standard Edge probability-and-value entries, plus an optional Texas Hold’em 2.0 opening play with Flop, Turn, and River exits.
+- **Strategies:** Standard Edge probability-and-value entries, plus an optional Texas Hold’em 2.1 opening play with Flop, Turn, and River exits.
 - **Protective exits:** Configurable profit take, stop-loss, and Threshold Breach Exit rules.
 - **Calibration:** Tune Standard Edge, exits, risk controls, and review probability, volatility, and volume evidence.
 - **Trade review:** Expand a settled trade to replay its BTC, probability, MVI, readiness, and execution history.
@@ -122,11 +122,11 @@ Every entry must clear probability, EV, spread, liquidity, data, confidence, thr
 
 Texas Hold’em is an alternative automatic strategy. Once the official market opens and To Beat is known, it buys the contract opposite BTC’s opening position versus the threshold—Down when BTC is above it, Up when BTC is below it—only when the all-in executable price is at or below the configured entry cap. It sends an aggressive IOC attempt plus the configured number of remaining-quantity retries, each using genuinely fresh market state, during the configured opening window; otherwise it folds until the next market. Standard Edge entries are disabled while this strategy is on.
 
-Texas Hold’em 2.0 records its own strategy version and has separate settings for Paper, Demo, and Live.
+Texas Hold’em 2.1 records its own strategy version and has separate settings for Paper, Demo, and Live.
 
 - **Entry gate:** Coinbase 15-minute realized volatility must be at least 0.20% by default.
 - **Allocation boost:** Volatility at or above 0.80% applies a 1.5× boost by default.
-- **Thesis check:** After five minutes without a breach, Texas can reduce risk when BTC moves farther from the threshold.
+- **Thesis check:** After five minutes, Texas exits when BRTI is more than $50 unfavorable, even after an earlier brief breach.
 - **Hard limits:** Position, risk, and execution caps always remain ceilings.
 
 ### How it protects a trade

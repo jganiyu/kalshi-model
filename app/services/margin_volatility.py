@@ -751,7 +751,7 @@ class MarginVolatilityService:
             "mode": normalized_mode,
             "calculation_version": CALCULATION_VERSION,
             "scope": (
-                "Version-matched MVI evidence only. Texas Hold’em 2.0 uses a "
+                "Version-matched MVI evidence only. Texas Hold’em 2.1 uses a "
                 "separate lower MVI entry minimum; this report does not tune it. "
                 + ("Demo/Live outcomes use the most recent 100 economic ledger rows. "
                    if normalized_mode != "PAPER" else "")
@@ -768,9 +768,9 @@ class MarginVolatilityService:
             "live_limit_ready": len(observations) >= 1000 and completed_total >= 100,
             "guidance": (
                 "Enough version-matched evidence is available to review the Standard Edge upper-volatility limit. "
-                "Texas Hold’em 2.0's lower MVI entry minimum remains separate."
+                "Texas Hold’em 2.1's entry gate remains separate."
                 if len(observations) >= 1000 and completed_total >= 100
                 else "Collect more version-matched confirmed round trips before reviewing the Standard Edge "
-                "upper-volatility limit. This does not recommend disabling Texas Hold’em 2.0's separate lower MVI gate."
+                "upper-volatility limit. This does not recommend disabling Texas Hold’em 2.1's separate entry gate."
             ),
         }

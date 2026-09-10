@@ -18,7 +18,7 @@ Read this before making changes. It is a working map, not trading advice.
 - Kalshi market WebSocket supplies executable contract quotes and order books. REST is its fallback.
 - Historical Kalshi executable quotes are stored so the dashboard BTC chart can display a read-only crosshair.
 
-## Texas Hold’em 2.0
+## Texas Hold’em 2.1
 
 - Thesis: selectively buy a side when conditions favor an intraround threshold breach, then exit at the configured target rather than hold through settlement.
 - Current volatility signal: **Coinbase 15-minute realized volatility**. MVI2 is retired from active strategy use; historic records remain for old-trade review.
@@ -26,7 +26,7 @@ Read this before making changes. It is a working map, not trading advice.
   - Entry gate: `>= 0.20%`
   - Allocation boost trigger: `>= 0.80%`
   - Boost size: `1.5x`
-  - Thesis-loss rule: 5-minute no-breach / distance rule remains configurable through Texas rules.
+  - Thesis-loss rule: five minutes after first fill, exit when BRTI is more than $50 unfavorable, even after an earlier brief breach.
 - The Dashboard Volatility view charts the same 15-minute Coinbase RV signal used by Texas. It is not a second volatility calculation.
 - A solid red `Texas gate <value>%` line is always drawn and is included in the Y-axis range.
 

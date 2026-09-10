@@ -591,7 +591,11 @@ def threshold_breach_exit_state(
 
 TEXAS_HOLDEM_LEGACY = "TEXAS_HOLDEM"
 TEXAS_HOLDEM_V2 = "TEXAS_HOLDEM_2_0"
-TEXAS_HOLDEM_STRATEGIES = frozenset({TEXAS_HOLDEM_LEGACY, TEXAS_HOLDEM_V2})
+TEXAS_HOLDEM_V21 = "TEXAS_HOLDEM_2_1"
+TEXAS_HOLDEM_MODERN_STRATEGIES = frozenset({TEXAS_HOLDEM_V2, TEXAS_HOLDEM_V21})
+TEXAS_HOLDEM_STRATEGIES = frozenset(
+    {TEXAS_HOLDEM_LEGACY, *TEXAS_HOLDEM_MODERN_STRATEGIES}
+)
 # The entry gate and volatility boost are saved, per-environment settings.
 # Historical MVI values remain read-only evidence; no active MVI rule lives
 # here.
@@ -609,6 +613,10 @@ TEXAS_RV_HORIZON_MINUTES = 15
 
 def is_texas_holdem_strategy(value: object) -> bool:
     return str(value or "").upper() in TEXAS_HOLDEM_STRATEGIES
+
+
+def is_modern_texas_holdem_strategy(value: object) -> bool:
+    return str(value or "").upper() in TEXAS_HOLDEM_MODERN_STRATEGIES
 
 
 def texas_threshold_breached(side: object, btc_proxy: object, threshold: object) -> bool:

@@ -19,7 +19,7 @@ from app.domain import (
     DEFAULT_BENCHMARK_UNCERTAINTY_PCT,
     NextThresholdForecast,
     SETTLEMENT_WINDOW_SECONDS,
-    TEXAS_HOLDEM_V2,
+    TEXAS_HOLDEM_V21,
     TEXAS_V2_RULE_VERSION,
     TEXAS_V2_THESIS_CHECKPOINT_SECONDS,
     TEXAS_V2_THESIS_UNFAVORABLE_DISTANCE,
@@ -642,8 +642,8 @@ class AnalysisEngine:
         }
         return {
             "enabled": bool(settings.get("texas_holdem_enabled", False)),
-            "strategy": TEXAS_HOLDEM_V2,
-            "display_name": "Texas Hold’em 2.0",
+            "strategy": TEXAS_HOLDEM_V21,
+            "display_name": "Texas Hold’em 2.1",
             "status": "WAITING_FOR_MARKET_DATA",
             "phase": {"key": "FLOP", "label": "The Flop"},
             "side": None,
@@ -1969,7 +1969,7 @@ class AnalysisEngine:
             )
             execution_risk_by_side = {
                 side: self.trading.preview_automatic_risk(
-                    strategy=TEXAS_HOLDEM_V2 if texas_enabled else "STANDARD_EDGE",
+                    strategy=TEXAS_HOLDEM_V21 if texas_enabled else "STANDARD_EDGE",
                     ticker=str(market["ticker"]),
                     assessment=assessments[side],
                     bankroll_fraction=(
@@ -2024,7 +2024,7 @@ class AnalysisEngine:
                     trading_mode,
                     str(market["ticker"]),
                     strategy=(
-                        TEXAS_HOLDEM_V2
+                        TEXAS_HOLDEM_V21
                         if settings.get("texas_holdem_enabled", False)
                         else None
                     ),
