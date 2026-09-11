@@ -19,8 +19,9 @@ from app.domain import (
     DEFAULT_BENCHMARK_UNCERTAINTY_PCT,
     NextThresholdForecast,
     SETTLEMENT_WINDOW_SECONDS,
-    TEXAS_HOLDEM_V21,
+    TEXAS_HOLDEM_V3,
     TEXAS_V2_RULE_VERSION,
+    TEXAS_V3_RULE_VERSION,
     TEXAS_V2_THESIS_CHECKPOINT_SECONDS,
     TEXAS_V2_THESIS_UNFAVORABLE_DISTANCE,
     calibration_metrics,
@@ -642,8 +643,8 @@ class AnalysisEngine:
         }
         return {
             "enabled": bool(settings.get("texas_holdem_enabled", False)),
-            "strategy": TEXAS_HOLDEM_V21,
-            "display_name": "Texas Hold’em 2.1",
+            "strategy": TEXAS_HOLDEM_V3,
+            "display_name": "Texas Hold’em 3.0",
             "status": "WAITING_FOR_MARKET_DATA",
             "phase": {"key": "FLOP", "label": "The Flop"},
             "side": None,
@@ -660,7 +661,7 @@ class AnalysisEngine:
             "pass": {"passed": False, "scheduled": False, "next_open_time": None},
             "threshold_breach_exempt": True,
             "rules": {
-                "version": TEXAS_V2_RULE_VERSION,
+                "version": TEXAS_V3_RULE_VERSION,
                 "realized_volatility_gate_pct": self.paper._texas_v21_realized_volatility_gate(
                     settings, str(settings.get("trading_mode") or "PAPER")
                 ),
@@ -1969,7 +1970,7 @@ class AnalysisEngine:
             )
             execution_risk_by_side = {
                 side: self.trading.preview_automatic_risk(
-                    strategy=TEXAS_HOLDEM_V21 if texas_enabled else "STANDARD_EDGE",
+                    strategy=TEXAS_HOLDEM_V3 if texas_enabled else "STANDARD_EDGE",
                     ticker=str(market["ticker"]),
                     assessment=assessments[side],
                     bankroll_fraction=(
@@ -1986,7 +1987,7 @@ class AnalysisEngine:
                     ),
                     time_in_force=("immediate_or_cancel" if texas_enabled else None),
                     maximum_entry_price=(
-                        settings.get("texas_holdem_max_entry_price")
+                        settings.get("texas_holdem_max_entry_price", 0.45)
                         if texas_enabled else None
                     ),
                 )
@@ -2024,7 +2025,7 @@ class AnalysisEngine:
                     trading_mode,
                     str(market["ticker"]),
                     strategy=(
-                        TEXAS_HOLDEM_V21
+                        TEXAS_HOLDEM_V3
                         if settings.get("texas_holdem_enabled", False)
                         else None
                     ),

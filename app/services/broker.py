@@ -2591,7 +2591,7 @@ class KalshiBroker(Broker):
         result: dict[str, dict[str, Any]] = {}
         for strategy in (
             "STANDARD_EDGE", "EARLY_THRESHOLD", "LATE_CONVICTION", "SWING",
-            "TEXAS_HOLDEM", "TEXAS_HOLDEM_2_0", "TEXAS_HOLDEM_2_1",
+            "TEXAS_HOLDEM", "TEXAS_HOLDEM_2_0", "TEXAS_HOLDEM_2_1", "TEXAS_HOLDEM_3_0",
         ):
             rows = [row for row in fills if row.get("strategy") == strategy]
             buys = [row for row in rows if row.get("action") == "BUY"]
@@ -2917,7 +2917,7 @@ class KalshiBroker(Broker):
             """
             SELECT filled_contracts,average_fill_price,limit_price FROM broker_orders
             WHERE mode=? AND ticker=? AND side=? AND action='BUY'
-              AND strategy IN ('TEXAS_HOLDEM','TEXAS_HOLDEM_2_0','TEXAS_HOLDEM_2_1') AND filled_contracts>0
+              AND strategy IN ('TEXAS_HOLDEM','TEXAS_HOLDEM_2_0','TEXAS_HOLDEM_2_1','TEXAS_HOLDEM_3_0') AND filled_contracts>0
             """,
             (self.mode, intent.ticker, intent.side),
         )
@@ -2951,9 +2951,9 @@ class KalshiBroker(Broker):
                     THEN excluded.average_price ELSE broker_positions.average_price END,
                 market_exposure=CASE WHEN excluded.contracts>broker_positions.contracts
                     THEN excluded.market_exposure ELSE broker_positions.market_exposure END,
-                strategy=CASE WHEN excluded.strategy IN ('TEXAS_HOLDEM_2_0','TEXAS_HOLDEM_2_1')
+                strategy=CASE WHEN excluded.strategy IN ('TEXAS_HOLDEM_2_0','TEXAS_HOLDEM_2_1','TEXAS_HOLDEM_3_0')
                     THEN excluded.strategy ELSE COALESCE(broker_positions.strategy,excluded.strategy) END,
-                source=CASE WHEN excluded.strategy IN ('TEXAS_HOLDEM_2_0','TEXAS_HOLDEM_2_1')
+                source=CASE WHEN excluded.strategy IN ('TEXAS_HOLDEM_2_0','TEXAS_HOLDEM_2_1','TEXAS_HOLDEM_3_0')
                     THEN excluded.source ELSE COALESCE(broker_positions.source,excluded.source) END,
                 updated_at=excluded.updated_at,status='open'
             """,
@@ -2980,7 +2980,7 @@ class KalshiBroker(Broker):
             """
             SELECT strategy FROM broker_order_intents
             WHERE mode=? AND ticker=? AND side=? AND action='BUY'
-              AND strategy IN ('TEXAS_HOLDEM_2_0','TEXAS_HOLDEM_2_1')
+              AND strategy IN ('TEXAS_HOLDEM_2_0','TEXAS_HOLDEM_2_1','TEXAS_HOLDEM_3_0')
             ORDER BY created_at DESC LIMIT 1
             """,
             (self.mode, ticker, side),
@@ -2988,7 +2988,7 @@ class KalshiBroker(Broker):
             """
             SELECT strategy FROM broker_fills
             WHERE mode=? AND ticker=? AND side=? AND action='BUY'
-              AND strategy IN ('TEXAS_HOLDEM_2_0','TEXAS_HOLDEM_2_1')
+              AND strategy IN ('TEXAS_HOLDEM_2_0','TEXAS_HOLDEM_2_1','TEXAS_HOLDEM_3_0')
             ORDER BY filled_at DESC LIMIT 1
             """,
             (self.mode, ticker, side),
@@ -3243,9 +3243,9 @@ class KalshiBroker(Broker):
                 contracts=excluded.contracts,average_price=excluded.average_price,
                 market_exposure=excluded.market_exposure,realized_pnl=excluded.realized_pnl,
                 fees=excluded.fees,
-                strategy=CASE WHEN excluded.strategy IN ('TEXAS_HOLDEM_2_0','TEXAS_HOLDEM_2_1')
+                strategy=CASE WHEN excluded.strategy IN ('TEXAS_HOLDEM_2_0','TEXAS_HOLDEM_2_1','TEXAS_HOLDEM_3_0')
                     THEN excluded.strategy ELSE COALESCE(broker_positions.strategy,excluded.strategy) END,
-                source=CASE WHEN excluded.strategy IN ('TEXAS_HOLDEM_2_0','TEXAS_HOLDEM_2_1')
+                source=CASE WHEN excluded.strategy IN ('TEXAS_HOLDEM_2_0','TEXAS_HOLDEM_2_1','TEXAS_HOLDEM_3_0')
                     THEN excluded.source ELSE COALESCE(broker_positions.source,excluded.source) END,
                 updated_at=excluded.updated_at,status='open'
             """,
@@ -3286,12 +3286,12 @@ class KalshiBroker(Broker):
         self.db.execute(
             """
             UPDATE broker_positions SET
-                texas_exit_status=CASE WHEN strategy IN ('TEXAS_HOLDEM','TEXAS_HOLDEM_2_0','TEXAS_HOLDEM_2_1') OR EXISTS (
+                texas_exit_status=CASE WHEN strategy IN ('TEXAS_HOLDEM','TEXAS_HOLDEM_2_0','TEXAS_HOLDEM_2_1','TEXAS_HOLDEM_3_0') OR EXISTS (
                     SELECT 1 FROM texas_holdem_rounds r
                     WHERE r.environment=broker_positions.mode
                       AND r.ticker=broker_positions.ticker
                 ) THEN 'Exited' ELSE texas_exit_status END,
-                texas_exit_reason=CASE WHEN strategy IN ('TEXAS_HOLDEM','TEXAS_HOLDEM_2_0','TEXAS_HOLDEM_2_1') OR EXISTS (
+                texas_exit_reason=CASE WHEN strategy IN ('TEXAS_HOLDEM','TEXAS_HOLDEM_2_0','TEXAS_HOLDEM_2_1','TEXAS_HOLDEM_3_0') OR EXISTS (
                     SELECT 1 FROM texas_holdem_rounds r
                     WHERE r.environment=broker_positions.mode
                       AND r.ticker=broker_positions.ticker

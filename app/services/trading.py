@@ -720,7 +720,7 @@ class TradingCoordinator:
                UNION ALL
                SELECT 1 FROM broker_order_intents
                WHERE mode=? AND ticker=?
-                 AND strategy IN ('TEXAS_HOLDEM','TEXAS_HOLDEM_2_0','TEXAS_HOLDEM_2_1') LIMIT 1""",
+                 AND strategy IN ('TEXAS_HOLDEM','TEXAS_HOLDEM_2_0','TEXAS_HOLDEM_2_1','TEXAS_HOLDEM_3_0') LIMIT 1""",
             (mode, ticker, mode, ticker),
         ) is not None
 
@@ -1442,10 +1442,10 @@ class TradingCoordinator:
                     UPDATE broker_positions SET strategy=?,source=?,stop_loss_price=?,
                         target_exit_price=?,fallback_exit_mode=?,fallback_exit_seconds=?,
                         strategy_metadata_json=?,threshold_breach_enabled=CASE
-                            WHEN ? IN ('TEXAS_HOLDEM','TEXAS_HOLDEM_2_0','TEXAS_HOLDEM_2_1') THEN 0 ELSE threshold_breach_enabled END,
-                        threshold_exit_status=CASE WHEN ? IN ('TEXAS_HOLDEM','TEXAS_HOLDEM_2_0','TEXAS_HOLDEM_2_1') THEN 'Watching'
+                            WHEN ? IN ('TEXAS_HOLDEM','TEXAS_HOLDEM_2_0','TEXAS_HOLDEM_2_1','TEXAS_HOLDEM_3_0') THEN 0 ELSE threshold_breach_enabled END,
+                        threshold_exit_status=CASE WHEN ? IN ('TEXAS_HOLDEM','TEXAS_HOLDEM_2_0','TEXAS_HOLDEM_2_1','TEXAS_HOLDEM_3_0') THEN 'Watching'
                             ELSE threshold_exit_status END,
-                        threshold_exit_block_reason=CASE WHEN ? IN ('TEXAS_HOLDEM','TEXAS_HOLDEM_2_0','TEXAS_HOLDEM_2_1')
+                        threshold_exit_block_reason=CASE WHEN ? IN ('TEXAS_HOLDEM','TEXAS_HOLDEM_2_0','TEXAS_HOLDEM_2_1','TEXAS_HOLDEM_3_0')
                             THEN 'Threshold Breach Exit is inactive for Texas Hold''em positions.'
                             ELSE threshold_exit_block_reason END
                     WHERE mode=? AND ticker=? AND side=? AND status='open'

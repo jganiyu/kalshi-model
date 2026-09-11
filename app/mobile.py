@@ -114,7 +114,7 @@ def mobile_snapshot(dashboard: dict[str, Any]) -> dict[str, Any]:
                     "targets": texas_holdem.get("targets"),
                 }
             ) if str(position.get("strategy") or "").upper() in {
-                "TEXAS_HOLDEM", "TEXAS_HOLDEM_2_0", "TEXAS_HOLDEM_2_1"
+                "TEXAS_HOLDEM", "TEXAS_HOLDEM_2_0", "TEXAS_HOLDEM_2_1", "TEXAS_HOLDEM_3_0"
             } else None,
         }
         for position in (selected.get("positions") or [])

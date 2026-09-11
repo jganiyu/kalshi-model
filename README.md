@@ -22,7 +22,7 @@ A local macOS research and trading app for Kalshi's 15-minute Bitcoin Up or Down
 - **Coinbase volatility:** Closed one-minute candles provide the 15-minute realized-volatility signal used by Texas.
 - **Three modes:** Paper, isolated Kalshi Demo, and deliberately armed Kalshi Live.
 - **Mobile Monitor:** Read-only HUD, market metrics, and recent trades on iPhone through Tailscale.
-- **Strategies:** Standard Edge probability-and-value entries, plus an optional Texas Hold’em 2.1 opening play with Flop, Turn, and River exits.
+- **Strategies:** Standard Edge probability-and-value entries, plus Texas Hold’em 3.0 breach-first entries with Flop, Turn, and River exits.
 - **Protective exits:** Configurable profit take, stop-loss, and Threshold Breach Exit rules.
 - **Calibration:** Tune Standard Edge, exits, risk controls, and review probability, volatility, and volume evidence.
 - **Trade review:** Expand a settled trade to replay its BTC, probability, MVI, readiness, and execution history.
@@ -120,9 +120,9 @@ Standard Edge looks for a sustained pricing advantage and confirms it against th
 
 Every entry must clear probability, EV, spread, liquidity, data, confidence, threshold distance, BTC directional momentum, volatility, confirmation, allocation, and risk checks. By default, a 15-second BTC-proxy regression must move at least $1 upward for Up or downward for Down. The HUD shows these checks live so it is clear what the model is waiting on.
 
-Texas Hold’em is an alternative automatic strategy. Once the official market opens and To Beat is known, it buys the contract opposite BTC’s opening position versus the threshold—Down when BTC is above it, Up when BTC is below it—only when the all-in executable price is at or below the configured entry cap. It sends an aggressive IOC attempt plus the configured number of remaining-quantity retries, each using genuinely fresh market state, during the configured opening window; otherwise it folds until the next market. Standard Edge entries are disabled while this strategy is on.
+Texas Hold’em 3.0 waits for the first BRTI threshold breach after the open, then buys the opposite side at 45¢ or less. The breach and fresh-quote IOC retries must occur within 90 seconds; otherwise it folds until the next market. Standard Edge entries are disabled while this strategy is on.
 
-Texas Hold’em 2.1 records its own strategy version and has separate settings for Paper, Demo, and Live.
+Texas Hold’em 3.0 records its own strategy version; older Texas positions retain their original strategy identity and exit protection.
 
 - **Entry gate:** Coinbase 15-minute realized volatility must be at least 0.20% by default.
 - **Allocation boost:** Volatility at or above 0.80% applies a 1.5× boost by default.

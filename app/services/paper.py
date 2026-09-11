@@ -12,7 +12,9 @@ from app.domain import (
     TEXAS_HOLDEM_LEGACY,
     TEXAS_HOLDEM_V2,
     TEXAS_HOLDEM_V21,
+    TEXAS_HOLDEM_V3,
     TEXAS_V2_RULE_VERSION,
+    TEXAS_V3_RULE_VERSION,
     TEXAS_V2_THESIS_CHECKPOINT_SECONDS,
     TEXAS_V2_THESIS_UNFAVORABLE_DISTANCE,
     is_texas_holdem_strategy,
@@ -227,7 +229,7 @@ class PaperTradingService:
                 """
                 SELECT COALESCE(SUM(remaining_contracts),0) amount
                 FROM paper_entries WHERE ticker=? AND side=?
-                  AND strategy IN ('TEXAS_HOLDEM','TEXAS_HOLDEM_2_0','TEXAS_HOLDEM_2_1')
+                  AND strategy IN ('TEXAS_HOLDEM','TEXAS_HOLDEM_2_0','TEXAS_HOLDEM_2_1','TEXAS_HOLDEM_3_0')
                   AND status='open'
                 """,
                 (ticker, side),
@@ -237,7 +239,7 @@ class PaperTradingService:
                 """
                 SELECT COALESCE(SUM(contracts),0) amount
                 FROM broker_positions WHERE mode=? AND ticker=? AND side=?
-                  AND strategy IN ('TEXAS_HOLDEM','TEXAS_HOLDEM_2_0','TEXAS_HOLDEM_2_1') AND status='open'
+                  AND strategy IN ('TEXAS_HOLDEM','TEXAS_HOLDEM_2_0','TEXAS_HOLDEM_2_1','TEXAS_HOLDEM_3_0') AND status='open'
                 """,
                 (mode, ticker, side),
             ) or {}
@@ -394,7 +396,11 @@ class PaperTradingService:
         ) if current_reliable else None
         if status == "WAITING" and checkpoint and observed and observed >= checkpoint and current_reliable:
             evidence = {
-                "rule_version": TEXAS_V2_RULE_VERSION,
+                "rule_version": (
+                    TEXAS_V3_RULE_VERSION
+                    if str(row.get("strategy")) == TEXAS_HOLDEM_V3
+                    else TEXAS_V2_RULE_VERSION
+                ),
                 "first_filled_at": row.get("first_filled_at"),
                 "checkpoint_at": row.get("thesis_checkpoint_at"),
                 "observed_at": observed_at,
@@ -463,10 +469,12 @@ class PaperTradingService:
         rv_boost_threshold = self._texas_v21_realized_volatility_boost(settings, mode)
         rv_boost_multiplier = self._texas_v21_realized_volatility_boost_multiplier(settings, mode)
         phase = texas_holdem_phase(seconds_remaining)
-        maximum_price = float(settings.get("texas_holdem_max_entry_price", 0.50))
-        entry_window = int(settings.get("texas_holdem_entry_window_seconds", 20))
-        # The initial IOC plus the user-configured number of fresh-quote retries.
-        max_attempts = 1 + max(0, int(settings.get("texas_holdem_additional_retries", 2)))
+        configured_maximum_price = float(
+            settings.get("texas_holdem_max_entry_price", 0.45)
+        )
+        configured_entry_window = int(
+            settings.get("texas_holdem_entry_window_seconds", 90)
+        )
         targets = {
             "flop": float(settings.get("texas_holdem_flop_target", 0.60)),
             "flop_stop": float(settings.get("texas_holdem_flop_stop", 0.60)),
@@ -500,8 +508,9 @@ class PaperTradingService:
                 ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
-                    mode, ticker, TEXAS_HOLDEM_V21, market_open_time, threshold,
-                    opening_proxy, proposed_side, "PASSED" if passed else "WAITING", maximum_price,
+                    mode, ticker, TEXAS_HOLDEM_V3, market_open_time, threshold,
+                    opening_proxy, None, "PASSED" if passed else "WAITING",
+                    configured_maximum_price,
                     targets["flop"], targets["turn"], targets["river"],
                     targets["river_stop"], now_iso, now_iso,
                 ),
@@ -514,8 +523,30 @@ class PaperTradingService:
             )
         strategy = str(row.get("strategy") or TEXAS_HOLDEM_LEGACY)
         texas_v2 = is_modern_texas_holdem_strategy(strategy)
+        texas_v3 = strategy == TEXAS_HOLDEM_V3
+        maximum_price = configured_maximum_price
+        entry_window = configured_entry_window
+        # A breach arms the entry; configured retries may use later fresh
+        # quotes within the same deadline, but only one position may exist.
+        max_attempts = 1 + max(
+            0, int(settings.get("texas_holdem_additional_retries", 2))
+        )
         stored_side = str(row.get("side") or "") or None
-        side = stored_side or proposed_side
+        breach_side = None
+        if texas_v3 and not stored_side:
+            try:
+                opening_proxy = float(row.get("opening_btc_proxy"))
+                threshold = float(row.get("threshold"))
+            except (TypeError, ValueError):
+                opening_proxy = threshold = float("nan")
+            if math.isfinite(opening_proxy) and math.isfinite(threshold) and margin is not None:
+                if opening_proxy > threshold and margin <= 0:
+                    breach_side = "YES"
+                elif opening_proxy < threshold and margin >= 0:
+                    breach_side = "NO"
+                elif opening_proxy == threshold and margin != 0:
+                    breach_side = "NO" if margin > 0 else "YES"
+        side = stored_side or breach_side or (None if texas_v3 else proposed_side)
         filled = self._texas_filled_contracts(mode, ticker, side) if side else 0.0
         attempts = int(row.get("attempt_count") or 0)
         target_contracts = float(row.get("target_contracts") or 0.0)
@@ -541,7 +572,7 @@ class PaperTradingService:
         elif texas_v2 and status == "PARTIALLY_FILLED":
             # An accepted partial IOC is confirmed exposure. It is never a
             # license for a later automatic buy during recovery.
-            blocker = "A partially filled Texas Hold’em 2.1 entry already holds confirmed exposure."
+            blocker = f"A partially filled {('Texas Hold’em 3.0' if texas_v3 else 'Texas Hold’em 2.1')} entry already holds confirmed exposure."
         elif status not in {"ENTERED", "FOLDED", "EXITED", "PASSED"} and not (
             status == "PARTIALLY_FILLED" and blocker
         ):
@@ -556,15 +587,22 @@ class PaperTradingService:
             elif opening_elapsed > entry_window:
                 status = "FOLDED" if filled <= 0 else "PARTIALLY_FILLED"
                 blocker = f"The {entry_window}-second opening play expired."
-            elif proposed_side is None:
+            elif texas_v3 and side is None:
+                blocker = "Waiting for the first BRTI threshold breach."
+            elif not texas_v3 and proposed_side is None:
                 blocker = "BTC proxy is exactly at To Beat."
-            elif stored_side and proposed_side != stored_side:
+            elif not texas_v3 and stored_side and proposed_side != stored_side:
                 status = "FOLDED" if filled <= 0 else "PARTIALLY_FILLED"
                 blocker = "BTC crossed To Beat before the opening play completed."
             elif entry_exists:
                 blocker = "An entry order or filled position already exists for this market."
             else:
-                side = proposed_side
+                side = side if texas_v3 else proposed_side
+                if texas_v3 and breach_side:
+                    self.db.execute(
+                        "UPDATE texas_holdem_rounds SET side=?,updated_at=? WHERE id=?",
+                        (side, market_observed_at or iso_now(), row["id"]),
+                    )
                 assessment = dict(assessments.get(side) or {})
                 buy = dict(assessment.get("buy") or {})
                 executable = buy.get("executable_price")
@@ -593,7 +631,7 @@ class PaperTradingService:
                     and float(rv_value) + 1e-12 < rv_gate
                 ):
                     blocker = (
-                        f"Texas Hold’em 2.1 requires 15m Coinbase volatility ≥ {rv_gate:.2f}% "
+                        f"{('Texas Hold’em 3.0' if texas_v3 else 'Texas Hold’em 2.1')} requires 15m Coinbase volatility ≥ {rv_gate:.2f}% "
                         f"(current {float(rv_value):.2f}%)."
                     )
                 elif executable is None:
@@ -637,6 +675,12 @@ class PaperTradingService:
                             "trigger_timestamp": market_observed_at or iso_now(),
                             "configured_window_seconds": entry_window,
                             "opening_btc_proxy_margin": margin,
+                            "entry_breach_timestamp": (
+                                market_observed_at if texas_v3 else None
+                            ),
+                            "entry_trigger": (
+                                "FIRST_BRTI_THRESHOLD_BREACH" if texas_v3 else "OPENING_PLAY"
+                            ),
                             "entry_price_cap": maximum_price,
                             "flop_target": targets["flop"],
                             "flop_stop": targets["flop_stop"],
@@ -656,7 +700,10 @@ class PaperTradingService:
                         }
                         if texas_v2:
                             metadata.update({
-                                "strategy_version": TEXAS_V2_RULE_VERSION,
+                                "strategy_version": (
+                                    TEXAS_V3_RULE_VERSION if texas_v3
+                                    else TEXAS_V2_RULE_VERSION
+                                ),
                                 "realized_volatility_gate_pct": rv_gate,
                                 "realized_volatility_boost_pct": rv_boost_threshold,
                                 "realized_volatility_boost_multiplier": boost_multiplier,
@@ -680,7 +727,11 @@ class PaperTradingService:
                             assessment=assessment,
                             bankroll_fraction=base_allocation * boost_multiplier,
                             model_version=model_version,
-                            reason="Opening play bought the contract opposite the BTC proxy's position versus To Beat.",
+                            reason=(
+                                "First BRTI threshold breach bought the opposite contract."
+                                if texas_v3 else
+                                "Opening play bought the contract opposite the BTC proxy's position versus To Beat."
+                            ),
                             stop_loss_cents=None,
                             strategy_metadata=metadata,
                             requested_contracts=remaining,
@@ -764,7 +815,8 @@ class PaperTradingService:
         return {
             "strategy": str(row.get("strategy") or TEXAS_HOLDEM_LEGACY),
             "display_name": (
-                "Texas Hold’em 2.1" if strategy == TEXAS_HOLDEM_V21
+                "Texas Hold’em 3.0" if strategy == TEXAS_HOLDEM_V3
+                else "Texas Hold’em 2.1" if strategy == TEXAS_HOLDEM_V21
                 else "Texas Hold’em 2.0" if strategy == TEXAS_HOLDEM_V2
                 else "Texas Hold’em"
             ),
@@ -791,7 +843,10 @@ class PaperTradingService:
             "allocation_boosted": bool(latest_evidence.get("allocation_boosted"))
             if texas_v2 else False,
             "rules": ({
-                "version": TEXAS_V2_RULE_VERSION,
+                "version": (
+                    TEXAS_V3_RULE_VERSION if texas_v3
+                    else TEXAS_V2_RULE_VERSION
+                ),
                 "realized_volatility_gate_pct": rv_gate,
                 "base_allocation_pct": self._texas_v2_base_allocation(settings, mode),
                 "realized_volatility_boost_pct": rv_boost_threshold,
@@ -1054,13 +1109,13 @@ class PaperTradingService:
             SELECT e.*,t.outcome,t.status AS trade_status
             FROM paper_entries e
             JOIN paper_trades t ON t.id=e.trade_id
-            WHERE e.strategy IN ('STANDARD_EDGE','EARLY_THRESHOLD','LATE_CONVICTION','SWING','TEXAS_HOLDEM','TEXAS_HOLDEM_2_0','TEXAS_HOLDEM_2_1')
+            WHERE e.strategy IN ('STANDARD_EDGE','EARLY_THRESHOLD','LATE_CONVICTION','SWING','TEXAS_HOLDEM','TEXAS_HOLDEM_2_0','TEXAS_HOLDEM_2_1','TEXAS_HOLDEM_3_0')
             ORDER BY e.id ASC
             """
         )
         results: dict[str, dict[str, Any]] = {}
         for strategy in (
-            "STANDARD_EDGE", "EARLY_THRESHOLD", "LATE_CONVICTION", "SWING", "TEXAS_HOLDEM", "TEXAS_HOLDEM_2_0", "TEXAS_HOLDEM_2_1"
+            "STANDARD_EDGE", "EARLY_THRESHOLD", "LATE_CONVICTION", "SWING", "TEXAS_HOLDEM", "TEXAS_HOLDEM_2_0", "TEXAS_HOLDEM_2_1", "TEXAS_HOLDEM_3_0"
         ):
             entries = [row for row in rows if row.get("strategy") == strategy]
             settled = [row for row in entries if row.get("status") == "settled"]
@@ -1954,7 +2009,7 @@ class PaperTradingService:
         entries = self.db.fetch_all(
             """
             SELECT * FROM paper_entries
-            WHERE ticker=? AND strategy IN ('TEXAS_HOLDEM','TEXAS_HOLDEM_2_0','TEXAS_HOLDEM_2_1') AND status='open'
+            WHERE ticker=? AND strategy IN ('TEXAS_HOLDEM','TEXAS_HOLDEM_2_0','TEXAS_HOLDEM_2_1','TEXAS_HOLDEM_3_0') AND status='open'
               AND remaining_contracts>0 ORDER BY id ASC
             """,
             (ticker,),
@@ -3413,13 +3468,13 @@ class PaperTradingService:
                 fixed_entry_handler=fixed_entry_handler,
                 execution_risk_by_side=execution_risk_by_side,
             )
-            result["active_strategy"] = TEXAS_HOLDEM_V21
+            result["active_strategy"] = TEXAS_HOLDEM_V3
             result["texas_holdem"] = texas
             result["entered"] = texas.get("status") in {
                 "ATTEMPTING", "PARTIALLY_FILLED", "ENTERED",
             }
             self.reset_automatic_confirmation()
-            return finish(priority_strategy=TEXAS_HOLDEM_V21, blocked_reason=texas.get("blocker"))
+            return finish(priority_strategy=TEXAS_HOLDEM_V3, blocked_reason=texas.get("blocker"))
         if not enabled:
             self.reset_automatic_confirmation()
             return finish(

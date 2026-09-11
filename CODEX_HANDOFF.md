@@ -18,9 +18,11 @@ Read this before making changes. It is a working map, not trading advice.
 - Kalshi market WebSocket supplies executable contract quotes and order books. REST is its fallback.
 - Historical Kalshi executable quotes are stored so the dashboard BTC chart can display a read-only crosshair.
 
-## Texas Hold’em 2.1
+## Texas Hold’em 3.0
 
-- Thesis: selectively buy a side when conditions favor an intraround threshold breach, then exit at the configured target rather than hold through settlement.
+- Entry: wait for the first post-open BRTI threshold breach, then buy the opposite side at an all-in executable price of 45¢ or less.
+- Timing: the breach and any fresh-quote IOC retries must occur within 90 seconds of the official market open.
+- Identity: new rounds persist as `TEXAS_HOLDEM_3_0`; older Texas positions retain their saved strategy version and protection.
 - Current volatility signal: **Coinbase 15-minute realized volatility**. MVI2 is retired from active strategy use; historic records remain for old-trade review.
 - Defaults, editable per Paper/Demo/Live:
   - Entry gate: `>= 0.20%`

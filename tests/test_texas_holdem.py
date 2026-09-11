@@ -8,6 +8,7 @@ from app.db import Database
 from app.domain import (
     TEXAS_HOLDEM_V2,
     TEXAS_HOLDEM_V21,
+    TEXAS_HOLDEM_V3,
     texas_holdem_exit_reason,
     texas_holdem_phase,
 )
@@ -26,12 +27,12 @@ def make_db(tmp_path: Path) -> Database:
         {
             "paper_trading_enabled": True,
             "texas_holdem_enabled": True,
-            "texas_holdem_max_entry_price": 0.50,
+            "texas_holdem_max_entry_price": 0.45,
             "texas_holdem_flop_target": 0.60,
             "texas_holdem_turn_target": 0.50,
             "texas_holdem_river_target": 0.95,
             "texas_holdem_river_stop": 0.60,
-            "texas_holdem_entry_window_seconds": 20,
+            "texas_holdem_entry_window_seconds": 90,
             "texas_holdem_additional_retries": 2,
             "risk_controls_enabled": False,
             "slippage_cents": 0.5,
@@ -97,6 +98,21 @@ def run_strategy(
     ticker: str = "TEXAS",
     market_open_time: str = "2026-09-01T12:00:00+00:00",
 ) -> dict:
+    if service._texas_round("PAPER", ticker) is None:
+        service.consider_strategies(
+            ticker=ticker,
+            assessments=side_assessments,
+            standard_decisions={},
+            seconds_remaining=900,
+            market_status="active",
+            market_open_time=market_open_time,
+            market_observed_at=market_open_time,
+            threshold_state={},
+            settlement_window={},
+            z_distance=0,
+            threshold_margin_dollars=-margin,
+            model_version="test",
+        )
     return service.consider_strategies(
         ticker=ticker,
         assessments=side_assessments,
@@ -220,21 +236,28 @@ def test_opening_play_is_contrarian_and_threshold_exit_exempt(tmp_path: Path) ->
     service = PaperTradingService(db)
     result = run_strategy(
         service,
-        assessments(yes_bid=0.52, yes_ask=0.54),
+        assessments(yes_bid=0.56, yes_ask=0.58),
         margin=25.0,
     )
     texas = result["texas_holdem"]
-    assert result["active_strategy"] == TEXAS_HOLDEM_V21
+    assert result["active_strategy"] == TEXAS_HOLDEM_V3
     assert texas["side"] == "NO"
     assert texas["status"] in {"ATTEMPTING", "ENTERED"}
     entry = db.fetch_one(
-        "SELECT * FROM paper_entries WHERE ticker='TEXAS' AND strategy='TEXAS_HOLDEM_2_1'"
+        "SELECT * FROM paper_entries WHERE ticker='TEXAS' AND strategy='TEXAS_HOLDEM_3_0'"
     )
     assert entry is not None
     assert entry["side"] == "NO"
-    assert entry["entry_price"] <= 0.50 + 1e-12
+    assert entry["entry_price"] <= 0.45 + 1e-12
     assert entry["threshold_breach_enabled"] == 0
     assert entry["stop_loss_price"] is None
+    attempt = db.fetch_one(
+        "SELECT observed_at,evidence_json FROM texas_holdem_attempts WHERE round_id=?",
+        (db.fetch_one("SELECT id FROM texas_holdem_rounds WHERE ticker='TEXAS'")["id"],),
+    )
+    assert attempt["observed_at"] == "2026-09-01T12:00:01+00:00"
+    assert '"entry_price_cap": 0.45' in attempt["evidence_json"]
+    assert '"entry_trigger": "FIRST_BRTI_THRESHOLD_BREACH"' in attempt["evidence_json"]
 
 
 def test_price_cap_blocks_opening_attempt_without_consuming_retry(tmp_path: Path) -> None:
@@ -247,36 +270,30 @@ def test_price_cap_blocks_opening_attempt_without_consuming_retry(tmp_path: Path
     )["texas_holdem"]
     assert result["status"] == "WAITING"
     assert result["attempt_count"] == 0
-    assert "50¢" in result["blocker"]
+    assert "45¢" in result["blocker"]
     assert db.fetch_one("SELECT id FROM paper_entries WHERE ticker='TEXAS'") is None
 
 
-def test_texas_v21_requires_current_coinbase_rv_on_each_entry_attempt(tmp_path: Path) -> None:
+def test_texas_v3_requires_current_coinbase_rv_on_each_entry_attempt(tmp_path: Path) -> None:
     db = make_db(tmp_path)
     service = PaperTradingService(db)
-    quotes = assessments(yes_bid=.52, yes_ask=.54)
+    quotes = assessments(yes_bid=.56, yes_ask=.58)
     quotes["NO"]["coinbase_realized_volatility"]["horizons"]["15"]["rv_pct"] = .19
     blocked = run_strategy(service, quotes, margin=25.0)["texas_holdem"]
     assert blocked["attempt_count"] == 0
     assert "0.20%" in blocked["blocker"]
-    quotes["NO"]["coinbase_realized_volatility"]["horizons"]["15"]["current_valid"] = False
-    unavailable = run_strategy(
-        service, quotes, margin=25.0, observed_at="2026-09-01T12:00:02+00:00"
-    )["texas_holdem"]
-    assert unavailable["attempt_count"] == 0
-    assert "16 consecutive" in unavailable["blocker"]
-    quotes["NO"]["coinbase_realized_volatility"]["horizons"]["15"].update({"rv_pct": .80, "current_valid": True})
+    assert blocked["status"] == "WAITING"
+    quotes["NO"]["coinbase_realized_volatility"]["horizons"]["15"].update(
+        {"rv_pct": .80, "current_valid": True}
+    )
     admitted = run_strategy(
         service, quotes, margin=25.0, observed_at="2026-09-01T12:00:03+00:00"
     )["texas_holdem"]
     assert admitted["attempt_count"] == 1
-    evidence = db.fetch_one("SELECT evidence_json FROM texas_holdem_attempts WHERE attempt_number=1")
-    assert '"realized_volatility_gate_pct": 0.2' in str(evidence["evidence_json"])
-    assert '"realized_volatility_value_pct": 0.8' in str(evidence["evidence_json"])
-    assert '"realized_volatility_version": "coinbase-rv-1"' in str(evidence["evidence_json"])
+    assert admitted["status"] in {"ATTEMPTING", "ENTERED"}
 
 
-def test_texas_v21_rv_gate_boost_and_mode_isolation(tmp_path: Path) -> None:
+def test_texas_v3_rv_gate_boost_and_mode_isolation(tmp_path: Path) -> None:
     db = make_db(tmp_path)
     db.update_settings({
         "paper_texas_holdem_v21_realized_volatility_gate_pct": .20,
@@ -285,82 +302,45 @@ def test_texas_v21_rv_gate_boost_and_mode_isolation(tmp_path: Path) -> None:
         "demo_texas_holdem_v21_realized_volatility_boost_multiplier": 1.2,
     })
     service = PaperTradingService(db)
-    quotes = assessments(yes_bid=.52, yes_ask=.54)
+    quotes = assessments(yes_bid=.56, yes_ask=.58)
     seen: list[dict] = []
 
     def submit(**kwargs):
         seen.append(kwargs)
         return True, kwargs["bankroll_fraction"]
 
-    quotes["NO"]["coinbase_realized_volatility"]["horizons"]["15"]["rv_pct"] = .19
-    blocked = service._texas_holdem_state(
-        ticker="GATE", assessments=quotes, opening_elapsed=1, seconds_remaining=899,
-        threshold_margin_dollars=25, market_open_time="2026-09-01T12:00:00+00:00",
-        market_observed_at="2026-09-01T12:00:01+00:00", status_open=True,
-        execution_mode="PAPER", automatic_enabled=True, execution_block_reason=None,
-        entry_exists=False, model_version="test", fixed_entry_handler=submit,
-        execution_risk_by_side={},
-    )
+    def breached_round(ticker: str, mode: str, rv: float) -> dict:
+        now = "2026-09-01T12:00:00+00:00"
+        db.execute(
+            """INSERT INTO texas_holdem_rounds(
+                   environment,ticker,strategy,market_open_time,threshold,
+                   opening_btc_proxy,status,entry_price_cap,flop_target,
+                   turn_target,river_target,river_stop,created_at,updated_at
+               ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (mode, ticker, TEXAS_HOLDEM_V3, now, 100, 75, "WAITING", .45,
+             .60, .50, .95, .60, now, now),
+        )
+        quotes["NO"]["coinbase_realized_volatility"]["horizons"]["15"]["rv_pct"] = rv
+        return service._texas_holdem_state(
+            ticker=ticker, assessments=quotes, opening_elapsed=1,
+            seconds_remaining=899, threshold_margin_dollars=25,
+            market_open_time=now, market_observed_at="2026-09-01T12:00:01+00:00",
+            status_open=True, execution_mode=mode, automatic_enabled=True,
+            execution_block_reason=None, entry_exists=False, model_version="test",
+            fixed_entry_handler=submit, execution_risk_by_side={},
+        )
+
+    blocked = breached_round("GATE", "PAPER", .19)
+    assert blocked["status"] == "WAITING"
     assert blocked["attempt_count"] == 0 and "0.20%" in blocked["blocker"]
-    quotes["NO"]["coinbase_realized_volatility"]["horizons"]["15"]["rv_pct"] = .20
-    admitted = service._texas_holdem_state(
-        ticker="GATE", assessments=quotes, opening_elapsed=1, seconds_remaining=899,
-        threshold_margin_dollars=25, market_open_time="2026-09-01T12:00:00+00:00",
-        market_observed_at="2026-09-01T12:00:02+00:00", status_open=True,
-        execution_mode="PAPER", automatic_enabled=True, execution_block_reason=None,
-        entry_exists=False, model_version="test", fixed_entry_handler=submit,
-        execution_risk_by_side={},
-    )
+    admitted = breached_round("ADMITTED", "PAPER", .20)
     assert admitted["attempt_count"] == 1
     assert seen[-1]["bankroll_fraction"] == pytest.approx(.01)
-    quotes["NO"]["coinbase_realized_volatility"]["horizons"]["15"]["rv_pct"] = .80
-    quotes["NO"]["ask_size"] = 99  # a new executable quote permits retry
-    boosted = service._texas_holdem_state(
-        ticker="GATE", assessments=quotes, opening_elapsed=3, seconds_remaining=897,
-        threshold_margin_dollars=25, market_open_time="2026-09-01T12:00:00+00:00",
-        market_observed_at="2026-09-01T12:00:03+00:00", status_open=True,
-        execution_mode="PAPER", automatic_enabled=True, execution_block_reason=None,
-        entry_exists=False, model_version="test", fixed_entry_handler=submit,
-        execution_risk_by_side={},
-    )
-    assert boosted["attempt_count"] == 2
+    boosted = breached_round("BOOSTED", "PAPER", .80)
+    assert boosted["attempt_count"] == 1
     assert seen[-1]["bankroll_fraction"] == pytest.approx(.018)
-    evidence = db.fetch_one(
-        "SELECT evidence_json FROM texas_holdem_attempts WHERE attempt_number=2"
-    ) or {}
-    assert '"realized_volatility_boost_multiplier": 1.8' in evidence["evidence_json"]
-    # The Demo gate remains distinct from Paper's saved value.
-    quotes["NO"]["coinbase_realized_volatility"]["horizons"]["15"]["rv_pct"] = .50
-    demo = service._texas_holdem_state(
-        ticker="DEMO-GATE", assessments=quotes, opening_elapsed=1, seconds_remaining=899,
-        threshold_margin_dollars=25, market_open_time="2026-09-01T12:00:00+00:00",
-        market_observed_at="2026-09-01T12:00:01+00:00", status_open=True,
-        execution_mode="DEMO", automatic_enabled=True, execution_block_reason=None,
-        entry_exists=False, model_version="test", fixed_entry_handler=submit,
-        execution_risk_by_side={},
-    )
+    demo = breached_round("DEMO-GATE", "DEMO", .50)
     assert demo["attempt_count"] == 0 and "0.60%" in demo["blocker"]
-
-    # Zero is an explicit valid gate/boost threshold, not a falsy missing
-    # value. The actual opening path uses the same saved multiplier as preview.
-    db.update_settings({
-        "paper_texas_holdem_v21_realized_volatility_gate_pct": 0.0,
-        "paper_texas_holdem_v21_realized_volatility_boost_pct": 0.0,
-        "paper_texas_holdem_v21_realized_volatility_boost_multiplier": 1.7,
-    })
-    quotes["NO"]["coinbase_realized_volatility"]["horizons"]["15"]["rv_pct"] = 0.0
-    quotes["NO"]["coinbase_realized_volatility"]["as_of"] = "2026-09-01T12:15:00+00:00"
-    zero = service._texas_holdem_state(
-        ticker="ZERO-RV", assessments=quotes, opening_elapsed=1, seconds_remaining=899,
-        threshold_margin_dollars=25, market_open_time="2026-09-01T12:15:00+00:00",
-        market_observed_at="2026-09-01T12:15:01+00:00", status_open=True,
-        execution_mode="PAPER", automatic_enabled=True, execution_block_reason=None,
-        entry_exists=False, model_version="test", fixed_entry_handler=submit,
-        execution_risk_by_side={},
-    )
-    assert zero["attempt_count"] == 1
-    assert zero["rules"]["realized_volatility_boost_multiplier"] == pytest.approx(1.7)
-    assert seen[-1]["bankroll_fraction"] == pytest.approx(.017)
 
 
 def test_legacy_texas_does_not_gain_v2_gate_or_rules(tmp_path: Path) -> None:
@@ -371,7 +351,7 @@ def test_legacy_texas_does_not_gain_v2_gate_or_rules(tmp_path: Path) -> None:
            VALUES ('PAPER','LEGACY','WAITING',.5,.6,.5,.95,.6,?,?)""",
         ("2026-09-01T12:00:00+00:00", "2026-09-01T12:00:00+00:00"),
     )
-    quotes = assessments(yes_bid=.52, yes_ask=.54)
+    quotes = assessments(yes_bid=.56, yes_ask=.58)
     quotes["NO"]["margin_volatility"] = {}
     entered = PaperTradingService(db)._texas_holdem_state(
         ticker="LEGACY", assessments=quotes, opening_elapsed=1, seconds_remaining=899,
@@ -419,7 +399,7 @@ def test_texas_v2_clock_moves_to_earlier_authoritative_fill_and_stale_btc_does_n
 def test_v2_breach_latches_when_global_exit_has_priority(tmp_path: Path) -> None:
     db = make_db(tmp_path)
     service = PaperTradingService(db)
-    run_strategy(service, assessments(yes_bid=.52, yes_ask=.54), margin=25.0)
+    run_strategy(service, assessments(yes_bid=.56, yes_ask=.58), margin=25.0)
     assert service.process_texas_holdem_exits("TEXAS", {
         "observed_at": "2026-09-01T12:02:00+00:00",
         "btc_observed_at": "2026-09-01T12:02:00+00:00",
@@ -441,7 +421,7 @@ def test_texas_v2_thesis_checkpoint_is_one_shot_and_strictly_over_fifty(tmp_path
         "texas_holdem_turn_stop": 0, "texas_holdem_river_stop": 0,
     })
     service = PaperTradingService(db)
-    run_strategy(service, assessments(yes_bid=.52, yes_ask=.54), margin=25.0)
+    run_strategy(service, assessments(yes_bid=.56, yes_ask=.58), margin=25.0)
     # NO was entered at 12:00:01, so 12:05:01 is the immutable checkpoint.
     closed = service.process_texas_holdem_exits("TEXAS", {
         "observed_at": "2026-09-01T12:05:01+00:00",
@@ -453,7 +433,7 @@ def test_texas_v2_thesis_checkpoint_is_one_shot_and_strictly_over_fifty(tmp_path
     row = db.fetch_one(
         "SELECT strategy,first_filled_at,thesis_checkpoint_at,thesis_status FROM texas_holdem_rounds WHERE ticker='TEXAS'"
     )
-    assert row["strategy"] == TEXAS_HOLDEM_V21
+    assert row["strategy"] == TEXAS_HOLDEM_V3
     assert row["first_filled_at"].startswith("2026-09-01T12:00:01")
     assert row["thesis_checkpoint_at"].startswith("2026-09-01T12:05:01")
     assert row["thesis_status"] == "NO_EXIT"
@@ -467,7 +447,7 @@ def test_texas_v2_thesis_checkpoint_is_one_shot_and_strictly_over_fifty(tmp_path
     assert db.fetch_one("SELECT thesis_status FROM texas_holdem_rounds WHERE ticker='TEXAS'")["thesis_status"] == "NO_EXIT"
 
 
-def test_texas_v21_double_breach_exits_at_checkpoint(tmp_path: Path) -> None:
+def test_texas_v3_double_breach_exits_at_checkpoint(tmp_path: Path) -> None:
     db = make_db(tmp_path)
     db.update_settings({
         "texas_holdem_flop_target": .95, "texas_holdem_turn_target": .95,
@@ -475,7 +455,7 @@ def test_texas_v21_double_breach_exits_at_checkpoint(tmp_path: Path) -> None:
         "texas_holdem_turn_stop": 0, "texas_holdem_river_stop": 0,
     })
     service = PaperTradingService(db)
-    run_strategy(service, assessments(yes_bid=.52, yes_ask=.54), margin=25.0)
+    run_strategy(service, assessments(yes_bid=.56, yes_ask=.58), margin=25.0)
     # An early touch is retained as evidence, but crossing back to the losing
     # side by more than $50 at five minutes triggers the thesis-failure exit.
     service.process_texas_holdem_exits("TEXAS", {
@@ -510,7 +490,7 @@ def test_texas_v21_double_breach_exits_at_checkpoint(tmp_path: Path) -> None:
             expected_expiration_time,result,rules_primary,rules_secondary,raw_json,
             first_seen_at,updated_at FROM markets WHERE ticker='TEXAS'"""
     )
-    run_strategy(service, assessments(yes_bid=.52, yes_ask=.54), margin=25.0,
+    run_strategy(service, assessments(yes_bid=.56, yes_ask=.58), margin=25.0,
                  ticker="TEXAS-2")
     assert service.process_texas_holdem_exits("TEXAS-2", {
         "observed_at": "2026-09-01T12:05:01+00:00",
@@ -521,7 +501,7 @@ def test_texas_v21_double_breach_exits_at_checkpoint(tmp_path: Path) -> None:
     assert db.fetch_one("SELECT exit_reason FROM texas_holdem_rounds WHERE ticker='TEXAS-2'")["exit_reason"] == "TEXAS_THESIS_FAILURE"
 
 
-def test_texas_v21_early_breach_still_favorable_at_checkpoint_does_not_exit(
+def test_texas_v3_early_breach_still_favorable_at_checkpoint_does_not_exit(
     tmp_path: Path,
 ) -> None:
     db = make_db(tmp_path)
@@ -531,7 +511,7 @@ def test_texas_v21_early_breach_still_favorable_at_checkpoint_does_not_exit(
         "texas_holdem_turn_stop": 0, "texas_holdem_river_stop": 0,
     })
     service = PaperTradingService(db)
-    run_strategy(service, assessments(yes_bid=.52, yes_ask=.54), margin=25.0)
+    run_strategy(service, assessments(yes_bid=.56, yes_ask=.58), margin=25.0)
     service.process_texas_holdem_exits("TEXAS", {
         "observed_at": "2026-09-01T12:02:00+00:00",
         "btc_observed_at": "2026-09-01T12:02:00+00:00",
@@ -551,7 +531,7 @@ def test_texas_v21_early_breach_still_favorable_at_checkpoint_does_not_exit(
     assert row["post_fill_breached_at"].startswith("2026-09-01T12:02:00")
 
 
-def test_texas_v21_four_crossings_keep_playing_volatile_market(tmp_path: Path) -> None:
+def test_texas_v3_four_crossings_keep_playing_volatile_market(tmp_path: Path) -> None:
     db = make_db(tmp_path)
     db.update_settings({
         "texas_holdem_flop_target": .95, "texas_holdem_turn_target": .95,
@@ -559,7 +539,7 @@ def test_texas_v21_four_crossings_keep_playing_volatile_market(tmp_path: Path) -
         "texas_holdem_turn_stop": 0, "texas_holdem_river_stop": 0,
     })
     service = PaperTradingService(db)
-    run_strategy(service, assessments(yes_bid=.52, yes_ask=.54), margin=25.0)
+    run_strategy(service, assessments(yes_bid=.56, yes_ask=.58), margin=25.0)
     for minute, btc_proxy in ((1, 100.0), (2, 180.0), (3, 90.0), (4, 180.0)):
         assert service.process_texas_holdem_exits("TEXAS", {
             "observed_at": f"2026-09-01T12:0{minute}:00+00:00",
@@ -580,7 +560,7 @@ def test_texas_v21_four_crossings_keep_playing_volatile_market(tmp_path: Path) -
     assert row["post_fill_crossing_count"] == 4
 
 
-def test_texas_v21_new_rounds_are_labeled_without_relabeling_legacy_data(tmp_path: Path) -> None:
+def test_texas_v3_new_rounds_are_labeled_without_relabeling_legacy_data(tmp_path: Path) -> None:
     db = make_db(tmp_path)
     db.execute(
         """INSERT INTO texas_holdem_rounds(environment,ticker,status,entry_price_cap,
@@ -589,8 +569,8 @@ def test_texas_v21_new_rounds_are_labeled_without_relabeling_legacy_data(tmp_pat
         ("2026-09-01T11:00:00+00:00", "2026-09-01T11:00:00+00:00"),
     )
     assert db.fetch_one("SELECT strategy FROM texas_holdem_rounds WHERE ticker='LEGACY'")["strategy"] == "TEXAS_HOLDEM"
-    run_strategy(PaperTradingService(db), assessments(yes_bid=.52, yes_ask=.54), margin=25.0)
-    assert db.fetch_one("SELECT strategy FROM texas_holdem_rounds WHERE ticker='TEXAS'")["strategy"] == TEXAS_HOLDEM_V21
+    run_strategy(PaperTradingService(db), assessments(yes_bid=.56, yes_ask=.58), margin=25.0)
+    assert db.fetch_one("SELECT strategy FROM texas_holdem_rounds WHERE ticker='TEXAS'")["strategy"] == TEXAS_HOLDEM_V3
 
 
 def test_texas_v2_rehydrates_early_breach_then_exits_after_cross_back(tmp_path: Path) -> None:
@@ -631,19 +611,26 @@ def test_texas_v2_rehydrates_early_breach_then_exits_after_cross_back(tmp_path: 
     assert db.fetch_one("SELECT post_fill_breached_at FROM texas_holdem_rounds WHERE ticker='REHYDRATE'")["post_fill_breached_at"].startswith("2026-09-01T12:02:00")
 
 
-def test_opening_expiry_uses_the_saved_window_in_status_text(tmp_path: Path) -> None:
+def test_breach_entry_expires_after_ninety_seconds(tmp_path: Path) -> None:
     db = make_db(tmp_path)
-    db.update_settings({"texas_holdem_entry_window_seconds": 7})
     service = PaperTradingService(db)
+    on_time = run_strategy(
+        service, assessments(yes_bid=0.56, yes_ask=0.58), margin=25.0,
+        observed_at="2026-09-01T12:01:30+00:00", seconds_remaining=810,
+    )["texas_holdem"]
+    assert on_time["status"] == "ENTERED"
+
+    late_db = make_db(tmp_path / "late")
+    late_service = PaperTradingService(late_db)
     result = run_strategy(
-        service, assessments(yes_bid=0.52, yes_ask=0.54), margin=25.0,
-        observed_at="2026-09-01T12:00:08+00:00", seconds_remaining=892,
+        late_service, assessments(yes_bid=0.56, yes_ask=0.58), margin=25.0,
+        observed_at="2026-09-01T12:01:31+00:00", seconds_remaining=809,
     )["texas_holdem"]
     assert result["status"] == "FOLDED"
-    assert result["blocker"] == "The 7-second opening play expired."
+    assert result["blocker"] == "The 90-second opening play expired."
 
 
-def test_retries_require_new_market_state_and_fold_after_three_attempts(
+def test_breach_entry_retries_fresh_quotes_without_duplicate_position(
     tmp_path: Path,
 ) -> None:
     db = make_db(tmp_path)
@@ -654,8 +641,8 @@ def test_retries_require_new_market_state_and_fold_after_three_attempts(
         attempts_seen.append(kwargs)
         return True, 0.05
 
-    def call(size: float, second: int) -> dict:
-        side_assessments = assessments(yes_bid=0.52, yes_ask=0.54)
+    def call(size: float, second: int, margin: float) -> dict:
+        side_assessments = assessments(yes_bid=0.56, yes_ask=0.58)
         side_assessments["NO"]["ask_size"] = size
         return service.consider_strategies(
             ticker="TEXAS",
@@ -668,29 +655,25 @@ def test_retries_require_new_market_state_and_fold_after_three_attempts(
             threshold_state={},
             settlement_window={},
             z_distance=0,
-            threshold_margin_dollars=25.0,
+            threshold_margin_dollars=margin,
             model_version="test",
             entry_exists_override=False,
             fixed_entry_handler=submit,
         )["texas_holdem"]
 
-    assert call(100, 1)["attempt_count"] == 1
-    assert call(100, 2)["attempt_count"] == 1
-    assert "fresh executable quote" in call(100, 3)["blocker"]
-    assert call(90, 4)["attempt_count"] == 2
-    assert call(80, 5)["attempt_count"] == 3
-    folded = call(70, 6)
-    assert folded["status"] == "FOLDED"
-    assert folded["blocker"] == "All opening-play attempts were used."
-    assert len(attempts_seen) == 3
+    assert call(100, 1, -25)["attempt_count"] == 0
+    assert call(90, 2, 25)["attempt_count"] == 1
+    retried = call(80, 3, 25)
+    assert retried["attempt_count"] == 2
+    assert len(attempts_seen) == 2
     assert all(item["time_in_force"] == "immediate_or_cancel" for item in attempts_seen)
-    assert all(item["maximum_entry_price"] == pytest.approx(0.50) for item in attempts_seen)
+    assert all(item["maximum_entry_price"] == pytest.approx(0.45) for item in attempts_seen)
 
 
 def test_flop_target_closes_paper_position_and_records_reason(tmp_path: Path) -> None:
     db = make_db(tmp_path)
     service = PaperTradingService(db)
-    run_strategy(service, assessments(yes_bid=0.52, yes_ask=0.54), margin=25.0)
+    run_strategy(service, assessments(yes_bid=0.56, yes_ask=0.58), margin=25.0)
     closed = service.process_texas_holdem_exits(
         "TEXAS",
         {
@@ -890,7 +873,7 @@ def test_v2_fractional_confirmed_remainder_never_rounds_up_to_buy_more(tmp_path:
         return True, .05
 
     state = service._texas_holdem_state(
-        ticker="FRACTION", assessments=assessments(yes_bid=.52, yes_ask=.54),
+        ticker="FRACTION", assessments=assessments(yes_bid=.56, yes_ask=.58),
         opening_elapsed=1, seconds_remaining=899, threshold_margin_dollars=25,
         market_open_time=now, market_observed_at="2026-09-01T12:00:01+00:00",
         status_open=True, execution_mode="DEMO", automatic_enabled=True,

@@ -592,7 +592,10 @@ def threshold_breach_exit_state(
 TEXAS_HOLDEM_LEGACY = "TEXAS_HOLDEM"
 TEXAS_HOLDEM_V2 = "TEXAS_HOLDEM_2_0"
 TEXAS_HOLDEM_V21 = "TEXAS_HOLDEM_2_1"
-TEXAS_HOLDEM_MODERN_STRATEGIES = frozenset({TEXAS_HOLDEM_V2, TEXAS_HOLDEM_V21})
+TEXAS_HOLDEM_V3 = "TEXAS_HOLDEM_3_0"
+TEXAS_HOLDEM_MODERN_STRATEGIES = frozenset(
+    {TEXAS_HOLDEM_V2, TEXAS_HOLDEM_V21, TEXAS_HOLDEM_V3}
+)
 TEXAS_HOLDEM_STRATEGIES = frozenset(
     {TEXAS_HOLDEM_LEGACY, *TEXAS_HOLDEM_MODERN_STRATEGIES}
 )
@@ -604,6 +607,7 @@ TEXAS_V2_THESIS_UNFAVORABLE_DISTANCE = 50.0
 # Keep the existing user-facing Texas Hold'em 2.0 name.  The persisted rules
 # version distinguishes its Coinbase realized-volatility successor.
 TEXAS_V2_RULE_VERSION = "texas-holdem-2.1.1"
+TEXAS_V3_RULE_VERSION = "texas-holdem-3.0.0"
 TEXAS_RV_VERSION = "coinbase-rv-1"
 TEXAS_RV_SOURCE = "Coinbase"
 TEXAS_RV_PRODUCT = "BTC-USD"

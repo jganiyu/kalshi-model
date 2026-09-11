@@ -114,14 +114,14 @@ DEFAULT_SETTINGS: dict[str, object] = {
     "directional_momentum_minimum_movement_dollars": 1.0,
     "maximum_margin_volatility": 0.0,
     "texas_holdem_enabled": False,
-    "texas_holdem_max_entry_price": 0.50,
+    "texas_holdem_max_entry_price": 0.45,
     "texas_holdem_flop_target": 0.60,
     "texas_holdem_flop_stop": 0.60,
     "texas_holdem_turn_target": 0.50,
     "texas_holdem_turn_stop": 0.60,
     "texas_holdem_river_target": 0.95,
     "texas_holdem_river_stop": 0.60,
-    "texas_holdem_entry_window_seconds": 20,
+    "texas_holdem_entry_window_seconds": 90,
     "texas_holdem_additional_retries": 2,
     # Retained read-only compatibility knobs for historical Texas 2.0 records.
     # New Texas entries must never read these MVI values.

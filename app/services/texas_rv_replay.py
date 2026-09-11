@@ -93,12 +93,14 @@ def _strategy_version(value: object) -> str:
     normalized = str(value or "").upper()
     if normalized == "TEXAS_HOLDEM_2_1":
         return "V21"
+    if normalized == "TEXAS_HOLDEM_3_0":
+        return "V3"
     return "V2" if normalized == "TEXAS_HOLDEM_2_0" else "LEGACY"
 
 
 def _is_texas(value: object) -> bool:
     return str(value or "").upper() in {
-        "TEXAS_HOLDEM", "TEXAS_HOLDEM_2_0", "TEXAS_HOLDEM_2_1",
+        "TEXAS_HOLDEM", "TEXAS_HOLDEM_2_0", "TEXAS_HOLDEM_2_1", "TEXAS_HOLDEM_3_0",
     }
 
 
@@ -570,7 +572,7 @@ def replay_texas_rv(db: Database) -> dict[str, Any]:
             version: _summary(
                 [row for row in report_rows if row["strategy_version"] == version]
             )
-            for version in ("LEGACY", "V2", "V21")
+            for version in ("LEGACY", "V2", "V21", "V3")
         },
         "loss_minimization_sweep": _sweep_loss_minimization(sweep_inputs),
         "loss_minimization_by_rv15_gate": {

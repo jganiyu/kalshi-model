@@ -392,6 +392,7 @@ function openTradeExecutablePriceLabel(position = {}, current = state.dashboard?
 
 function displayStrategy(value) {
   const strategy = String(value || "Manual").toUpperCase();
+  if (strategy === "TEXAS_HOLDEM_3_0") return "Texas Hold’em 3.0";
   if (strategy === "TEXAS_HOLDEM_2_1") return "Texas Hold’em 2.1";
   if (strategy === "TEXAS_HOLDEM_2_0") return "Texas Hold’em 2.0";
   if (strategy === "TEXAS_HOLDEM") return "Texas Hold’em";
@@ -442,7 +443,7 @@ function renderDashboardOpenTrades(mode, portfolio = {}) {
       <small>${escapeHtml(status)}</small>
       <p>${escapeHtml(compact(position.contracts))} contracts · ${escapeHtml(cents(entryPrice))} entry · ${escapeHtml(money(exposure))} exposure</p>
       <p class="open-trade-executable-price" data-open-trade-executable-price data-ticker="${escapeHtml(String(position.ticker || ""))}" data-side="${escapeHtml(side)}">${escapeHtml(openTradeExecutablePriceLabel(position))}</p>
-      <p class="threshold-breach-state">${escapeHtml(["TEXAS_HOLDEM", "TEXAS_HOLDEM_2_0", "TEXAS_HOLDEM_2_1"].includes(String(strategy).toUpperCase()) ? texasExitText(position) : thresholdBreachExitText(protection))}</p>
+      <p class="threshold-breach-state">${escapeHtml(["TEXAS_HOLDEM", "TEXAS_HOLDEM_2_0", "TEXAS_HOLDEM_2_1", "TEXAS_HOLDEM_3_0"].includes(String(strategy).toUpperCase()) ? texasExitText(position) : thresholdBreachExitText(protection))}</p>
     </article>`;
   });
   const orderRows = restingOrders.map((order) => {
@@ -634,7 +635,7 @@ function renderTexasHoldemHud(texas = {}) {
     return;
   }
   $("#standard-edge-hud").dataset.status = String(texas.status || "WATCHING").toLowerCase();
-  $("#texas-holdem-title").textContent = texas.display_name || "Texas Hold’em 2.1";
+  $("#texas-holdem-title").textContent = texas.display_name || "Texas Hold’em 3.0";
   const phaseKey = String(texas.phase?.key || texasPhaseProgress(texas.market_open_time).phase);
   $("#texas-holdem-phase").textContent = `THE ${phaseKey}`;
   $("#texas-holdem-status").textContent = String(texas.status || "WAITING").replaceAll("_", " ");
@@ -2173,8 +2174,8 @@ const calibrationGroups = [
     { id: "directional_momentum_minimum_movement_dollars", label: "Minimum directional movement", unit: "dollars", min: 0, max: 100000, step: .25, tip: "Minimum fitted BTC move required across the lookback window in the entry direction. Default: $1." },
   ]],
   ["Texas Hold’em Strategy", [
-    { id: "texas_holdem_enabled", label: "Enable Texas Hold’em Strategy", type: "toggle", tip: "Runs one contrarian opening play per market and replaces Standard Edge automatic entries while enabled. Default: off." },
-    { id: "texas_holdem_max_entry_price", label: "Maximum entry price", unit: "cents", min: 1, max: 99, step: 1, scale: 100, tip: "Highest all-in executable contract price allowed for the opening IOC buy. Default: 50 cents." },
+    { id: "texas_holdem_enabled", label: "Enable Texas Hold’em Strategy", type: "toggle", tip: "Texas Hold’em 3.0 waits for the first BRTI threshold breach, then buys the opposite side. Default: off." },
+    { id: "texas_holdem_max_entry_price", label: "Maximum entry price", unit: "cents", min: 1, max: 99, step: 1, scale: 100, tip: "Highest all-in executable contract price allowed after the breach. Default: 45 cents." },
     { id: "paper_texas_holdem_v21_realized_volatility_gate_pct", label: "Paper Texas 15m volatility gate", unit: "%", min: 0, max: 100, step: .01, tip: "Closed Coinbase 15-minute realized volatility required for a Paper Texas entry. Default: 0.20%." },
     { id: "demo_texas_holdem_v21_realized_volatility_gate_pct", label: "Demo Texas 15m volatility gate", unit: "%", min: 0, max: 100, step: .01, tip: "Closed Coinbase 15-minute realized volatility required for a Demo Texas entry. Default: 0.20%." },
     { id: "live_texas_holdem_v21_realized_volatility_gate_pct", label: "Live Texas 15m volatility gate", unit: "%", min: 0, max: 100, step: .01, tip: "Closed Coinbase 15-minute realized volatility required for a Live Texas entry. Default: 0.20%." },
@@ -2184,16 +2185,16 @@ const calibrationGroups = [
     { id: "paper_texas_holdem_v21_realized_volatility_boost_multiplier", label: "Paper Texas volatility boost size", unit: "× allocation", min: 1, max: 5, step: .1, tip: "Sizing multiplier applied when Paper reaches its volatility boost trigger. General risk and execution caps still apply. Default: 1.5×." },
     { id: "demo_texas_holdem_v21_realized_volatility_boost_multiplier", label: "Demo Texas volatility boost size", unit: "× allocation", min: 1, max: 5, step: .1, tip: "Sizing multiplier applied when Demo reaches its volatility boost trigger. General risk and execution caps still apply. Default: 1.5×." },
     { id: "live_texas_holdem_v21_realized_volatility_boost_multiplier", label: "Live Texas volatility boost size", unit: "× allocation", min: 1, max: 5, step: .1, tip: "Sizing multiplier applied when Live reaches its volatility boost trigger. General risk and execution caps still apply. Default: 1.5×." },
-    { id: "paper_texas_holdem_v2_base_allocation_pct", label: "Paper Texas 2.1 base allocation", unit: "% bankroll", min: 0, max: 100, step: .1, scale: 100, tip: "Normal Texas Hold’em 2.1 allocation before its configured volatility boost. General risk and execution caps still apply. Default: 1%." },
-    { id: "demo_texas_holdem_v2_base_allocation_pct", label: "Demo Texas 2.1 base allocation", unit: "% bankroll", min: 0, max: 100, step: .1, scale: 100, tip: "Normal Texas Hold’em 2.1 allocation before its configured volatility boost. General risk and execution caps still apply. Default: 1%." },
-    { id: "live_texas_holdem_v2_base_allocation_pct", label: "Live Texas 2.1 base allocation", unit: "% bankroll", min: 0, max: 100, step: .1, scale: 100, tip: "Normal Texas Hold’em 2.1 allocation before its configured volatility boost. General risk and execution caps still apply. Default: 1%." },
+    { id: "paper_texas_holdem_v2_base_allocation_pct", label: "Paper Texas 3.0 base allocation", unit: "% bankroll", min: 0, max: 100, step: .1, scale: 100, tip: "Normal Texas Hold’em allocation before its configured volatility boost. General risk and execution caps still apply. Default: 1%." },
+    { id: "demo_texas_holdem_v2_base_allocation_pct", label: "Demo Texas 3.0 base allocation", unit: "% bankroll", min: 0, max: 100, step: .1, scale: 100, tip: "Normal Texas Hold’em allocation before its configured volatility boost. General risk and execution caps still apply. Default: 1%." },
+    { id: "live_texas_holdem_v2_base_allocation_pct", label: "Live Texas 3.0 base allocation", unit: "% bankroll", min: 0, max: 100, step: .1, scale: 100, tip: "Normal Texas Hold’em allocation before its configured volatility boost. General risk and execution caps still apply. Default: 1%." },
     { id: "texas_holdem_flop_target", label: "Flop target", unit: "cents", min: 1, max: 99, step: 1, scale: 100, tip: "Executable bid that closes the position during minutes 0–5. Default: 60 cents." },
     { id: "texas_holdem_flop_stop", label: "Flop stop", unit: "cents", min: 0, max: 99, step: 1, scale: 100, tip: "Executable bid that folds during minutes 0–5. Use 0 to disable. Default: 60 cents." },
     { id: "texas_holdem_turn_target", label: "Turn target", unit: "cents", min: 1, max: 99, step: 1, scale: 100, tip: "Executable bid that closes the position during minutes 5–10. Default: 50 cents." },
     { id: "texas_holdem_turn_stop", label: "Turn stop", unit: "cents", min: 0, max: 99, step: 1, scale: 100, tip: "Executable bid that folds during minutes 5–10. Use 0 to disable. Default: 60 cents." },
     { id: "texas_holdem_river_target", label: "River target", unit: "cents", min: 1, max: 99, step: 1, scale: 100, tip: "Executable bid that takes profit during minutes 10–15. Default: 95 cents." },
     { id: "texas_holdem_river_stop", label: "River stop", unit: "cents", min: 0, max: 99, step: 1, scale: 100, tip: "Executable bid at or below which the position folds during the River. Use 0 to disable. Default: 60 cents." },
-    { id: "texas_holdem_entry_window_seconds", label: "Opening-play window", unit: "seconds", min: 1, max: 120, step: 1, integer: true, tip: "Time after official market open in which the initial attempt and fresh-quote retries may occur." },
+    { id: "texas_holdem_entry_window_seconds", label: "Breach-entry window", unit: "seconds", min: 1, max: 120, step: 1, integer: true, tip: "Time after market open in which the first breach and fresh-quote retries may occur. Default: 90 seconds." },
     { id: "texas_holdem_additional_retries", label: "Additional retries", unit: "retries", min: 0, max: 10, step: 1, integer: true, tip: "Fresh-quote IOC retries after the initial attempt. Default: 2." },
   ]],
   ["Stops & Exits", [
@@ -2346,6 +2347,7 @@ function renderCalibrationResults(data) {
     TEXAS_HOLDEM: "Texas Hold’em",
     TEXAS_HOLDEM_2_0: "Texas Hold’em 2.0",
     TEXAS_HOLDEM_2_1: "Texas Hold’em 2.1",
+    TEXAS_HOLDEM_3_0: "Texas Hold’em 3.0",
   };
   $("#strategy-results").innerHTML = Object.entries(strategyLabels).map(([key, label]) => {
     const result = strategyResults[key] || {};
