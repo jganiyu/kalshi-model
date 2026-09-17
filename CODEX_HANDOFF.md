@@ -17,6 +17,33 @@ Read this before making changes. It is a working map, not trading advice.
 - **Coinbase** is retained only for closed one-minute candles and 15-minute realized volatility.
 - Kalshi market WebSocket supplies executable contract quotes and order books. REST is its fallback.
 - Historical Kalshi executable quotes are stored so the dashboard BTC chart can display a read-only crosshair.
+- Historical research has a separate lab namespace (`research_observations`,
+  `research_feature_values`, `research_hypotheses`, `research_experiments`,
+  and related quality tables). New signal work should use `app.research`
+  rather than production strategy/execution tables.
+- External research observations distinguish source event time, receive time,
+  availability time, and ingestion time. Point-in-time features must use
+  `available_at <= T`, which protects against later REST/backfill data leaking
+  into earlier market states.
+- Future high-frequency data sources should enter through the
+  `ResearchSourceAdapter` protocol and preserve both source-specific
+  provenance and optional `market_ticker` association to KXBTC15M timelines.
+- `docs/research-platform-audit.md` summarizes what is solid, what should be
+  refactored, and what should be retired from the research path.
+
+## Research platform guardrails
+
+- Treat signals as hypotheses. A feature should show incremental predictive
+  value against a simple baseline before it influences any execution path.
+- Keep train, validation, and test boundaries explicit and persisted with each
+  experiment.
+- Every historical observation used for research should have source,
+  observation time, ingestion time, price type, and provenance.
+- Use point-in-time/as-of feature values. Do not let settlement or future book
+  state enter earlier feature rows.
+- Probability forecasting and execution economics remain separate. The model
+  answers probability; execution decides whether a quoted price has edge after
+  costs. No trade is always an acceptable outcome.
 
 ## Texas Hold’em 3.0
 

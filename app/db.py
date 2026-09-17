@@ -1183,6 +1183,130 @@ MIGRATIONS: list[tuple[int, str]] = [
         ALTER TABLE texas_holdem_rounds ADD COLUMN post_fill_last_crossing_at TEXT;
         """,
     ),
+    (
+        33,
+        """
+        -- Research-lab storage is deliberately separate from production
+        -- execution, broker, and dashboard tables.  Every row records source,
+        -- source timestamp, app ingestion timestamp, price type, and
+        -- provenance so historical experiments can be replayed without
+        -- guessing what an observation meant.
+        CREATE TABLE research_observations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            dataset TEXT NOT NULL,
+            market_ticker TEXT,
+            instrument TEXT NOT NULL,
+            observed_at TEXT NOT NULL,
+            source TEXT NOT NULL,
+            source_observed_at TEXT,
+            received_at TEXT NOT NULL,
+            available_at TEXT NOT NULL,
+            ingested_at TEXT NOT NULL,
+            price_type TEXT NOT NULL,
+            value REAL NOT NULL,
+            source_sequence TEXT NOT NULL DEFAULT '',
+            provenance_json TEXT NOT NULL DEFAULT '{}',
+            valid INTEGER NOT NULL DEFAULT 1,
+            quality_flags_json TEXT NOT NULL DEFAULT '[]',
+            UNIQUE(dataset,instrument,observed_at,source,price_type,source_sequence)
+        );
+        CREATE INDEX idx_research_observations_lookup
+            ON research_observations(dataset,instrument,price_type,observed_at);
+        CREATE INDEX idx_research_observations_source_time
+            ON research_observations(dataset,source,observed_at);
+        CREATE INDEX idx_research_observations_market_time
+            ON research_observations(dataset,market_ticker,available_at);
+
+        CREATE TABLE research_data_quality_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            dataset TEXT NOT NULL,
+            market_ticker TEXT,
+            instrument TEXT,
+            observed_at TEXT NOT NULL,
+            check_name TEXT NOT NULL,
+            severity TEXT NOT NULL CHECK(severity IN ('INFO','WARN','ERROR')),
+            detail_json TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX idx_research_quality_dataset_time
+            ON research_data_quality_events(dataset,observed_at,check_name);
+
+        CREATE TABLE research_feature_definitions (
+            name TEXT PRIMARY KEY,
+            version TEXT NOT NULL,
+            description TEXT NOT NULL,
+            inputs_json TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+
+        CREATE TABLE research_feature_values (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            dataset TEXT NOT NULL,
+            market_ticker TEXT,
+            instrument TEXT NOT NULL,
+            feature_name TEXT NOT NULL,
+            feature_version TEXT NOT NULL,
+            observed_at TEXT NOT NULL,
+            value REAL,
+            asof_observed_at TEXT NOT NULL,
+            source_observation_ids_json TEXT NOT NULL DEFAULT '[]',
+            quality_flags_json TEXT NOT NULL DEFAULT '[]',
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(feature_name) REFERENCES research_feature_definitions(name),
+            UNIQUE(dataset,instrument,feature_name,feature_version,observed_at)
+        );
+        CREATE INDEX idx_research_feature_values_lookup
+            ON research_feature_values(dataset,instrument,feature_name,observed_at);
+        CREATE INDEX idx_research_feature_values_market_time
+            ON research_feature_values(dataset,market_ticker,feature_name,observed_at);
+
+        CREATE TABLE research_market_timeline_points (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            dataset TEXT NOT NULL,
+            market_ticker TEXT NOT NULL,
+            timeline_second INTEGER NOT NULL,
+            observed_at TEXT NOT NULL,
+            phase TEXT NOT NULL CHECK(phase IN ('PRE_OPEN','OPEN','SETTLEMENT','POST_SETTLEMENT')),
+            created_at TEXT NOT NULL,
+            UNIQUE(dataset,market_ticker,timeline_second,phase)
+        );
+        CREATE INDEX idx_research_market_timeline_lookup
+            ON research_market_timeline_points(dataset,market_ticker,observed_at);
+
+        CREATE TABLE research_hypotheses (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL UNIQUE,
+            description TEXT NOT NULL,
+            feature_name TEXT NOT NULL,
+            expected_direction TEXT NOT NULL CHECK(expected_direction IN ('positive','negative','two_sided')),
+            status TEXT NOT NULL DEFAULT 'PROPOSED',
+            created_at TEXT NOT NULL,
+            retired_at TEXT,
+            FOREIGN KEY(feature_name) REFERENCES research_feature_definitions(name)
+        );
+
+        CREATE TABLE research_experiments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            hypothesis_id INTEGER,
+            dataset TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            train_start TEXT,
+            train_end TEXT,
+            validation_start TEXT,
+            validation_end TEXT,
+            test_start TEXT,
+            test_end TEXT,
+            baseline_json TEXT NOT NULL,
+            metrics_json TEXT NOT NULL,
+            parameters_json TEXT NOT NULL,
+            notes TEXT,
+            FOREIGN KEY(hypothesis_id) REFERENCES research_hypotheses(id)
+        );
+        CREATE INDEX idx_research_experiments_dataset
+            ON research_experiments(dataset,created_at);
+        """,
+    ),
 ]
 
 
